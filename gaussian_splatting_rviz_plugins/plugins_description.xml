@@ -1,0 +1,10 @@
+<library path="gaussian_splatting_rviz_plugins">
+  <class
+    name="gaussian_splatting_rviz_plugins/GaussianSplatting"
+    type="gaussian_splatting_rviz_plugins::GaussianSplattingDisplay"
+    base_class_type="rviz_common::Display">
+    <description>
+      Displays Gaussian splatting.
+    </description>
+  </class>
+</library>
