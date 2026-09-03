@@ -11,14 +11,20 @@
 #include <OgreEntity.h>
 #include <OgreHardwareBufferManager.h>
 #include <OgreMeshManager.h>
+#include <OgreRenderSystem.h>
 #include <OgreResourceGroupManager.h>
+#include <OgreRoot.h>
 #include <OgreSceneManager.h>
 #include <OgreSceneNode.h>
 #include <OgreSubMesh.h>
 #include <OgreVertexIndexData.h>
 
-#if __has_include(<GL/gl.h>)
+#if defined(GSPLAT_HAS_OPENGL) && __has_include(<GL/gl.h>)
 #include <GL/gl.h>
+#define GSPLAT_OPENGL_API_AVAILABLE 1
+#elif defined(GSPLAT_HAS_OPENGL) && __has_include(<OpenGL/gl.h>)
+#include <OpenGL/gl.h>
+#define GSPLAT_OPENGL_API_AVAILABLE 1
 #endif
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
@@ -42,9 +48,18 @@ constexpr const char * kMaterialName = "GaussianSplatting/RViz";
 
 void enableProgrammablePointSize()
 {
-#if __has_include(<GL/gl.h>)
-  glEnable(GL_PROGRAM_POINT_SIZE);
+#if defined(GSPLAT_OPENGL_API_AVAILABLE)
+  Ogre::RenderSystem * render_system = Ogre::Root::getSingleton().getRenderSystem();
+  if (render_system && render_system->getName().find("OpenGL") != std::string::npos) {
+    glEnable(GL_PROGRAM_POINT_SIZE);
+  }
 #endif
+}
+
+bool usesMetalRenderSystem()
+{
+  Ogre::RenderSystem * render_system = Ogre::Root::getSingleton().getRenderSystem();
+  return render_system && render_system->getName().find("Metal") != std::string::npos;
 }
 
 template<typename T>
@@ -127,8 +142,13 @@ void GaussianSplattingDisplay::registerOgreResources()
     ament_index_cpp::get_package_share_directory("gaussian_splatting_rviz_plugins");
   const std::string media_dir = share_dir + "/ogre_media";
 
-  rgm.addResourceLocation(media_dir + "/materials/scripts", "FileSystem", kResourceGroup);
-  rgm.addResourceLocation(media_dir + "/materials/programs/GLSL", "FileSystem", kResourceGroup);
+  if (usesMetalRenderSystem()) {
+    rgm.addResourceLocation(media_dir + "/materials/scriptsMetal", "FileSystem", kResourceGroup);
+    rgm.addResourceLocation(media_dir + "/materials/programs/Metal", "FileSystem", kResourceGroup);
+  } else {
+    rgm.addResourceLocation(media_dir + "/materials/scripts", "FileSystem", kResourceGroup);
+    rgm.addResourceLocation(media_dir + "/materials/programs/GLSL", "FileSystem", kResourceGroup);
+  }
   rgm.initialiseResourceGroup(kResourceGroup);
 
   resources_registered_ = true;

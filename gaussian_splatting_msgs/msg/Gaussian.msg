@@ -1,5 +1,5 @@
 # Gaussian.msg
-geometry_msgs/Point position
+geometry_msgs/Point32 position
 std_msgs/ColorRGBA color
 
 # 3D covariance matrix:
