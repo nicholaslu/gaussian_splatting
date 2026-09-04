@@ -3,9 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <map>
-#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +19,7 @@
 #include <OgreMaterialManager.h>
 #include <OgrePass.h>
 #include <OgreRectangle2D.h>
+#include <OgreRenderSystem.h>
 #include <OgreRenderTexture.h>
 #include <OgreResourceGroupManager.h>
 #include <OgreRoot.h>
@@ -669,7 +671,8 @@ void GaussianSplattingDisplay::clearMesh()
   splat_count_ = 0;
   visible_splat_count_ = 0;
   positions_.clear();
-  indices_.clear();
+  order_.clear();
+  order_scratch_.clear();
   instances_.clear();
   sorted_instances_.clear();
   last_camera_position_ = Ogre::Vector3::ZERO;
@@ -691,8 +694,8 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   splat_count_ = count;
 
   positions_.resize(count);
-  indices_.resize(count);
-  std::iota(indices_.begin(), indices_.end(), 0);
+  order_.reserve(count);
+  order_scratch_.resize(count);
   instances_.resize(count);
   sorted_instances_.resize(count);
 
@@ -823,17 +826,70 @@ void GaussianSplattingDisplay::writeSortedInstances()
     return;
   }
 
-  for (std::size_t output = 0; output < indices_.size(); ++output) {
-    sorted_instances_[output] = instances_[indices_[output]];
+  for (std::size_t output = 0; output < order_.size(); ++output) {
+    sorted_instances_[output] = instances_[static_cast<std::uint32_t>(order_[output])];
   }
 
-  visible_splat_count_ = indices_.size();
+  visible_splat_count_ = order_.size();
   renderable_->setInstanceCount(visible_splat_count_);
   if (visible_splat_count_ > 0) {
     instance_buffer_->writeData(
       0, visible_splat_count_ * sizeof(SplatInstance), sorted_instances_.data(), true);
   }
 }
+
+namespace
+{
+
+// Maps a float onto a uint32 whose unsigned order matches the float's ordering,
+// so depths can be sorted by their bits: flip the sign bit for positives, and
+// invert everything for negatives, whose magnitude ordering runs backwards.
+// This also gives NaN a defined place, which the old comparator did not.
+std::uint32_t depthKey(float depth)
+{
+  std::uint32_t bits;
+  std::memcpy(&bits, &depth, sizeof(bits));
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// Least-significant-byte-first radix sort on the high word, i.e. on the depth
+// key, leaving the packed index along for the ride. Four linear passes rather
+// than the n log n random accesses a comparison sort spends here.
+void radixSortByHighWord(
+  std::vector<std::uint64_t> & values, std::vector<std::uint64_t> & scratch)
+{
+  const std::size_t count = values.size();
+  if (count < 2) {
+    return;
+  }
+  if (scratch.size() < count) {
+    scratch.resize(count);
+  }
+
+  std::uint64_t * source = values.data();
+  std::uint64_t * target = scratch.data();
+  for (int shift = 32; shift < 64; shift += 8) {
+    std::size_t offset[257] = {0};
+    for (std::size_t i = 0; i < count; ++i) {
+      ++offset[((source[i] >> shift) & 0xFF) + 1];
+    }
+    for (int bucket = 0; bucket < 256; ++bucket) {
+      offset[bucket + 1] += offset[bucket];
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+      target[offset[(source[i] >> shift) & 0xFF]++] = source[i];
+    }
+    std::swap(source, target);
+  }
+
+  // Four passes is even, so the result is already back in values; the copy is
+  // only here so the pass count can change without silently drawing garbage.
+  if (source != values.data()) {
+    std::memcpy(values.data(), source, count * sizeof(std::uint64_t));
+  }
+}
+
+}  // namespace
 
 void GaussianSplattingDisplay::sortIndexBuffer()
 {
@@ -880,8 +936,10 @@ void GaussianSplattingDisplay::sortIndexBuffer()
   sort_dirty_ = false;
   const auto sort_start = std::chrono::steady_clock::now();
 
-  indices_.clear();
-  indices_.reserve(splat_count_);
+  order_.clear();
+
+  const Ogre::Vector3 local_sort_direction =
+    splat_node_->_getDerivedOrientation().Inverse() * (-camera_direction);
 
   const Ogre::Matrix4 world_transform = splat_node_->_getFullTransform();
   const Ogre::Vector3 derived_scale = splat_node_->_getDerivedScale();
@@ -936,16 +994,12 @@ void GaussianSplattingDisplay::sortIndexBuffer()
       }
     }
 
-    indices_.push_back(i);
+    order_.push_back(
+      (static_cast<std::uint64_t>(depthKey(positions_[i].dotProduct(local_sort_direction))) << 32) |
+      i);
   }
 
-  const Ogre::Vector3 local_sort_direction =
-    splat_node_->_getDerivedOrientation().Inverse() * (-camera_direction);
-
-  std::sort(indices_.begin(), indices_.end(), [&](std::uint32_t a, std::uint32_t b) {
-      return positions_[a].dotProduct(local_sort_direction) <
-             positions_[b].dotProduct(local_sort_direction);
-    });
+  radixSortByHighWord(order_, order_scratch_);
 
   writeSortedInstances();
   last_sort_ms_ = std::chrono::duration<double, std::milli>(
@@ -1004,6 +1058,20 @@ void GaussianSplattingDisplay::preViewportUpdate(const Ogre::RenderTargetViewpor
 
   if (renderable_) {
     renderable_->setVisible(is_splat_pass);
+  }
+
+  if (is_splat_pass) {
+    // The depth-only viewport deliberately leaves colour writes disabled. In
+    // OpenGL, glClear honours that write mask, so the automatic transparent
+    // clear at the start of this viewport otherwise does nothing and old splat
+    // frames accumulate into long trails as the camera moves. Metal attachment
+    // clears ignore the previous pipeline's mask, which is why the bug was
+    // backend-specific. Restore an ordinary colour state before Ogre performs
+    // the viewport clear; the splat material installs its blend state again
+    // before drawing.
+    if (Ogre::RenderSystem * render_system = Ogre::Root::getSingleton().getRenderSystem()) {
+      render_system->setColourBlendState(Ogre::ColourBlendState());
+    }
   }
 
   if (is_depth_pass && depth_scheme_resolver_) {

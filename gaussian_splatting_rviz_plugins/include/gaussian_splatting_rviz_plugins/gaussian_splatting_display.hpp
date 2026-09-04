@@ -109,7 +109,14 @@ private:
     float quat[4];
   };
   std::vector<Ogre::Vector3> positions_;
-  std::vector<std::uint32_t> indices_;
+
+  // Depth-sorted draw order, one word per surviving splat: the view depth as an
+  // order-preserving key in the high 32 bits, the splat index in the low 32.
+  // Packing them lets a single radix pass sort and permute at once, and keeps
+  // the depth out of the comparator, where recomputing it was chasing a random
+  // load per comparison.
+  std::vector<std::uint64_t> order_;
+  std::vector<std::uint64_t> order_scratch_;
   std::vector<SplatInstance> instances_;
   std::vector<SplatInstance> sorted_instances_;
 
