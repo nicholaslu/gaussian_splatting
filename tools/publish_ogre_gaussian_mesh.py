@@ -108,28 +108,32 @@ def element_offset(buffers, element, vertex_index):
     return buffer["body"] + vertex_index * buffer["vertex_size"] + element["offset"]
 
 
+SH_C0 = 0.28209479177387814
+
+
+def covariances_to_scales_quats(cov):
+    """Recover linear scales and (x, y, z, w) quaternions from 3x3 covariances.
+
+    The Ogre .mesh carries Sigma directly, but the message stores the
+    definitional scale/rotation pair, so this inverts Sigma = R diag(s)^2 R^T.
+    The decomposition is unique only up to axis permutation and sign, which
+    describe the same ellipsoid.
+    """
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    scales = np.sqrt(np.clip(eigenvalues, 0.0, None)).astype(np.float32)
+
+    # eigh may return a left-handed basis; mirror one axis so it is a rotation.
+    flip = np.linalg.det(eigenvectors) < 0.0
+    eigenvectors[flip, :, 0] *= -1.0
+
+    quats = Rotation.from_matrix(eigenvectors).as_quat().astype(np.float32)
+    return scales, quats  # as_quat() is already (x, y, z, w)
+
+
 def parse_ogre_gaussian_mesh(path, max_splats=None):
-    try:
-        from geometry_msgs.msg import Point32
-        from std_msgs.msg import ColorRGBA
-        from gaussian_splatting_msgs.msg import Gaussian
-    except ModuleNotFoundError:
-        class Point32:
-            def __init__(self, x=0.0, y=0.0, z=0.0):
-                self.x = x
-                self.y = y
-                self.z = z
-
-        class ColorRGBA:
-            def __init__(self, r=0.0, g=0.0, b=0.0, a=0.0):
-                self.r = r
-                self.g = g
-                self.b = b
-                self.a = a
-
-        class Gaussian:
-            pass
-
     reader = MeshReader(path)
 
     header_id = reader.u16(0)
@@ -196,28 +200,44 @@ def parse_ogre_gaussian_mesh(path, max_splats=None):
         if element["type"] != elem_type:
             raise RuntimeError(f"unexpected {name} element type {element['type']}")
 
+    import numpy as np
+
     count = min(vertex_count, max_splats) if max_splats else vertex_count
-    splats = []
+
+    means = np.empty((count, 3), np.float32)
+    rgba = np.empty((count, 4), np.float32)
+    cov = np.empty((count, 3, 3), np.float64)
     for i in range(count):
-        px, py, pz = read_half3(reader.data, element_offset(buffers, position_elem, i))
-        r, g, b, a = read_colour(reader.data, element_offset(buffers, colour_elem, i))
-        cov_xx, cov_yy, cov_zz = read_half3(
-            reader.data, element_offset(buffers, cov_diag_elem, i))
-        cov_xy, cov_xz, cov_yz = read_half3(
-            reader.data, element_offset(buffers, cov_upper_elem, i))
+        means[i] = read_half3(reader.data, element_offset(buffers, position_elem, i))
+        rgba[i] = read_colour(reader.data, element_offset(buffers, colour_elem, i))
+        xx, yy, zz = read_half3(reader.data, element_offset(buffers, cov_diag_elem, i))
+        xy, xz, yz = read_half3(reader.data, element_offset(buffers, cov_upper_elem, i))
+        cov[i, 0, 0], cov[i, 1, 1], cov[i, 2, 2] = xx, yy, zz
+        cov[i, 0, 1] = cov[i, 1, 0] = xy
+        cov[i, 0, 2] = cov[i, 2, 0] = xz
+        cov[i, 1, 2] = cov[i, 2, 1] = yz
 
-        splat = Gaussian()
-        splat.position = Point32(x=float(px), y=float(py), z=float(pz))
-        splat.color = ColorRGBA(r=float(r), g=float(g), b=float(b), a=float(a))
-        splat.cov_xx = float(cov_xx)
-        splat.cov_yy = float(cov_yy)
-        splat.cov_zz = float(cov_zz)
-        splat.cov_xy = float(cov_xy)
-        splat.cov_xz = float(cov_xz)
-        splat.cov_yz = float(cov_yz)
-        splats.append(splat)
+    scales, quats = covariances_to_scales_quats(cov)
+    return means, rgba, scales, quats, vertex_count
 
-    return splats, vertex_count
+
+def build_message(means, rgba, scales, quats):
+    from gaussian_splatting_msgs.msg import GaussianSplats
+
+    msg = GaussianSplats()
+    msg.type = GaussianSplats.TYPE_3DGS
+    msg.rasterize_mode = GaussianSplats.RASTERIZE_MODE_CLASSIC
+    msg.eps2d = 0.3
+    msg.sh_degree = 0
+
+    msg.means = means.reshape(-1).tolist()
+    msg.scales = scales.reshape(-1).tolist()
+    msg.quats = quats.reshape(-1).tolist()
+    msg.opacities = rgba[:, 3].tolist()
+    # The mesh stores RGB, so invert the degree 0 SH mapping rgb = sh*C0 + 0.5.
+    msg.sh_dc = ((rgba[:, :3] - 0.5) / SH_C0).reshape(-1).tolist()
+    msg.sh_rest = []
+    return msg
 
 
 def create_publisher_node_class():
@@ -229,28 +249,23 @@ def create_publisher_node_class():
         def __init__(self, args):
             super().__init__("ogre_gaussian_mesh_publisher")
             self.publisher = self.create_publisher(GaussianSplats, args.topic, 1)
-            self.frame_id = args.frame_id
-            self.splats, source_count = parse_ogre_gaussian_mesh(args.mesh, args.max_splats)
+            means, rgba, scales, quats, source_count = parse_ogre_gaussian_mesh(
+                args.mesh, args.max_splats)
+            self.msg = build_message(means, rgba, scales, quats)
+            self.msg.header.frame_id = args.frame_id
+            self.count = len(means)
             self.get_logger().info(
-                f"loaded {len(self.splats)} / {source_count} splats from {args.mesh}")
+                f"loaded {self.count} / {source_count} splats from {args.mesh}")
             self.timer = self.create_timer(1.0 / args.rate, self.publish_once)
 
         def publish_once(self):
-            msg = GaussianSplats()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = self.frame_id
-            msg.splats = self.splats
-            self.publisher.publish(msg)
+            self.msg.header.stamp = self.get_clock().now().to_msg()
+            self.publisher.publish(self.msg)
             self.get_logger().info(
-                f"published {len(msg.splats)} splats",
+                f"published {self.count} splats",
                 throttle_duration_sec=2.0)
 
     return rclpy, OgreGaussianMeshPublisher
-
-
-class _Unused:
-    def __init__(self, args):
-        raise RuntimeError(args)
 
 
 def main():
@@ -264,15 +279,13 @@ def main():
     args = parser.parse_args()
 
     if args.dry_run:
-        splats, source_count = parse_ogre_gaussian_mesh(args.mesh, args.max_splats)
-        print(f"loaded {len(splats)} / {source_count} splats from {args.mesh}")
-        first = splats[0]
-        print(
-            "first splat:",
-            first.position.x, first.position.y, first.position.z,
-            first.color.r, first.color.g, first.color.b, first.color.a,
-            first.cov_xx, first.cov_yy, first.cov_zz,
-            first.cov_xy, first.cov_xz, first.cov_yz)
+        means, rgba, scales, quats, source_count = parse_ogre_gaussian_mesh(
+            args.mesh, args.max_splats)
+        print(f"loaded {len(means)} / {source_count} splats from {args.mesh}")
+        print("first mean  :", means[0])
+        print("first rgba  :", rgba[0])
+        print("first scale :", scales[0], "(linear sigma, metres)")
+        print("first quat  :", quats[0], "(x, y, z, w)")
         return
 
     rclpy, OgreGaussianMeshPublisher = create_publisher_node_class()

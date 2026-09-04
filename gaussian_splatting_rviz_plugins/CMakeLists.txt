@@ -13,7 +13,6 @@ find_package(rviz_rendering REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(gaussian_splatting_msgs REQUIRED)
-find_package(OpenGL QUIET)
 
 add_library(${PROJECT_NAME} SHARED
   src/gaussian_splatting_display.cpp
@@ -34,11 +33,6 @@ ament_target_dependencies(${PROJECT_NAME}
   ament_index_cpp
   gaussian_splatting_msgs
 )
-
-if(OpenGL_FOUND)
-  target_link_libraries(${PROJECT_NAME} OpenGL::GL)
-  target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_HAS_OPENGL=1)
-endif()
 
 pluginlib_export_plugin_description_file(rviz_common plugins_description.xml)
 

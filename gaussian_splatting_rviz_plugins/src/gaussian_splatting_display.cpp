@@ -9,23 +9,18 @@
 #include <OgreAxisAlignedBox.h>
 #include <OgreCamera.h>
 #include <OgreEntity.h>
+#include <OgreGpuProgramParams.h>
 #include <OgreHardwareBufferManager.h>
+#include <OgreMaterialManager.h>
 #include <OgreMeshManager.h>
-#include <OgreRenderSystem.h>
+#include <OgrePass.h>
 #include <OgreResourceGroupManager.h>
 #include <OgreRoot.h>
 #include <OgreSceneManager.h>
 #include <OgreSceneNode.h>
 #include <OgreSubMesh.h>
+#include <OgreTechnique.h>
 #include <OgreVertexIndexData.h>
-
-#if defined(GSPLAT_HAS_OPENGL) && __has_include(<GL/gl.h>)
-#include <GL/gl.h>
-#define GSPLAT_OPENGL_API_AVAILABLE 1
-#elif defined(GSPLAT_HAS_OPENGL) && __has_include(<OpenGL/gl.h>)
-#include <OpenGL/gl.h>
-#define GSPLAT_OPENGL_API_AVAILABLE 1
-#endif
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "pluginlib/class_list_macros.hpp"
@@ -42,19 +37,22 @@ namespace
 constexpr const char * kResourceGroup = "GaussianSplattingRviz";
 constexpr const char * kMaterialName = "GaussianSplatting/RViz";
 
-#ifndef GL_PROGRAM_POINT_SIZE
-#define GL_PROGRAM_POINT_SIZE 0x8642
-#endif
+// Degree 0 spherical harmonics basis, as used by the 3DGS reference
+// implementation: rgb = sh_dc * kSHC0 + 0.5
+constexpr float kSHC0 = 0.28209479177387814f;
 
-void enableProgrammablePointSize()
-{
-#if defined(GSPLAT_OPENGL_API_AVAILABLE)
-  Ogre::RenderSystem * render_system = Ogre::Root::getSingleton().getRenderSystem();
-  if (render_system && render_system->getName().find("OpenGL") != std::string::npos) {
-    glEnable(GL_PROGRAM_POINT_SIZE);
-  }
-#endif
-}
+// Each splat is expanded into a screen-aligned quad. Ogre's Metal render
+// system advertises RSC_VERTEX_BUFFER_INSTANCE_DATA but hardcodes
+// MTLVertexStepFunctionPerVertex, so hardware instancing cannot be used and
+// the per-splat attributes are duplicated across the four corners instead.
+constexpr std::size_t kVerticesPerSplat = 4;
+constexpr std::size_t kIndicesPerSplat = 6;
+constexpr float kCorners[kVerticesPerSplat][2] = {
+  {-1.0f, -1.0f},
+  {1.0f, -1.0f},
+  {1.0f, 1.0f},
+  {-1.0f, 1.0f},
+};
 
 bool usesMetalRenderSystem()
 {
@@ -72,12 +70,30 @@ T clamp(T value, T low, T high)
 
 GaussianSplattingDisplay::GaussianSplattingDisplay()
 {
-  mesh_name_ = "GaussianSplattingRvizMesh_" + std::to_string(reinterpret_cast<std::uintptr_t>(this));
+  const std::string suffix = std::to_string(reinterpret_cast<std::uintptr_t>(this));
+  mesh_name_ = "GaussianSplattingRvizMesh_" + suffix;
+  material_name_ = std::string(kMaterialName) + "_" + suffix;
+
+  sigma_radius_property_ = new rviz_common::properties::FloatProperty(
+    "Sigma Radius", 3.0f,
+    "Extent of the rasterised quad in standard deviations. Fill rate scales "
+    "with the square of this value, so lowering it is the cheapest way to "
+    "trade accuracy for speed: 3.0 matches the reference rasteriser, 2.5 "
+    "truncates the Gaussian at 4% of its peak, and 2.0 at 13% while costing "
+    "2.25x fewer fragments.",
+    this);
+  sigma_radius_property_->setMin(0.5f);
+  sigma_radius_property_->setMax(4.0f);
 }
 
 GaussianSplattingDisplay::~GaussianSplattingDisplay()
 {
   clearMesh();
+
+  if (material_) {
+    Ogre::MaterialManager::getSingleton().remove(material_);
+    material_.reset();
+  }
 
   if (splat_node_) {
     scene_manager_->destroySceneNode(splat_node_);
@@ -90,7 +106,6 @@ void GaussianSplattingDisplay::onInitialize()
   rviz_common::MessageFilterDisplay<GaussianSplats>::onInitialize();
 
   registerOgreResources();
-  enableProgrammablePointSize();
   splat_node_ = scene_manager_->getRootSceneNode()->createChildSceneNode();
 }
 
@@ -103,13 +118,19 @@ void GaussianSplattingDisplay::reset()
 void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
 {
   rviz_common::MessageFilterDisplay<GaussianSplats>::update(wall_dt, ros_dt);
-  enableProgrammablePointSize();
+  applyShaderParams();
   sortIndexBuffer();
 }
 
 void GaussianSplattingDisplay::processMessage(GaussianSplats::ConstSharedPtr msg)
 {
   if (!msg) {
+    return;
+  }
+
+  std::size_t count = 0;
+  if (!validate(*msg, count)) {
+    clearMesh();
     return;
   }
 
@@ -124,7 +145,74 @@ void GaussianSplattingDisplay::processMessage(GaussianSplats::ConstSharedPtr msg
   splat_node_->setPosition(frame_position);
   splat_node_->setOrientation(frame_orientation);
 
-  rebuildMesh(*msg);
+  if (count == 0) {
+    clearMesh();
+    return;
+  }
+
+  // Streaming sources (feed-forward models) emit a constant primitive count
+  // because their output is pixel-aligned, so this reallocates only once.
+  if (count != splat_count_) {
+    allocateMesh(count);
+  }
+
+  eps2d_ = msg->eps2d;
+  antialiased_ =
+    msg->rasterize_mode == GaussianSplats::RASTERIZE_MODE_ANTIALIASED ? 1.0f : 0.0f;
+  applyShaderParams();
+  uploadSplats(*msg, count);
+  writeDrawIndices();
+  sortIndexBuffer();
+}
+
+bool GaussianSplattingDisplay::validate(const GaussianSplats & msg, std::size_t & count)
+{
+  if (msg.type == GaussianSplats::TYPE_2DGS) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, "Message",
+      "TYPE_2DGS is not rendered yet: 2D Gaussians need ray/disc intersection "
+      "rather than the EWA projection this display implements.");
+    return false;
+  }
+  if (msg.type != GaussianSplats::TYPE_3DGS) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, "Message",
+      QString("Unknown primitive type %1.").arg(msg.type));
+    return false;
+  }
+
+  if (msg.means.size() % 3 != 0) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, "Message",
+      "means length is not a multiple of 3.");
+    return false;
+  }
+
+  count = msg.means.size() / 3;
+  const auto expect =
+    [&](const char * name, std::size_t actual, std::size_t wanted) {
+      if (actual == wanted) {
+        return true;
+      }
+      setStatus(
+        rviz_common::properties::StatusProperty::Error, "Message",
+        QString("%1 has %2 values, expected %3 for %4 primitives.")
+        .arg(name).arg(actual).arg(wanted).arg(count));
+      return false;
+    };
+
+  if (!expect("scales", msg.scales.size(), count * 3) ||
+    !expect("quats", msg.quats.size(), count * 4) ||
+    !expect("opacities", msg.opacities.size(), count) ||
+    !expect("sh_dc", msg.sh_dc.size(), count * 3))
+  {
+    return false;
+  }
+
+  setStatus(
+    rviz_common::properties::StatusProperty::Ok, "Message",
+    QString("%1 splats").arg(count));
+  return true;
 }
 
 void GaussianSplattingDisplay::registerOgreResources()
@@ -151,6 +239,24 @@ void GaussianSplattingDisplay::registerOgreResources()
   }
   rgm.initialiseResourceGroup(kResourceGroup);
 
+  // Clone the shared material so that eps2d / rasterize_mode set from one
+  // message cannot leak into another display instance.
+  Ogre::MaterialPtr base =
+    Ogre::MaterialManager::getSingleton().getByName(kMaterialName, kResourceGroup);
+  if (!base) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, "Material",
+      QString("Material '%1' was not found in %2. This usually means the shader "
+      "failed to compile; see Ogre.log in the directory rviz2 was started from.")
+      .arg(kMaterialName).arg(usesMetalRenderSystem() ? "Metal" : "GLSL"));
+    resources_registered_ = true;
+    return;
+  }
+
+  material_ = base->clone(material_name_, true, kResourceGroup);
+  material_->load();
+  setStatus(rviz_common::properties::StatusProperty::Ok, "Material", "loaded");
+
   resources_registered_ = true;
 }
 
@@ -166,111 +272,198 @@ void GaussianSplattingDisplay::clearMesh()
     mesh_.reset();
   }
 
+  position_buffer_.reset();
+  colour_buffer_.reset();
+  scale_buffer_.reset();
+  quat_buffer_.reset();
   index_buffer_.reset();
+
+  splat_count_ = 0;
   positions_.clear();
   indices_.clear();
+  draw_indices_.clear();
   last_camera_position_ = Ogre::Vector3::ZERO;
   last_camera_direction_ = Ogre::Vector3::ZERO;
 }
 
-void GaussianSplattingDisplay::rebuildMesh(const GaussianSplats & msg)
+void GaussianSplattingDisplay::allocateMesh(std::size_t count)
 {
   clearMesh();
 
-  const std::size_t count = msg.splats.size();
-  if (count == 0) {
-    return;
-  }
+  splat_count_ = count;
+  const std::size_t vertex_count = count * kVerticesPerSplat;
 
   positions_.resize(count);
   indices_.resize(count);
   std::iota(indices_.begin(), indices_.end(), 0);
+  draw_indices_.resize(count * kIndicesPerSplat);
 
-  std::vector<float> position_data(count * 3);
-  std::vector<float> colour_data(count * 4);
-  std::vector<float> cov_diag_data(count * 3);
-  std::vector<float> cov_upper_data(count * 3);
-
-  Ogre::AxisAlignedBox bounds;
-  bounds.setNull();
-  Ogre::Real radius_sq = 0.0f;
-
-  for (std::size_t i = 0; i < count; ++i) {
-    const auto & splat = msg.splats[i];
-
-    const Ogre::Vector3 position(
-      static_cast<Ogre::Real>(splat.position.x),
-      static_cast<Ogre::Real>(splat.position.y),
-      static_cast<Ogre::Real>(splat.position.z));
-    positions_[i] = position;
-    bounds.merge(position);
-    radius_sq = std::max(radius_sq, position.squaredLength());
-
-    position_data[i * 3 + 0] = static_cast<float>(splat.position.x);
-    position_data[i * 3 + 1] = static_cast<float>(splat.position.y);
-    position_data[i * 3 + 2] = static_cast<float>(splat.position.z);
-
-    colour_data[i * 4 + 0] = clamp(splat.color.r, 0.0f, 1.0f);
-    colour_data[i * 4 + 1] = clamp(splat.color.g, 0.0f, 1.0f);
-    colour_data[i * 4 + 2] = clamp(splat.color.b, 0.0f, 1.0f);
-    colour_data[i * 4 + 3] = clamp(splat.color.a, 0.0f, 1.0f);
-
-    cov_diag_data[i * 3 + 0] = splat.cov_xx;
-    cov_diag_data[i * 3 + 1] = splat.cov_yy;
-    cov_diag_data[i * 3 + 2] = splat.cov_zz;
-
-    cov_upper_data[i * 3 + 0] = splat.cov_xy;
-    cov_upper_data[i * 3 + 1] = splat.cov_xz;
-    cov_upper_data[i * 3 + 2] = splat.cov_yz;
-  }
+  position_data_.resize(vertex_count * 3);
+  colour_data_.resize(vertex_count * 4);
+  scale_data_.resize(vertex_count * 3);
+  quat_data_.resize(vertex_count * 4);
 
   mesh_ = Ogre::MeshManager::getSingleton().createManual(mesh_name_, kResourceGroup);
   Ogre::SubMesh * submesh = mesh_->createSubMesh();
   submesh->useSharedVertices = false;
-  submesh->operationType = Ogre::RenderOperation::OT_POINT_LIST;
-  submesh->setMaterialName(kMaterialName, kResourceGroup);
+  submesh->operationType = Ogre::RenderOperation::OT_TRIANGLE_LIST;
+  submesh->setMaterialName(material_name_, kResourceGroup);
   submesh->vertexData = OGRE_NEW Ogre::VertexData();
-  submesh->vertexData->vertexCount = count;
+  submesh->vertexData->vertexCount = vertex_count;
 
   Ogre::VertexDeclaration * declaration = submesh->vertexData->vertexDeclaration;
   declaration->addElement(0, 0, Ogre::VET_FLOAT3, Ogre::VES_POSITION);
   declaration->addElement(1, 0, Ogre::VET_FLOAT4, Ogre::VES_DIFFUSE);
   declaration->addElement(2, 0, Ogre::VET_FLOAT3, Ogre::VES_TEXTURE_COORDINATES, 0);
-  declaration->addElement(3, 0, Ogre::VET_FLOAT3, Ogre::VES_TEXTURE_COORDINATES, 1);
+  declaration->addElement(3, 0, Ogre::VET_FLOAT4, Ogre::VES_TEXTURE_COORDINATES, 1);
+  declaration->addElement(4, 0, Ogre::VET_FLOAT2, Ogre::VES_TEXTURE_COORDINATES, 2);
 
   auto & hbm = Ogre::HardwareBufferManager::getSingleton();
-  const Ogre::HardwareBuffer::Usage vertex_usage = Ogre::HardwareBuffer::HBU_STATIC_WRITE_ONLY;
+  const auto dynamic = Ogre::HardwareBuffer::HBU_DYNAMIC_WRITE_ONLY;
+  const auto stat1c = Ogre::HardwareBuffer::HBU_STATIC_WRITE_ONLY;
 
-  auto write_vertex_buffer =
-    [&](unsigned short source, const std::vector<float> & data, std::size_t components) {
-      Ogre::HardwareVertexBufferSharedPtr buffer = hbm.createVertexBuffer(
-        sizeof(float) * components, count, vertex_usage);
-      buffer->writeData(0, buffer->getSizeInBytes(), data.data(), true);
+  auto bind =
+    [&](unsigned short source, std::size_t components, Ogre::HardwareBuffer::Usage usage) {
+      Ogre::HardwareVertexBufferSharedPtr buffer =
+        hbm.createVertexBuffer(sizeof(float) * components, vertex_count, usage);
       submesh->vertexData->vertexBufferBinding->setBinding(source, buffer);
+      return buffer;
     };
 
-  write_vertex_buffer(0, position_data, 3);
-  write_vertex_buffer(1, colour_data, 4);
-  write_vertex_buffer(2, cov_diag_data, 3);
-  write_vertex_buffer(3, cov_upper_data, 3);
+  position_buffer_ = bind(0, 3, dynamic);
+  colour_buffer_ = bind(1, 4, dynamic);
+  scale_buffer_ = bind(2, 3, dynamic);
+  quat_buffer_ = bind(3, 4, dynamic);
+
+  // The corner offsets never change, so this buffer is written once here and
+  // left alone for the lifetime of the mesh.
+  Ogre::HardwareVertexBufferSharedPtr corner_buffer = bind(4, 2, stat1c);
+  std::vector<float> corner_data(vertex_count * 2);
+  for (std::size_t i = 0; i < count; ++i) {
+    for (std::size_t corner = 0; corner < kVerticesPerSplat; ++corner) {
+      const std::size_t vertex = i * kVerticesPerSplat + corner;
+      corner_data[vertex * 2 + 0] = kCorners[corner][0];
+      corner_data[vertex * 2 + 1] = kCorners[corner][1];
+    }
+  }
+  corner_buffer->writeData(0, corner_buffer->getSizeInBytes(), corner_data.data(), true);
 
   index_buffer_ = hbm.createIndexBuffer(
-    Ogre::HardwareIndexBuffer::IT_32BIT,
-    count,
-    Ogre::HardwareBuffer::HBU_DYNAMIC_WRITE_ONLY);
-  index_buffer_->writeData(0, index_buffer_->getSizeInBytes(), indices_.data(), true);
-  submesh->indexData->indexCount = count;
+    Ogre::HardwareIndexBuffer::IT_32BIT, count * kIndicesPerSplat, dynamic);
+  submesh->indexData->indexCount = count * kIndicesPerSplat;
   submesh->indexData->indexBuffer = index_buffer_;
 
-  mesh_->_setBounds(bounds);
-  mesh_->_setBoundingSphereRadius(std::sqrt(radius_sq));
+  // Bounds are refreshed by uploadSplats(); start from something valid so the
+  // mesh can be loaded before any data has been written.
+  mesh_->_setBounds(Ogre::AxisAlignedBox::BOX_INFINITE);
+  mesh_->_setBoundingSphereRadius(std::numeric_limits<Ogre::Real>::max());
   mesh_->load();
 
   entity_ = scene_manager_->createEntity(mesh_name_);
-  entity_->setMaterialName(kMaterialName, kResourceGroup);
+  entity_->setMaterialName(material_name_, kResourceGroup);
   splat_node_->attachObject(entity_);
+}
 
-  sortIndexBuffer();
+void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::size_t count)
+{
+  Ogre::AxisAlignedBox bounds;
+  bounds.setNull();
+  Ogre::Real radius_sq = 0.0f;
+
+  for (std::size_t i = 0; i < count; ++i) {
+    const Ogre::Vector3 position(msg.means[i * 3], msg.means[i * 3 + 1], msg.means[i * 3 + 2]);
+    positions_[i] = position;
+    bounds.merge(position);
+    radius_sq = std::max(radius_sq, position.squaredLength());
+
+    // Degree 0 spherical harmonics only. The higher order coefficients are
+    // carried by the message but evaluating them needs the view direction per
+    // frame, which does not fit in a vertex attribute.
+    const float r = clamp(msg.sh_dc[i * 3] * kSHC0 + 0.5f, 0.0f, 1.0f);
+    const float g = clamp(msg.sh_dc[i * 3 + 1] * kSHC0 + 0.5f, 0.0f, 1.0f);
+    const float b = clamp(msg.sh_dc[i * 3 + 2] * kSHC0 + 0.5f, 0.0f, 1.0f);
+    const float a = clamp(msg.opacities[i], 0.0f, 1.0f);
+
+    for (std::size_t corner = 0; corner < kVerticesPerSplat; ++corner) {
+      const std::size_t vertex = i * kVerticesPerSplat + corner;
+
+      position_data_[vertex * 3 + 0] = msg.means[i * 3];
+      position_data_[vertex * 3 + 1] = msg.means[i * 3 + 1];
+      position_data_[vertex * 3 + 2] = msg.means[i * 3 + 2];
+
+      colour_data_[vertex * 4 + 0] = r;
+      colour_data_[vertex * 4 + 1] = g;
+      colour_data_[vertex * 4 + 2] = b;
+      colour_data_[vertex * 4 + 3] = a;
+
+      scale_data_[vertex * 3 + 0] = msg.scales[i * 3];
+      scale_data_[vertex * 3 + 1] = msg.scales[i * 3 + 1];
+      scale_data_[vertex * 3 + 2] = msg.scales[i * 3 + 2];
+
+      quat_data_[vertex * 4 + 0] = msg.quats[i * 4];
+      quat_data_[vertex * 4 + 1] = msg.quats[i * 4 + 1];
+      quat_data_[vertex * 4 + 2] = msg.quats[i * 4 + 2];
+      quat_data_[vertex * 4 + 3] = msg.quats[i * 4 + 3];
+    }
+  }
+
+  position_buffer_->writeData(
+    0, position_buffer_->getSizeInBytes(), position_data_.data(), true);
+  colour_buffer_->writeData(0, colour_buffer_->getSizeInBytes(), colour_data_.data(), true);
+  scale_buffer_->writeData(0, scale_buffer_->getSizeInBytes(), scale_data_.data(), true);
+  quat_buffer_->writeData(0, quat_buffer_->getSizeInBytes(), quat_data_.data(), true);
+
+  mesh_->_setBounds(bounds);
+  mesh_->_setBoundingSphereRadius(std::sqrt(radius_sq));
+
+  // Force a fresh depth sort now that the geometry has changed.
+  last_camera_position_ = Ogre::Vector3::ZERO;
+  last_camera_direction_ = Ogre::Vector3::ZERO;
+}
+
+void GaussianSplattingDisplay::applyShaderParams()
+{
+  if (!material_) {
+    return;
+  }
+
+  Ogre::Technique * technique = material_->getBestTechnique();
+  if (!technique || technique->getNumPasses() == 0) {
+    return;
+  }
+
+  Ogre::Pass * pass = technique->getPass(0);
+  if (!pass->hasVertexProgram()) {
+    return;
+  }
+
+  // Pushed every frame rather than on change: setNamedConstant is a cheap
+  // write into the parameter block, and this avoids needing moc for a
+  // property-changed slot.
+  const Ogre::GpuProgramParametersSharedPtr params = pass->getVertexProgramParameters();
+  params->setNamedConstant("eps2d", eps2d_);
+  params->setNamedConstant("antialiased", antialiased_);
+  params->setNamedConstant("sigma_radius", sigma_radius_property_->getFloat());
+}
+
+void GaussianSplattingDisplay::writeDrawIndices()
+{
+  if (!index_buffer_) {
+    return;
+  }
+
+  std::size_t output = 0;
+  for (const std::uint32_t splat : indices_) {
+    const std::uint32_t base = splat * static_cast<std::uint32_t>(kVerticesPerSplat);
+    draw_indices_[output++] = base;
+    draw_indices_[output++] = base + 1;
+    draw_indices_[output++] = base + 2;
+    draw_indices_[output++] = base;
+    draw_indices_[output++] = base + 2;
+    draw_indices_[output++] = base + 3;
+  }
+
+  index_buffer_->writeData(0, index_buffer_->getSizeInBytes(), draw_indices_.data(), true);
 }
 
 void GaussianSplattingDisplay::sortIndexBuffer()
@@ -308,7 +501,7 @@ void GaussianSplattingDisplay::sortIndexBuffer()
            positions_[b].dotProduct(local_sort_direction);
   });
 
-  index_buffer_->writeData(0, index_buffer_->getSizeInBytes(), indices_.data(), true);
+  writeDrawIndices();
 }
 
 }  // namespace gaussian_splatting_rviz_plugins

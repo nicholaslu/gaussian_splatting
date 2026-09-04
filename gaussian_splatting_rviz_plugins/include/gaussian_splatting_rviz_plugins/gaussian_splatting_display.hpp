@@ -6,12 +6,15 @@
 #include <vector>
 
 #include <OgreHardwareIndexBuffer.h>
+#include <OgreHardwareVertexBuffer.h>
+#include <OgreMaterial.h>
 #include <OgreMesh.h>
 #include <OgrePrerequisites.h>
 #include <OgreVector.h>
 
 #include "gaussian_splatting_msgs/msg/gaussian_splats.hpp"
 #include "rviz_common/message_filter_display.hpp"
+#include "rviz_common/properties/float_property.hpp"
 
 namespace gaussian_splatting_rviz_plugins
 {
@@ -33,18 +36,51 @@ private:
   void processMessage(GaussianSplats::ConstSharedPtr msg) override;
   void registerOgreResources();
   void clearMesh();
-  void rebuildMesh(const GaussianSplats & msg);
+
+  // Returns false and sets the display status when the message violates the
+  // array size invariants documented in GaussianSplats.msg.
+  bool validate(const GaussianSplats & msg, std::size_t & count);
+
+  // Allocates the mesh and its buffers for the given primitive count. Only
+  // called when the count changes; a stream of equally sized messages reuses
+  // the existing buffers via uploadSplats().
+  void allocateMesh(std::size_t count);
+  void uploadSplats(const GaussianSplats & msg, std::size_t count);
+  void applyShaderParams();
+  void writeDrawIndices();
   void sortIndexBuffer();
+
+  rviz_common::properties::FloatProperty * sigma_radius_property_ = nullptr;
 
   Ogre::SceneNode * splat_node_ = nullptr;
   Ogre::Entity * entity_ = nullptr;
   Ogre::MeshPtr mesh_;
+  Ogre::MaterialPtr material_;
+  Ogre::HardwareVertexBufferSharedPtr position_buffer_;
+  Ogre::HardwareVertexBufferSharedPtr colour_buffer_;
+  Ogre::HardwareVertexBufferSharedPtr scale_buffer_;
+  Ogre::HardwareVertexBufferSharedPtr quat_buffer_;
   Ogre::HardwareIndexBufferSharedPtr index_buffer_;
+
+  std::size_t splat_count_ = 0;
   std::vector<Ogre::Vector3> positions_;
   std::vector<std::uint32_t> indices_;
+  std::vector<std::uint32_t> draw_indices_;
+
+  // Scratch buffers reused across messages to keep streaming allocation-free.
+  std::vector<float> position_data_;
+  std::vector<float> colour_data_;
+  std::vector<float> scale_data_;
+  std::vector<float> quat_data_;
+
+  // Rasterisation convention carried by the most recent message.
+  float eps2d_ = 0.3f;
+  float antialiased_ = 0.0f;
+
   Ogre::Vector3 last_camera_position_ = Ogre::Vector3::ZERO;
   Ogre::Vector3 last_camera_direction_ = Ogre::Vector3::ZERO;
   std::string mesh_name_;
+  std::string material_name_;
   bool resources_registered_ = false;
 };
 

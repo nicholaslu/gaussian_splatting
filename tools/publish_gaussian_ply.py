@@ -1,121 +1,98 @@
 #!/usr/bin/env python3
+"""Publish a 3DGS .ply file as a gaussian_splatting_msgs/GaussianSplats message.
+
+The message carries the definitional form of the parameters (linear scales,
+linear opacity, normalised quaternions in ROS order), so this converts out of
+the PLY's optimiser parameterisation on the way.
+
+The data is published unrotated in --frame-id. COLMAP-derived reconstructions
+are not in a REP-103 frame, but rotating the points here would also require
+rotating the spherical harmonics (Wigner D matrices for degree >= 1), so the
+axis change belongs in TF instead:
+
+    ros2 run tf2_ros static_transform_publisher \\
+        --frame-id map --child-frame-id splats --roll -1.5708
+"""
 
 import argparse
-import math
-import struct
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Header
-from geometry_msgs.msg import Point32
-from std_msgs.msg import ColorRGBA
 
-from gaussian_splatting_msgs.msg import Gaussian, GaussianSplats
+from gaussian_splatting_msgs.msg import GaussianSplats
 
 
-SH_C0 = 0.28209479177387814
-
-
-def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def quat_to_rotmat(q):
-    # GraphDECO stores rot as w, x, y, z
-    w, x, y, z = q
-    n = math.sqrt(w * w + x * x + y * y + z * z)
-    if n == 0.0:
-        return np.eye(3, dtype=np.float32)
-    w, x, y, z = w / n, x / n, y / n, z / n
-
-    return np.array([
-        [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w],
-        [2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w],
-        [2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y],
-    ], dtype=np.float32)
-
-
-def compute_covariance(scale, rot):
-    r = quat_to_rotmat(rot)
-    s = np.diag(scale)
-    m = r @ s
-    cov = m @ m.T
-    return cov
-
-
-def read_3dgs_ply(path, max_splats=None, stride=1, scale_mult=1.0):
+def load_3dgs_ply(path, max_splats=None, stride=1, scale_mult=1.0):
     from gsply import plyread
 
     data = plyread(path)
 
-    # Convert PLY log-scales/logit-opacities to linear values,
-    # and SH DC coefficients to RGB.
+    # PLY stores log-scales and logit-opacities; denormalize() applies exp()
+    # and sigmoid(). to_rgb() is deliberately NOT called: the message carries
+    # raw SH coefficients, not RGB.
     data.denormalize()
-    data.to_rgb()
 
-    means = data.means
-    scales = data.scales
-    quats = data.quats
-    opacities = data.opacities
-    colors = data.sh0
+    means = np.asarray(data.means, dtype=np.float32)
+    scales = np.asarray(data.scales, dtype=np.float32)
+    quats = np.asarray(data.quats, dtype=np.float32)
+    opacities = np.asarray(data.opacities, dtype=np.float32).reshape(-1)
+    sh0 = np.asarray(data.sh0, dtype=np.float32)
+    shN = np.asarray(data.shN, dtype=np.float32)
+    sh_degree = int(data.get_sh_degree())
 
-    print("scales min/max", scales.min(), scales.max())
-    print("opacities min/max", opacities.min(), opacities.max())
+    if stride > 1:
+        sel = slice(None, None, stride)
+        means, scales, quats = means[sel], scales[sel], quats[sel]
+        opacities, sh0, shN = opacities[sel], sh0[sel], shN[sel]
+    if max_splats:
+        n = min(len(means), max_splats)
+        means, scales, quats = means[:n], scales[:n], quats[:n]
+        opacities, sh0, shN = opacities[:n], sh0[:n], shN[:n]
 
-    count = means.shape[0]
-    selected = np.arange(0, count, stride)
-    if max_splats is not None:
-        selected = selected[:max_splats]
+    # gsply returns normalised quaternions in PLY order (w, x, y, z); the
+    # message uses the ROS component order (x, y, z, w).
+    quats = np.roll(quats, -1, axis=1)
 
-    splats = []
-    for i in selected:
-        xyz = means[i]
-        scale = scales[i] * scale_mult
-        rot = quats[i]
-        cov = compute_covariance(scale, rot)
+    msg = GaussianSplats()
+    msg.type = GaussianSplats.TYPE_3DGS
+    msg.rasterize_mode = GaussianSplats.RASTERIZE_MODE_CLASSIC
+    msg.eps2d = 0.3
+    msg.sh_degree = sh_degree
 
-        rgb = np.clip(colors[i], 0.0, 1.0)
-        alpha = float(np.clip(opacities[i], 0.0, 1.0))
-
-        g = Gaussian()
-        g.position = Point32(x=float(xyz[0]), y=float(xyz[1]), z=float(xyz[2]))
-        g.color = ColorRGBA(r=float(rgb[0]), g=float(rgb[1]), b=float(rgb[2]), a=alpha)
-
-        g.cov_xx = float(cov[0, 0])
-        g.cov_yy = float(cov[1, 1])
-        g.cov_zz = float(cov[2, 2])
-        g.cov_xy = float(cov[0, 1])
-        g.cov_xz = float(cov[0, 2])
-        g.cov_yz = float(cov[1, 2])
-        splats.append(g)
-
-    return splats
+    msg.means = (means * scale_mult).reshape(-1).tolist()
+    msg.scales = (scales * scale_mult).reshape(-1).tolist()
+    msg.quats = quats.reshape(-1).tolist()
+    msg.opacities = opacities.tolist()
+    msg.sh_dc = sh0.reshape(-1).tolist()
+    # gsply already returns shN as (N, K-1, 3), which is the coefficient-major
+    # layout the message wants, so no transpose is needed here.
+    msg.sh_rest = shN.reshape(-1).tolist()
+    return msg
 
 
 class GaussianPlyPublisher(Node):
     def __init__(self, args):
         super().__init__("gaussian_ply_publisher")
         self.publisher = self.create_publisher(GaussianSplats, args.topic, 1)
-        self.frame_id = args.frame_id
-        self.splats = read_3dgs_ply(
+        self.msg = load_3dgs_ply(
             args.ply,
             max_splats=args.max_splats,
             stride=args.stride,
             scale_mult=args.scale_mult,
         )
+        self.msg.header.frame_id = args.frame_id
 
-        self.get_logger().info(f"loaded {len(self.splats)} splats from {args.ply}")
+        count = len(self.msg.means) // 3
+        self.get_logger().info(
+            f"loaded {count} splats from {args.ply} (sh_degree={self.msg.sh_degree})")
         self.timer = self.create_timer(1.0 / args.rate, self.publish_once)
 
     def publish_once(self):
-        msg = GaussianSplats()
-        msg.header = Header()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.frame_id
-        msg.splats = self.splats
-        self.publisher.publish(msg)
-        self.get_logger().info(f"published {len(msg.splats)} splats", throttle_duration_sec=2.0)
+        self.msg.header.stamp = self.get_clock().now().to_msg()
+        self.publisher.publish(self.msg)
+        self.get_logger().info(
+            f"published {len(self.msg.means) // 3} splats", throttle_duration_sec=2.0)
 
 
 def main():
