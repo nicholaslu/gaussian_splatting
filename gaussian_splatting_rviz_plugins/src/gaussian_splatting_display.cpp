@@ -59,15 +59,36 @@ constexpr const char * kDepthMaterialScheme = "GaussianDepthOnly";
 // belongs anyway.
 constexpr Ogre::uint8 kSplatRenderQueue = Ogre::RENDER_QUEUE_MAIN + 1;
 
-// Degree 0 spherical harmonics basis, as used by the 3DGS reference
-// implementation: rgb = sh_dc * kSHC0 + 0.5
+// Spherical harmonics basis constants, as used by the 3DGS reference
+// implementation. Degree 0 alone gives rgb = sh_dc * kSHC0 + 0.5; the rest add
+// the view dependence that a specular surface is almost entirely made of.
 constexpr float kSHC0 = 0.28209479177387814f;
+constexpr std::uint8_t kMaxShDegree = 3;
+constexpr float kSHC1 = 0.4886025119029199f;
+constexpr float kSHC2[5] = {
+  1.0925484305920792f, -1.0925484305920792f, 0.31539156525252005f,
+  -1.0925484305920792f, 0.5462742152960396f,
+};
+constexpr float kSHC3[7] = {
+  -0.5900435899266435f, 2.890611442640554f, -0.4570457994644658f,
+  0.3731763325901154f, -0.4570457994644658f, 1.445305721320277f,
+  -0.5900435899266435f,
+};
 
 // Each splat is expanded from one instance record and a shared octagon. The
 // octagon circumscribes the unit circle, so it preserves every fragment that
 // the Gaussian shader can keep while removing 17.2% of the bounding square's
 // corner area. RViz's patched Ogre Metal render system maps instance buffers
 // to MTLVertexStepFunctionPerInstance; OpenGL uses the same Ogre declaration.
+// The per-splat record is read from a texture rather than streamed per
+// instance, so a depth sort rewrites one index and one colour per splat rather
+// than the whole record. Three RGBA32F texels hold it, and the width is a
+// whole number of splats so that a splat never straddles a row.
+constexpr std::size_t kTexelsPerSplat = 3;
+constexpr unsigned int kSplatDataWidth = 768;
+static_assert(
+  kSplatDataWidth % kTexelsPerSplat == 0, "a texture row must hold whole splats");
+
 constexpr std::size_t kVerticesPerSplat = 8;
 constexpr std::size_t kIndicesPerSplat = 18;
 constexpr float kOctagonTangent = 0.41421356237f;
@@ -606,6 +627,23 @@ bool GaussianSplattingDisplay::validate(const GaussianSplats & msg, std::size_t 
     return false;
   }
 
+  if (msg.sh_degree > kMaxShDegree) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, "Message",
+      QString("sh_degree is %1; this display evaluates up to %2.")
+      .arg(msg.sh_degree).arg(kMaxShDegree));
+    return false;
+  }
+
+  // (degree + 1)^2 coefficients in total, of which the first is sh_dc. The
+  // stride into sh_rest is derived from this, so a wrong size here would be
+  // read as a different degree rather than rejected.
+  const std::size_t coefficients =
+    (msg.sh_degree + 1u) * (msg.sh_degree + 1u) - 1u;
+  if (!expect("sh_rest", msg.sh_rest.size(), count * coefficients * 3)) {
+    return false;
+  }
+
   setStatus(
     rviz_common::properties::StatusProperty::Ok, "Message",
     QString("%1 splats").arg(count));
@@ -673,8 +711,16 @@ void GaussianSplattingDisplay::clearMesh()
   positions_.clear();
   order_.clear();
   order_scratch_.clear();
-  instances_.clear();
-  sorted_instances_.clear();
+  records_.clear();
+  draw_instances_.clear();
+  colours_.clear();
+  sh_dc_.clear();
+  sh_rest_.clear();
+  sh_coefficients_ = 0;
+  if (splat_data_texture_) {
+    Ogre::TextureManager::getSingleton().remove(splat_data_texture_);
+    splat_data_texture_.reset();
+  }
   last_camera_position_ = Ogre::Vector3::ZERO;
   last_camera_direction_ = Ogre::Vector3::ZERO;
   last_viewport_width_ = 0;
@@ -696,21 +742,22 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   positions_.resize(count);
   order_.reserve(count);
   order_scratch_.resize(count);
-  instances_.resize(count);
-  sorted_instances_.resize(count);
+  records_.resize(count);
+  draw_instances_.resize(count);
+  colours_.assign(count * 3, 0.0f);
+  createSplatDataTexture(count);
 
   auto * vertex_data = OGRE_NEW Ogre::VertexData();
   vertex_data->vertexCount = kVerticesPerSplat;
 
+  // A float rather than an integer type: indices are exact in float32 up to
+  // 2^24, far past any splat count that fits in memory, and this keeps the
+  // attribute a plain float on both back ends.
   Ogre::VertexDeclaration * declaration = vertex_data->vertexDeclaration;
   declaration->addElement(
-    0, offsetof(SplatInstance, position), Ogre::VET_FLOAT3, Ogre::VES_POSITION);
+    0, offsetof(DrawInstance, index), Ogre::VET_FLOAT1, Ogre::VES_TEXTURE_COORDINATES, 0);
   declaration->addElement(
-    0, offsetof(SplatInstance, colour), Ogre::VET_FLOAT4, Ogre::VES_DIFFUSE);
-  declaration->addElement(
-    0, offsetof(SplatInstance, scale), Ogre::VET_FLOAT3, Ogre::VES_TEXTURE_COORDINATES, 0);
-  declaration->addElement(
-    0, offsetof(SplatInstance, quat), Ogre::VET_FLOAT4, Ogre::VES_TEXTURE_COORDINATES, 1);
+    0, offsetof(DrawInstance, colour), Ogre::VET_FLOAT3, Ogre::VES_DIFFUSE);
   declaration->addElement(
     1, 0, Ogre::VET_FLOAT2, Ogre::VES_TEXTURE_COORDINATES, 2);
 
@@ -718,7 +765,7 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   const auto dynamic = Ogre::HardwareBuffer::HBU_DYNAMIC_WRITE_ONLY;
   const auto stat1c = Ogre::HardwareBuffer::HBU_STATIC_WRITE_ONLY;
 
-  instance_buffer_ = hbm.createVertexBuffer(sizeof(SplatInstance), count, dynamic);
+  instance_buffer_ = hbm.createVertexBuffer(sizeof(DrawInstance), count, dynamic);
   instance_buffer_->setIsInstanceData(true);
   instance_buffer_->setInstanceDataStepRate(1);
   vertex_data->vertexBufferBinding->setBinding(0, instance_buffer_);
@@ -759,6 +806,63 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   splat_node_->attachObject(renderable_.get());
 }
 
+void GaussianSplattingDisplay::createSplatDataTexture(std::size_t count)
+{
+  if (count == 0) {
+    return;
+  }
+
+  const std::size_t texels = count * kTexelsPerSplat;
+  const std::size_t rows = (texels + kSplatDataWidth - 1) / kSplatDataWidth;
+
+  auto & texture_manager = Ogre::TextureManager::getSingleton();
+  splat_data_texture_ = texture_manager.createManual(
+    mesh_name_ + "/data", Ogre::ResourceGroupManager::DEFAULT_RESOURCE_GROUP_NAME,
+    Ogre::TEX_TYPE_2D, kSplatDataWidth, static_cast<unsigned int>(rows), 0,
+    Ogre::PF_FLOAT32_RGBA, Ogre::TU_DYNAMIC_WRITE_ONLY);
+
+  // The shader reads texels by integer coordinate, so this never samples and
+  // never filters; the state is set anyway because a pass with a texture unit
+  // gets a sampler regardless, and RGBA32F is not filterable on Apple GPUs.
+  if (material_) {
+    Ogre::Pass * pass = material_->getTechnique(0)->getPass(0);
+    if (pass->getNumTextureUnitStates() == 0) {
+      pass->createTextureUnitState();
+    }
+    Ogre::TextureUnitState * unit = pass->getTextureUnitState(0);
+    unit->setTexture(splat_data_texture_);
+    unit->setTextureFiltering(Ogre::TFO_NONE);
+    unit->setTextureAddressingMode(Ogre::TextureUnitState::TAM_CLAMP);
+  }
+
+  applyShaderParams();
+}
+
+void GaussianSplattingDisplay::writeSplatDataTexture()
+{
+  if (!splat_data_texture_ || records_.empty()) {
+    return;
+  }
+
+  // The last row is only partly used, so lock and fill row by row rather than
+  // handing the whole buffer a short source box.
+  const Ogre::HardwarePixelBufferSharedPtr buffer = splat_data_texture_->getBuffer();
+  buffer->lock(Ogre::HardwareBuffer::HBL_DISCARD);
+  const Ogre::PixelBox & box = buffer->getCurrentLock();
+  auto * destination = reinterpret_cast<float *>(box.data);
+  const std::size_t row_floats = box.rowPitch * 4;
+  const std::size_t floats_per_splat = kTexelsPerSplat * 4;
+  const std::size_t splats_per_row = kSplatDataWidth / kTexelsPerSplat;
+
+  for (std::size_t row = 0; row * splats_per_row < records_.size(); ++row) {
+    const std::size_t first = row * splats_per_row;
+    const std::size_t here = std::min(splats_per_row, records_.size() - first);
+    std::memcpy(
+      destination + row * row_floats, &records_[first], here * floats_per_splat * sizeof(float));
+  }
+  buffer->unlock();
+}
+
 void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::size_t count)
 {
   Ogre::AxisAlignedBox bounds;
@@ -769,23 +873,22 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
     positions_[i] = position;
     bounds.merge(position);
 
-    // Degree 0 spherical harmonics only. The higher order coefficients are
-    // carried by the message but evaluating them needs the view direction per
-    // frame, which does not fit in a vertex attribute.
-    const float r = clamp(msg.sh_dc[i * 3] * kSHC0 + 0.5f, 0.0f, 1.0f);
-    const float g = clamp(msg.sh_dc[i * 3 + 1] * kSHC0 + 0.5f, 0.0f, 1.0f);
-    const float b = clamp(msg.sh_dc[i * 3 + 2] * kSHC0 + 0.5f, 0.0f, 1.0f);
-    const float a = clamp(msg.opacities[i], 0.0f, 1.0f);
-
-    SplatInstance & instance = instances_[i];
-    std::copy_n(&msg.means[i * 3], 3, instance.position);
-    instance.colour[0] = r;
-    instance.colour[1] = g;
-    instance.colour[2] = b;
-    instance.colour[3] = a;
-    std::copy_n(&msg.scales[i * 3], 3, instance.scale);
-    std::copy_n(&msg.quats[i * 4], 4, instance.quat);
+    SplatRecord & record = records_[i];
+    std::copy_n(&msg.means[i * 3], 3, record.position);
+    record.opacity = clamp(msg.opacities[i], 0.0f, 1.0f);
+    std::copy_n(&msg.scales[i * 3], 3, record.scale);
+    std::copy_n(&msg.quats[i * 4], 4, record.quat);
+    record.pad0 = 0.0f;
   }
+
+  // Colour cannot be baked in here: beyond degree 0 it depends on the view
+  // direction, so the coefficients are kept and evaluated whenever the camera
+  // moves. That is the same trigger the depth sort already uses.
+  sh_coefficients_ = (msg.sh_degree + 1u) * (msg.sh_degree + 1u) - 1u;
+  sh_dc_.assign(msg.sh_dc.begin(), msg.sh_dc.end());
+  sh_rest_.assign(msg.sh_rest.begin(), msg.sh_rest.end());
+
+  writeSplatDataTexture();
 
   if (renderable_) {
     renderable_->setBoundingBox(bounds);
@@ -818,6 +921,16 @@ void GaussianSplattingDisplay::applyShaderParams()
   params->setNamedConstant("eps2d", eps2d_);
   params->setNamedConstant("antialiased", antialiased_);
   params->setNamedConstant("sigma_radius", sigma_radius_property_->getFloat());
+
+  // The shader turns a splat index into a texel coordinate, so it needs the
+  // texture's dimensions. GLSL also needs the reciprocals, since GLSL 120 has
+  // no integer texel fetch and has to sample at normalised coordinates.
+  const float width = splat_data_texture_ ?
+    static_cast<float>(splat_data_texture_->getWidth()) : 1.0f;
+  const float height = splat_data_texture_ ?
+    static_cast<float>(splat_data_texture_->getHeight()) : 1.0f;
+  params->setNamedConstant(
+    "splat_data_size", Ogre::Vector4(width, height, 1.0f / width, 1.0f / height));
 }
 
 void GaussianSplattingDisplay::writeSortedInstances()
@@ -826,15 +939,20 @@ void GaussianSplattingDisplay::writeSortedInstances()
     return;
   }
 
+  // The shader reads the record from the data texture, so only the index and
+  // the view-dependent colour move: eight bytes per splat, not a whole record.
   for (std::size_t output = 0; output < order_.size(); ++output) {
-    sorted_instances_[output] = instances_[static_cast<std::uint32_t>(order_[output])];
+    const auto splat = static_cast<std::uint32_t>(order_[output]);
+    DrawInstance & instance = draw_instances_[output];
+    instance.index = static_cast<float>(splat);
+    std::copy_n(&colours_[splat * 3], 3, instance.colour);
   }
 
   visible_splat_count_ = order_.size();
   renderable_->setInstanceCount(visible_splat_count_);
   if (visible_splat_count_ > 0) {
     instance_buffer_->writeData(
-      0, visible_splat_count_ * sizeof(SplatInstance), sorted_instances_.data(), true);
+      0, visible_splat_count_ * sizeof(DrawInstance), draw_instances_.data(), true);
   }
 }
 
@@ -886,6 +1004,60 @@ void radixSortByHighWord(
   // only here so the pass count can change without silently drawing garbage.
   if (source != values.data()) {
     std::memcpy(values.data(), source, count * sizeof(std::uint64_t));
+  }
+}
+
+// Evaluates the spherical harmonics for one splat along a unit view direction.
+// This is eval_sh() from the 3DGS reference implementation, degree for degree;
+// `rest` is laid out coefficient major, matching sh_rest in GaussianSplats.msg.
+// Like the reference it clamps below at zero and not above, leaving highlights
+// brighter than white to be resolved by blending.
+void evaluateColour(
+  const float * dc, const float * rest, std::size_t coefficients, const Ogre::Vector3 & view,
+  float * colour)
+{
+  float channel[3];
+  for (int c = 0; c < 3; ++c) {
+    channel[c] = kSHC0 * dc[c] + 0.5f;
+  }
+
+  const float x = view.x;
+  const float y = view.y;
+  const float z = view.z;
+
+  if (coefficients >= 3) {
+    for (int c = 0; c < 3; ++c) {
+      channel[c] += -kSHC1 * y * rest[c] + kSHC1 * z * rest[3 + c] - kSHC1 * x * rest[6 + c];
+    }
+  }
+  if (coefficients >= 8) {
+    const float xx = x * x, yy = y * y, zz = z * z;
+    const float xy = x * y, yz = y * z, xz = x * z;
+    for (int c = 0; c < 3; ++c) {
+      channel[c] +=
+        kSHC2[0] * xy * rest[9 + c] +
+        kSHC2[1] * yz * rest[12 + c] +
+        kSHC2[2] * (2.0f * zz - xx - yy) * rest[15 + c] +
+        kSHC2[3] * xz * rest[18 + c] +
+        kSHC2[4] * (xx - yy) * rest[21 + c];
+    }
+  }
+  if (coefficients >= 15) {
+    const float xx = x * x, yy = y * y, zz = z * z, xy = x * y;
+    for (int c = 0; c < 3; ++c) {
+      channel[c] +=
+        kSHC3[0] * y * (3.0f * xx - yy) * rest[24 + c] +
+        kSHC3[1] * xy * z * rest[27 + c] +
+        kSHC3[2] * y * (4.0f * zz - xx - yy) * rest[30 + c] +
+        kSHC3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * rest[33 + c] +
+        kSHC3[4] * x * (4.0f * zz - xx - yy) * rest[36 + c] +
+        kSHC3[5] * z * (xx - yy) * rest[39 + c] +
+        kSHC3[6] * x * (xx - 3.0f * yy) * rest[42 + c];
+    }
+  }
+
+  for (int c = 0; c < 3; ++c) {
+    colour[c] = std::max(0.0f, channel[c]);
   }
 }
 
@@ -941,6 +1113,15 @@ void GaussianSplattingDisplay::sortIndexBuffer()
   const Ogre::Vector3 local_sort_direction =
     splat_node_->_getDerivedOrientation().Inverse() * (-camera_direction);
 
+  // Spherical harmonics are expressed in the splats' own frame, so the view
+  // direction has to be taken into that frame rather than the fixed frame.
+  // This is exactly why the publisher corrects a scene's orientation with a
+  // transform instead of rotating the data: rotating it would need the
+  // coefficients rotated too, by Wigner D matrices for degree >= 1.
+  const Ogre::Vector3 local_camera =
+    splat_node_->_getFullTransform().inverse() * camera_position;
+  const std::size_t rest_stride = sh_coefficients_ * 3;
+
   const Ogre::Matrix4 world_transform = splat_node_->_getFullTransform();
   const Ogre::Vector3 derived_scale = splat_node_->_getDerivedScale();
   const float world_scale = std::max(
@@ -953,16 +1134,16 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     std::tan(static_cast<float>(camera->getFOVy().valueRadians()) * 0.5f) : 0.0f;
 
   for (std::uint32_t i = 0; i < splat_count_; ++i) {
-    const SplatInstance & instance = instances_[i];
-    if (instance.colour[3] < alpha_cutoff) {
+    const SplatRecord & record = records_[i];
+    if (record.opacity < alpha_cutoff) {
       continue;
     }
 
     const float visible_radius = std::min(
       sigma_radius,
-      std::sqrt(2.0f * std::log(instance.colour[3] / alpha_cutoff)));
+      std::sqrt(2.0f * std::log(record.opacity / alpha_cutoff)));
     const float max_sigma = std::max(
-      instance.scale[0], std::max(instance.scale[1], instance.scale[2]));
+      record.scale[0], std::max(record.scale[1], record.scale[2]));
     const float world_radius = visible_radius * max_sigma * world_scale;
     const Ogre::Vector3 world_position = world_transform * positions_[i];
 
@@ -993,6 +1174,15 @@ void GaussianSplattingDisplay::sortIndexBuffer()
         continue;
       }
     }
+
+    // Only the survivors get a colour: at a typical camera this is a third of
+    // the scene, and the evaluation is the most expensive thing in the loop.
+    evaluateColour(
+      &sh_dc_[i * 3],
+      rest_stride > 0 ? &sh_rest_[i * rest_stride] : nullptr,
+      sh_coefficients_,
+      (positions_[i] - local_camera).normalisedCopy(),
+      &colours_[i * 3]);
 
     order_.push_back(
       (static_cast<std::uint64_t>(depthKey(positions_[i].dotProduct(local_sort_direction))) << 32) |

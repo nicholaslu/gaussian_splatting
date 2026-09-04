@@ -63,6 +63,13 @@ private:
   // the existing buffers via uploadSplats().
   void allocateMesh(std::size_t count);
   void uploadSplats(const GaussianSplats & msg, std::size_t count);
+
+  // The per-splat record lives in a texture the vertex shader reads by index,
+  // so a depth sort only has to rewrite 4 bytes per splat instead of moving
+  // the whole record. Sized for the current splat count and filled once per
+  // message; the draw order never touches it.
+  void createSplatDataTexture(std::size_t count);
+  void writeSplatDataTexture();
   void applyShaderParams();
   void writeSortedInstances();
   void sortIndexBuffer();
@@ -87,6 +94,7 @@ private:
   Ogre::HardwareVertexBufferSharedPtr instance_buffer_;
 
   Ogre::TexturePtr splat_texture_;
+  Ogre::TexturePtr splat_data_texture_;
   Ogre::Viewport * depth_viewport_ = nullptr;
   Ogre::Viewport * rtt_viewport_ = nullptr;
   Ogre::RenderTarget * main_target_ = nullptr;
@@ -101,14 +109,49 @@ private:
 
   std::size_t splat_count_ = 0;
   std::size_t visible_splat_count_ = 0;
-  struct SplatInstance
+
+  // One splat as the shader reads it, laid out as whole texels so a row of the
+  // data texture is a whole number of splats. Colour is absent because it is
+  // view dependent; it arrives per instance instead.
+  struct SplatRecord
   {
     float position[3];
-    float colour[4];
+    float opacity;
     float scale[3];
+    float pad0;
     float quat[4];
   };
+  static_assert(sizeof(SplatRecord) == 12 * sizeof(float), "three texels per splat");
+
+  // What each drawn instance carries: which splat, and the colour its
+  // spherical harmonics give for this view. Sixteen bytes, against the 56 the
+  // whole record used to cost per camera move.
+  //
+  // Float rather than a packed byte colour: the reference rasteriser keeps
+  // max(sh, 0) with no upper bound and only clamps after blending, and on this
+  // scene 7.5% of opaque splats have a channel above 1.0, reaching 3.5. Those
+  // are the specular highlights, so clamping them per splat flattens exactly
+  // the surfaces the higher order coefficients exist to reproduce.
+  struct DrawInstance
+  {
+    float index;
+    float colour[3];
+  };
+  static_assert(sizeof(DrawInstance) == 16, "index plus an unclamped colour");
+
   std::vector<Ogre::Vector3> positions_;
+  std::vector<SplatRecord> records_;
+  std::vector<DrawInstance> draw_instances_;
+
+  // Spherical harmonics, kept in splat order because the view direction is not
+  // known until the camera moves. sh_coefficients_ is K-1, the count beyond the
+  // constant term, so it is 0, 3, 8 or 15.
+  std::vector<float> sh_dc_;
+  std::vector<float> sh_rest_;
+  std::size_t sh_coefficients_ = 0;
+
+  // Three floats per splat index, filled for the splats that survive culling.
+  std::vector<float> colours_;
 
   // Depth-sorted draw order, one word per surviving splat: the view depth as an
   // order-preserving key in the high 32 bits, the splat index in the low 32.
@@ -117,8 +160,6 @@ private:
   // load per comparison.
   std::vector<std::uint64_t> order_;
   std::vector<std::uint64_t> order_scratch_;
-  std::vector<SplatInstance> instances_;
-  std::vector<SplatInstance> sorted_instances_;
 
   // Rasterisation convention carried by the most recent message.
   float eps2d_ = 0.3f;

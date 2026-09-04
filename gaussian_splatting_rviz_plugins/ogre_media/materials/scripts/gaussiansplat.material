@@ -11,6 +11,8 @@ vertex_program GaussianSplatting/RVizVP glsl
     param_named eps2d float 0.3
     param_named antialiased float 0.0
     param_named sigma_radius float 3.0
+    param_named splat_data_size float4 768 1 0.00130208333 1
+    param_named splat_data int 0
   }
 }
 
@@ -37,6 +39,14 @@ material GaussianSplatting/RViz
 
       fragment_program_ref GaussianSplatting/RVizFP
       {
+      }
+
+      // Filled at runtime with the per-splat records; the vertex shader reads
+      // texels from it by index. Declared here so the pass has a unit to bind.
+      texture_unit
+      {
+        filtering none
+        tex_address_mode clamp
       }
     }
   }

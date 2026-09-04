@@ -4,11 +4,22 @@
 
 struct GaussianSplatIn
 {
-    float3 position [[attribute(0)]];
-    float4 color    [[attribute(3)]];
-    float3 scale    [[attribute(8)]];   // linear sigma in metres
-    float4 quat     [[attribute(9)]];   // unit quaternion, ROS order (x,y,z,w)
-    float2 corner   [[attribute(10)]];  // quad corner in [-1, 1]
+    // The per-instance data: which splat this instance draws, and the colour
+    // its spherical harmonics give for this view. Everything else is read from
+    // splatData, so a depth sort moves 8 bytes per splat, not a whole record.
+    float splatIndex [[attribute(8)]];
+    float3 color     [[attribute(3)]];
+    float2 corner    [[attribute(10)]];  // quad corner in [-1, 1]
+};
+
+// One splat as three consecutive RGBA32F texels of splatData. Colour is absent
+// because it is view dependent and arrives per instance.
+struct GaussianSplat
+{
+    float3 position;
+    float opacity;
+    float3 scale;   // linear sigma in metres
+    float4 quat;    // unit quaternion, ROS order (x, y, z, w)
 };
 
 struct GaussianSplatOut
@@ -31,11 +42,34 @@ struct GaussianSplatUniforms
     float fovy;
     float eps2d;
     float antialiased;
+    // Dimensions of the splat data texture: width, height, and the
+    // reciprocals the GLSL path needs. Only .xy is used here.
+    float4 splat_data_size;
     // Extent of the rasterised quad, in standard deviations. Fill rate scales
     // with the square of this value, so lowering it is the cheapest
     // accuracy/speed trade available; 3.0 matches the reference rasteriser.
     float sigma_radius;
 };
+
+// splatData holds kTexelsPerSplat consecutive texels per splat, and its width
+// is a whole number of splats, so a splat never straddles a row.
+static GaussianSplat readSplat(
+    metal::texture2d<float> splatData, uint index, uint width)
+{
+    const uint texel = index * 3u;
+    const uint2 origin = uint2(texel % width, texel / width);
+
+    const float4 a = splatData.read(origin);
+    const float4 b = splatData.read(origin + uint2(1, 0));
+    const float4 c = splatData.read(origin + uint2(2, 0));
+
+    GaussianSplat splat;
+    splat.position = a.xyz;
+    splat.opacity = a.w;
+    splat.scale = b.xyz;
+    splat.quat = c;
+    return splat;
+}
 
 // Sigma = M * M^T with M = R * diag(s), i.e. column i of the rotation matrix
 // scaled by s[i]. float3x3() takes columns.
@@ -95,10 +129,14 @@ static float3 computeCov2D(
 
 vertex GaussianSplatOut gsplat_vp(
     GaussianSplatIn in [[stage_in]],
-    constant GaussianSplatUniforms & u [[buffer(CONST_SLOT_START)]])
+    constant GaussianSplatUniforms & u [[buffer(CONST_SLOT_START)]],
+    metal::texture2d<float> splatData [[texture(0)]])
 {
+    const GaussianSplat splat = readSplat(
+        splatData, uint(in.splatIndex), uint(u.splat_data_size.x));
+
     GaussianSplatOut out;
-    const float4 clip = u.projmatrix * float4(in.position, 1.0);
+    const float4 clip = u.projmatrix * float4(splat.position, 1.0);
 
     // Behind the camera the manual perspective divide below would wrap the
     // splat onto the opposite side of the screen, so discard it here instead.
@@ -112,9 +150,9 @@ vertex GaussianSplatOut gsplat_vp(
 
     float compensation = 0.0;
     const float3 cov = computeCov2D(
-        in.position, computeCov3D(in.scale, in.quat), u, compensation);
+        splat.position, computeCov3D(splat.scale, splat.quat), u, compensation);
 
-    out.color = in.color;
+    out.color = float4(in.color, splat.opacity);
     // The compensation factor is only correct for opacities that were
     // optimised with it applied, so it follows the message's rasterize_mode.
     out.color.a *= metal::mix(1.0, compensation, u.antialiased);
