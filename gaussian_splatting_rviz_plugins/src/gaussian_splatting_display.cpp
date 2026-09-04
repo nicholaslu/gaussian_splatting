@@ -109,9 +109,10 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
     "nothing for alpha blended splats, since they have no geometric edges to "
     "antialias. The offscreen target has no MSAA, which measured roughly 3x "
     "faster with no visible difference.\n\n"
-    "The cost is that the splats are NOT depth tested against the rest of the "
-    "scene while this is on, and are drawn over it, because the target does "
-    "not carry scene depth yet.",
+    "The scene is drawn into the target once beforehand to lay down depth, so "
+    "the splats are occluded by other displays exactly as they are when drawn "
+    "straight into the window. At Render Scale below 1.0 that depth is lower "
+    "resolution, so the occlusion boundary gets correspondingly coarser.",
     this);
 
   render_scale_property_ = new rviz_common::properties::FloatProperty(
@@ -593,20 +594,42 @@ void GaussianSplattingDisplay::preRenderTargetUpdate(const Ogre::RenderTargetEve
   }
 
   const bool is_offscreen = event.source == splat_texture_->getBuffer()->getRenderTarget();
-  if (entity_) {
-    entity_->setVisible(is_offscreen);
-  }
+
+  // The quad belongs only in the main window; the splats never do, since the
+  // window gets them through the quad. Which of the offscreen target's two
+  // passes draws the splats is decided in preViewportUpdate().
   if (composite_rect_) {
     composite_rect_->setVisible(!is_offscreen && event.source == main_target_);
   }
+  if (!is_offscreen && entity_) {
+    entity_->setVisible(false);
+  }
+}
 
-  if (is_offscreen) {
-    // Without this the offscreen pass draws the whole scene -- grid, axes,
-    // every other display -- and compositing it back over the window replaces
-    // all of them with an unantialiased copy.
+void GaussianSplattingDisplay::preViewportUpdate(const Ogre::RenderTargetViewportEvent & event)
+{
+  if (!splat_texture_) {
+    return;
+  }
+
+  const bool is_depth_pass = event.source == depth_viewport_;
+  const bool is_splat_pass = event.source == rtt_viewport_;
+  if (!is_depth_pass && !is_splat_pass) {
+    return;
+  }
+
+  if (entity_) {
+    entity_->setVisible(is_splat_pass);
+  }
+
+  // The depth pass renders every queue except the hidden splat entity. The
+  // colour pass renders only splats, preserving the depth written above.
+  scene_manager_->clearSpecialCaseRenderQueues();
+  if (is_splat_pass) {
     scene_manager_->setSpecialCaseRenderQueueMode(Ogre::SceneManager::SCRQM_INCLUDE);
-    scene_manager_->clearSpecialCaseRenderQueues();
     scene_manager_->addSpecialCaseRenderQueue(kSplatRenderQueue);
+  } else {
+    scene_manager_->setSpecialCaseRenderQueueMode(Ogre::SceneManager::SCRQM_EXCLUDE);
   }
 }
 
@@ -640,6 +663,7 @@ void GaussianSplattingDisplay::destroyRenderTarget()
   }
 
   rtt_viewport_ = nullptr;
+  depth_viewport_ = nullptr;
   rtt_width_ = 0;
   rtt_height_ = 0;
 
@@ -702,10 +726,24 @@ void GaussianSplattingDisplay::updateRenderTarget()
     Ogre::PF_A8R8G8B8, Ogre::TU_RENDERTARGET);
 
   Ogre::RenderTexture * target = splat_texture_->getBuffer()->getRenderTarget();
-  rtt_viewport_ = target->addViewport(camera);
-  rtt_viewport_->setClearEveryFrame(true);
+
+  // Two passes over the same target. The first draws the rest of the scene
+  // purely to lay down depth; the second clears only the colour, so that depth
+  // survives and the splats are occluded by the scene exactly as they are when
+  // drawn straight into the window. The first pass's colour is thrown away by
+  // that clear, which is the price of not having to override every material in
+  // the scene with a depth-only technique.
+  depth_viewport_ = target->addViewport(camera, 0);
+  depth_viewport_->setClearEveryFrame(true, Ogre::FBT_COLOUR | Ogre::FBT_DEPTH);
+  depth_viewport_->setBackgroundColour(Ogre::ColourValue(0.0f, 0.0f, 0.0f, 0.0f));
+  depth_viewport_->setOverlaysEnabled(false);
+  depth_viewport_->setShadowsEnabled(false);
+
+  rtt_viewport_ = target->addViewport(camera, 1);
   // Transparent, and the splats write premultiplied alpha, so compositing with
   // "one one_minus_src_alpha" reproduces drawing them straight into the scene.
+  // Colour only: the depth left by the pass above is what occludes them.
+  rtt_viewport_->setClearEveryFrame(true, Ogre::FBT_COLOUR);
   rtt_viewport_->setBackgroundColour(Ogre::ColourValue(0.0f, 0.0f, 0.0f, 0.0f));
   rtt_viewport_->setOverlaysEnabled(false);
   rtt_viewport_->setShadowsEnabled(false);

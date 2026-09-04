@@ -44,6 +44,7 @@ public:
   // (priority 2) before windows (priority 4), so the target is always ready.
   void preRenderTargetUpdate(const Ogre::RenderTargetEvent & event) override;
   void postRenderTargetUpdate(const Ogre::RenderTargetEvent & event) override;
+  void preViewportUpdate(const Ogre::RenderTargetViewportEvent & event) override;
 
 private:
   using GaussianSplats = gaussian_splatting_msgs::msg::GaussianSplats;
@@ -88,6 +89,7 @@ private:
   Ogre::HardwareIndexBufferSharedPtr index_buffer_;
 
   Ogre::TexturePtr splat_texture_;
+  Ogre::Viewport * depth_viewport_ = nullptr;
   Ogre::Viewport * rtt_viewport_ = nullptr;
   Ogre::RenderTarget * main_target_ = nullptr;
   Ogre::Rectangle2D * composite_rect_ = nullptr;
