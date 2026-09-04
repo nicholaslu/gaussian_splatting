@@ -2,3 +2,6 @@
 .vscode/
 __pycache__/
 *.py[cod]
+
+# Test scenes, fetched separately -- see tools/publish_gaussian_ply.py.
+dataset/
