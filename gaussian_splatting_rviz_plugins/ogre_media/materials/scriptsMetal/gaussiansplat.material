@@ -47,4 +47,22 @@ material GaussianSplatting/RViz
       }
     }
   }
+
+  // RViz draws the scene again under its Pick and Depth schemes, for
+  // selection and for the depth behind a click. Its fallback for a material
+  // with no technique in those schemes is rviz/flat_vp, which declares
+  // POSITION alone -- valid against every vertex format except this one,
+  // whose per-instance stream is an index and a colour, with the position
+  // living in the data texture. Empty techniques keep the splats out of both
+  // passes, which is what already happened when they were drawn offscreen
+  // and were simply not visible at the time those passes ran.
+  technique pick
+  {
+    scheme Pick
+  }
+
+  technique depth
+  {
+    scheme Depth
+  }
 }
