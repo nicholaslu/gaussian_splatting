@@ -1,0 +1,65 @@
+// OpenGL counterpart of scriptsMetal/depth_only.material. RViz's existing
+// depth vertex program performs the same rigid world-view-project transform.
+material GaussianSplatting/DepthOnly
+{
+  technique Clockwise
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check on
+      depth_write on
+      cull_hardware clockwise
+      vertex_program_ref rviz/glsl120/depth.vert {}
+      fragment_program_ref rviz/glsl120/black.frag {}
+    }
+  }
+
+  technique Anticlockwise
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check on
+      depth_write on
+      cull_hardware anticlockwise
+      vertex_program_ref rviz/glsl120/depth.vert {}
+      fragment_program_ref rviz/glsl120/black.frag {}
+    }
+  }
+
+  technique NoCull
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check on
+      depth_write on
+      cull_hardware none
+      vertex_program_ref rviz/glsl120/depth.vert {}
+      fragment_program_ref rviz/glsl120/black.frag {}
+    }
+  }
+
+
+  technique NoDepth
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check off
+      depth_write off
+      cull_hardware none
+      vertex_program_ref rviz/glsl120/depth.vert {}
+      fragment_program_ref rviz/glsl120/black.frag {}
+    }
+  }
+}

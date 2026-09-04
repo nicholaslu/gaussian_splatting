@@ -1,0 +1,68 @@
+// Minimal opaque depth techniques used by GaussianDepthOnly's fast path.
+// Colour channels are masked. A trivial fragment function is still bound
+// because Ogre Metal otherwise retains the previous pass's fragment function.
+material GaussianSplatting/DepthOnly
+{
+  technique Clockwise
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check on
+      depth_write on
+      cull_hardware clockwise
+      vertex_program_ref rviz/flat_vp {}
+      fragment_program_ref rviz/flat_fp {}
+    }
+  }
+
+  technique Anticlockwise
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check on
+      depth_write on
+      cull_hardware anticlockwise
+      vertex_program_ref rviz/flat_vp {}
+      fragment_program_ref rviz/flat_fp {}
+    }
+  }
+
+  technique NoCull
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check on
+      depth_write on
+      cull_hardware none
+      vertex_program_ref rviz/flat_vp {}
+      fragment_program_ref rviz/flat_fp {}
+    }
+  }
+
+  // Conservative skip for transparent/overlay materials that did not write
+  // depth in their original pass. Keeping their original shader would spend
+  // work while still producing no depth contribution.
+  technique NoDepth
+  {
+    pass
+    {
+      lighting off
+      scene_blend one zero
+      colour_write off
+      depth_check off
+      depth_write off
+      cull_hardware none
+      vertex_program_ref rviz/flat_vp {}
+      fragment_program_ref rviz/flat_fp {}
+    }
+  }
+}

@@ -119,11 +119,20 @@ vertex GaussianSplatOut gsplat_vp(
     // optimised with it applied, so it follows the message's rasterize_mode.
     out.color.a *= metal::mix(1.0, compensation, u.antialiased);
 
-    if (out.color.a < (1.0 / 255.0)) {
+    const float alphaCutoff = 1.0 / 255.0;
+    if (out.color.a < alphaCutoff) {
         out.position = float4(0.0, 0.0, 2.0, 1.0);
         out.localCoord = float2(0.0);
         return out;
     }
+
+    // alpha = opacity * exp(-r^2 / 2). Pixels beyond this radius would be
+    // discarded by the fragment shader, so do not rasterise them in the first
+    // place. This is exact with respect to the shader's alpha cutoff and can
+    // shrink low-opacity splats substantially below the configured sigma cap.
+    const float visibleRadius = metal::min(
+        u.sigma_radius,
+        metal::sqrt(2.0 * metal::log(out.color.a / alphaCutoff)));
 
     const float det = cov.x * cov.z - cov.y * cov.y;
     const float mid = 0.5 * (cov.x + cov.z);
@@ -140,12 +149,12 @@ vertex GaussianSplatOut gsplat_vp(
     const float2 axis2 = float2(-axis1.y, axis1.x);
 
     const float2 pixelOffset =
-        in.corner.x * axis1 * (u.sigma_radius * metal::sqrt(lambda1)) +
-        in.corner.y * axis2 * (u.sigma_radius * metal::sqrt(lambda2));
+        in.corner.x * axis1 * (visibleRadius * metal::sqrt(lambda1)) +
+        in.corner.y * axis2 * (visibleRadius * metal::sqrt(lambda2));
     const float2 ndcOffset = pixelOffset * 2.0 / u.vpsize.xy;
 
     out.position = float4(projected.xy + ndcOffset, projected.z, 1.0);
-    out.localCoord = in.corner * u.sigma_radius;
+    out.localCoord = in.corner * visibleRadius;
     return out;
 }
 

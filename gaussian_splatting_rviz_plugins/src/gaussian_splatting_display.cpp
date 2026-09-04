@@ -1,19 +1,21 @@
 #include "gaussian_splatting_rviz_plugins/gaussian_splatting_display.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cmath>
+#include <map>
 #include <numeric>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <OgreAxisAlignedBox.h>
 #include <OgreCamera.h>
-#include <OgreEntity.h>
 #include <OgreGpuProgramParams.h>
 #include <OgreHardwarePixelBuffer.h>
 #include <OgreHardwareBufferManager.h>
 #include <OgreMaterialManager.h>
-#include <OgreMeshManager.h>
 #include <OgrePass.h>
 #include <OgreRectangle2D.h>
 #include <OgreRenderTexture.h>
@@ -21,7 +23,8 @@
 #include <OgreRoot.h>
 #include <OgreSceneManager.h>
 #include <OgreSceneNode.h>
-#include <OgreSubMesh.h>
+#include <OgreSimpleRenderable.h>
+#include <OgreSphere.h>
 #include <OgreTechnique.h>
 #include <OgreTextureManager.h>
 #include <OgreVertexIndexData.h>
@@ -45,6 +48,8 @@ namespace
 constexpr const char * kResourceGroup = "GaussianSplattingRviz";
 constexpr const char * kMaterialName = "GaussianSplatting/RViz";
 constexpr const char * kCompositeMaterialName = "GaussianSplatting/Composite";
+constexpr const char * kDepthMaterialName = "GaussianSplatting/DepthOnly";
+constexpr const char * kDepthMaterialScheme = "GaussianDepthOnly";
 
 // Splats get a render queue of their own so the offscreen pass can be told to
 // draw that queue and nothing else. Sitting just after RENDER_QUEUE_MAIN keeps
@@ -56,17 +61,23 @@ constexpr Ogre::uint8 kSplatRenderQueue = Ogre::RENDER_QUEUE_MAIN + 1;
 // implementation: rgb = sh_dc * kSHC0 + 0.5
 constexpr float kSHC0 = 0.28209479177387814f;
 
-// Each splat is expanded into a screen-aligned quad. Ogre's Metal render
-// system advertises RSC_VERTEX_BUFFER_INSTANCE_DATA but hardcodes
-// MTLVertexStepFunctionPerVertex, so hardware instancing cannot be used and
-// the per-splat attributes are duplicated across the four corners instead.
-constexpr std::size_t kVerticesPerSplat = 4;
-constexpr std::size_t kIndicesPerSplat = 6;
+// Each splat is expanded from one instance record and a shared octagon. The
+// octagon circumscribes the unit circle, so it preserves every fragment that
+// the Gaussian shader can keep while removing 17.2% of the bounding square's
+// corner area. RViz's patched Ogre Metal render system maps instance buffers
+// to MTLVertexStepFunctionPerInstance; OpenGL uses the same Ogre declaration.
+constexpr std::size_t kVerticesPerSplat = 8;
+constexpr std::size_t kIndicesPerSplat = 18;
+constexpr float kOctagonTangent = 0.41421356237f;
 constexpr float kCorners[kVerticesPerSplat][2] = {
-  {-1.0f, -1.0f},
-  {1.0f, -1.0f},
-  {1.0f, 1.0f},
-  {-1.0f, 1.0f},
+  {1.0f, kOctagonTangent},
+  {kOctagonTangent, 1.0f},
+  {-kOctagonTangent, 1.0f},
+  {-1.0f, kOctagonTangent},
+  {-1.0f, -kOctagonTangent},
+  {-kOctagonTangent, -1.0f},
+  {kOctagonTangent, -1.0f},
+  {1.0f, -kOctagonTangent},
 };
 
 bool usesMetalRenderSystem()
@@ -82,6 +93,278 @@ T clamp(T value, T low, T high)
 }
 
 }  // namespace
+
+// Resolves the depth viewport's material scheme in three tiers:
+//
+// 1. A material-provided GaussianDepthOnly technique is selected by Ogre
+//    before this listener is called.
+// 2. Simple opaque rigid materials use a shared minimal depth-only technique.
+// 3. Everything else gets a cached clone of its original technique with colour
+//    writes disabled. This preserves custom vertex deformation, alpha reject,
+//    and transparent/depth-write semantics for plugins unknown to us.
+class DepthSchemeResolver : public Ogre::MaterialManager::Listener
+{
+public:
+  struct Stats
+  {
+    std::size_t fast = 0;
+    std::size_t conservative = 0;
+    std::size_t unresolved = 0;
+  };
+
+  explicit DepthSchemeResolver(std::string owner_suffix)
+  : owner_suffix_(std::move(owner_suffix))
+  {
+    depth_material_ = Ogre::MaterialManager::getSingleton().getByName(
+      kDepthMaterialName, kResourceGroup);
+    if (depth_material_) {
+      depth_material_->load();
+      fast_clockwise_ = depth_material_->getTechnique("Clockwise");
+      fast_anticlockwise_ = depth_material_->getTechnique("Anticlockwise");
+      fast_no_cull_ = depth_material_->getTechnique("NoCull");
+      no_depth_ = depth_material_->getTechnique("NoDepth");
+    }
+  }
+
+  ~DepthSchemeResolver() override
+  {
+    auto & manager = Ogre::MaterialManager::getSingleton();
+    for (auto & entry : conservative_materials_) {
+      manager.remove(entry.second->getHandle());
+    }
+  }
+
+  void beginFrame()
+  {
+    stats_ = {};
+  }
+
+  Stats stats() const
+  {
+    return stats_;
+  }
+
+  Ogre::Technique * handleSchemeNotFound(
+    unsigned short,
+    const Ogre::String & scheme_name,
+    Ogre::Material * original_material,
+    unsigned short lod_index,
+    const Ogre::Renderable *) override
+  {
+    if (scheme_name != kDepthMaterialScheme || !original_material) {
+      ++stats_.unresolved;
+      return nullptr;
+    }
+
+    Ogre::Technique * source = findSourceTechnique(original_material, lod_index);
+    if (!source) {
+      ++stats_.unresolved;
+      return nullptr;
+    }
+
+    if (!contributesDepth(source) && no_depth_) {
+      ++stats_.conservative;
+      return no_depth_;
+    }
+
+    if (isFastPathSafe(source)) {
+      Ogre::Technique * fast = fastTechnique(source->getPass(0)->getCullingMode());
+      if (fast) {
+        ++stats_.fast;
+        return fast;
+      }
+    }
+
+    ++stats_.conservative;
+    return conservativeTechnique(original_material, source, lod_index);
+  }
+
+private:
+  using CacheKey = std::pair<Ogre::ResourceHandle, unsigned short>;
+
+  static Ogre::Technique * findSourceTechnique(
+    Ogre::Material * material, unsigned short lod_index)
+  {
+    material->load();
+
+    Ogre::Technique * exact = nullptr;
+    Ogre::Technique * nearest_lower = nullptr;
+    Ogre::Technique * first_default = nullptr;
+    Ogre::Technique * first_supported = nullptr;
+
+    for (Ogre::Technique * technique : material->getSupportedTechniques()) {
+      if (!first_supported) {
+        first_supported = technique;
+      }
+      if (technique->getSchemeName() != Ogre::MaterialManager::DEFAULT_SCHEME_NAME) {
+        continue;
+      }
+      if (!first_default) {
+        first_default = technique;
+      }
+      if (technique->getLodIndex() == lod_index) {
+        exact = technique;
+        break;
+      }
+      if (technique->getLodIndex() < lod_index &&
+        (!nearest_lower || technique->getLodIndex() > nearest_lower->getLodIndex()))
+      {
+        nearest_lower = technique;
+      }
+    }
+
+    if (exact) {
+      return exact;
+    }
+    if (nearest_lower) {
+      return nearest_lower;
+    }
+    return first_default ? first_default : first_supported;
+  }
+
+  static bool isSimpleRigidVertexProgram(const Ogre::String & name)
+  {
+    if (name.empty()) {
+      return true;
+    }
+
+    // RViz's Metal programs below differ in colour, texture, or lighting only;
+    // all transform the POSITION semantic directly by the world-view-project
+    // matrix. Custom and point-cloud programs deliberately fall back.
+    return name == "rviz/flat_vp" || name == "rviz/vertex_color_vp" ||
+           name == "rviz/texture_vp" || name == "rviz/lit_vp" ||
+           name == "rviz/lit_texture_vp" || name == "rviz/metal/depth_vp";
+  }
+
+  static bool isFastPathSafe(Ogre::Technique * technique)
+  {
+    if (!technique || technique->getNumPasses() != 1) {
+      return false;
+    }
+
+    Ogre::Pass * pass = technique->getPass(0);
+    return pass && pass->getDepthCheckEnabled() && pass->getDepthWriteEnabled() &&
+           !pass->isTransparent() &&
+           pass->getAlphaRejectFunction() == Ogre::CMPF_ALWAYS_PASS &&
+           isSimpleRigidVertexProgram(pass->getVertexProgramName());
+  }
+
+  static bool contributesDepth(Ogre::Technique * technique)
+  {
+    if (!technique) {
+      return false;
+    }
+    for (unsigned short i = 0; i < technique->getNumPasses(); ++i) {
+      Ogre::Pass * pass = technique->getPass(i);
+      if (pass && pass->getDepthCheckEnabled() && pass->getDepthWriteEnabled()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Ogre::Technique * fastTechnique(Ogre::CullingMode mode) const
+  {
+    switch (mode) {
+      case Ogre::CULL_CLOCKWISE:
+        return fast_clockwise_;
+      case Ogre::CULL_ANTICLOCKWISE:
+        return fast_anticlockwise_;
+      case Ogre::CULL_NONE:
+        return fast_no_cull_;
+    }
+    return nullptr;
+  }
+
+  Ogre::Technique * conservativeTechnique(
+    Ogre::Material * original_material, Ogre::Technique * source, unsigned short lod_index)
+  {
+    const CacheKey key(original_material->getHandle(), lod_index);
+    auto cached = conservative_materials_.find(key);
+    if (cached != conservative_materials_.end()) {
+      return cached->second->getTechnique(0);
+    }
+
+    auto & manager = Ogre::MaterialManager::getSingleton();
+    const Ogre::String name =
+      "GaussianSplatting/DepthFallback/" + owner_suffix_ + "/" +
+      std::to_string(original_material->getHandle()) + "/" + std::to_string(lod_index);
+    Ogre::MaterialPtr material = manager.create(name, kResourceGroup);
+    Ogre::Technique * technique = material->createTechnique();
+    *technique = *source;
+    technique->setSchemeName(kDepthMaterialScheme);
+    for (unsigned short i = 0; i < technique->getNumPasses(); ++i) {
+      technique->getPass(i)->setColourWriteEnabled(false);
+    }
+    material->load();
+    conservative_materials_.emplace(key, material);
+    return technique;
+  }
+
+  std::string owner_suffix_;
+  Ogre::MaterialPtr depth_material_;
+  Ogre::Technique * fast_clockwise_ = nullptr;
+  Ogre::Technique * fast_anticlockwise_ = nullptr;
+  Ogre::Technique * fast_no_cull_ = nullptr;
+  Ogre::Technique * no_depth_ = nullptr;
+  std::map<CacheKey, Ogre::MaterialPtr> conservative_materials_;
+  Stats stats_;
+};
+
+class GaussianSplatRenderable : public Ogre::SimpleRenderable
+{
+public:
+  explicit GaussianSplatRenderable(const Ogre::String & name)
+  : Ogre::SimpleRenderable(name)
+  {}
+
+  ~GaussianSplatRenderable() override
+  {
+    OGRE_DELETE mRenderOp.vertexData;
+    OGRE_DELETE mRenderOp.indexData;
+    mRenderOp.vertexData = nullptr;
+    mRenderOp.indexData = nullptr;
+  }
+
+  void setGeometry(
+    Ogre::VertexData * vertex_data, Ogre::IndexData * index_data, std::size_t instance_count)
+  {
+    mRenderOp.operationType = Ogre::RenderOperation::OT_TRIANGLE_LIST;
+    mRenderOp.useIndexes = true;
+    mRenderOp.vertexData = vertex_data;
+    mRenderOp.indexData = index_data;
+    mRenderOp.numberOfInstances = instance_count;
+    mRenderOp.useGlobalInstancingVertexBufferIsAvailable = false;
+  }
+
+  void setInstanceCount(std::size_t instance_count)
+  {
+    mRenderOp.numberOfInstances = instance_count;
+  }
+
+  Ogre::Real getBoundingRadius() const override
+  {
+    if (mBox.isNull() || mBox.isInfinite()) {
+      return 0.0f;
+    }
+    return Ogre::Math::Sqrt(
+      std::max(
+        mBox.getMaximum().squaredLength(),
+        mBox.getMinimum().squaredLength()));
+  }
+
+  Ogre::Real getSquaredViewDepth(const Ogre::Camera * camera) const override
+  {
+    if (!camera || mBox.isNull() || mBox.isInfinite()) {
+      return 0.0f;
+    }
+    Ogre::Vector3 centre = mBox.getCenter();
+    if (getParentSceneNode()) {
+      centre = getParentSceneNode()->_getFullTransform() * centre;
+    }
+    return (camera->getDerivedPosition() - centre).squaredLength();
+  }
+};
 
 GaussianSplattingDisplay::GaussianSplattingDisplay()
 {
@@ -99,6 +382,22 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
     this);
   sigma_radius_property_->setMin(0.5f);
   sigma_radius_property_->setMax(4.0f);
+
+  culling_property_ = new rviz_common::properties::BoolProperty(
+    "Visibility Culling", true,
+    "Skip splats whose conservative 3D extent is fully outside the camera "
+    "frustum, plus splats below the optional screen-size threshold. This also "
+    "reduces the set that must be sorted and uploaded each time the camera moves.",
+    this);
+
+  min_screen_radius_property_ = new rviz_common::properties::FloatProperty(
+    "Minimum Screen Radius", 0.0f,
+    "Cull splats whose conservative visible radius is smaller than this many "
+    "pixels. Zero preserves every in-frustum splat. Values around 0.5-1.0 can "
+    "reduce distant detail and overdraw in large scenes.",
+    culling_property_);
+  min_screen_radius_property_->setMin(0.0f);
+  min_screen_radius_property_->setMax(8.0f);
 
   offscreen_property_ = new rviz_common::properties::BoolProperty(
     "Offscreen Rendering", false,
@@ -125,11 +424,40 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
     offscreen_property_);
   render_scale_property_->setMin(0.25f);
   render_scale_property_->setMax(1.0f);
+
+  automatic_render_scale_property_ = new rviz_common::properties::BoolProperty(
+    "Automatic Render Scale", false,
+    "Adjust the splat render target to hold the requested frame rate. Render "
+    "Scale remains the upper quality limit; other RViz displays stay at native resolution.",
+    offscreen_property_);
+
+  minimum_render_scale_property_ = new rviz_common::properties::FloatProperty(
+    "Minimum Render Scale", 0.35f,
+    "Lowest scale automatic control may select. Lower values recover more "
+    "frame rate at the cost of softer splats.",
+    automatic_render_scale_property_);
+  minimum_render_scale_property_->setMin(0.25f);
+  minimum_render_scale_property_->setMax(1.0f);
+
+  target_frame_rate_property_ = new rviz_common::properties::FloatProperty(
+    "Target Frame Rate", 55.0f,
+    "Frame-rate target used by automatic render scaling. A small margin below "
+    "RViz's 60 Hz cap leaves room for transient work.",
+    automatic_render_scale_property_);
+  target_frame_rate_property_->setMin(10.0f);
+  target_frame_rate_property_->setMax(240.0f);
 }
 
 GaussianSplattingDisplay::~GaussianSplattingDisplay()
 {
   destroyRenderTarget();
+
+  if (depth_scheme_resolver_) {
+    Ogre::MaterialManager::getSingleton().removeListener(
+      depth_scheme_resolver_.get(), kDepthMaterialScheme);
+    depth_scheme_resolver_.reset();
+  }
+
   clearMesh();
 
   if (material_) {
@@ -160,6 +488,9 @@ void GaussianSplattingDisplay::onInitialize()
   rviz_common::MessageFilterDisplay<GaussianSplats>::onInitialize();
 
   registerOgreResources();
+  depth_scheme_resolver_ = std::make_unique<DepthSchemeResolver>(mesh_name_);
+  Ogre::MaterialManager::getSingleton().addListener(
+    depth_scheme_resolver_.get(), kDepthMaterialScheme);
   splat_node_ = scene_manager_->getRootSceneNode()->createChildSceneNode();
 }
 
@@ -172,16 +503,38 @@ void GaussianSplattingDisplay::reset()
 void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
 {
   rviz_common::MessageFilterDisplay<GaussianSplats>::update(wall_dt, ros_dt);
+  updateAutomaticRenderScale(wall_dt);
   updateRenderTarget();
   if (splat_texture_) {
     setStatus(
       rviz_common::properties::StatusProperty::Ok, "Offscreen",
       QString("splats rasterised at %1x%2").arg(rtt_width_).arg(rtt_height_));
+    if (depth_scheme_resolver_) {
+      const auto stats = depth_scheme_resolver_->stats();
+      setStatus(
+        rviz_common::properties::StatusProperty::Ok, "Depth materials",
+        QString("%1 fast, %2 conservative, %3 unresolved")
+        .arg(stats.fast).arg(stats.conservative).arg(stats.unresolved));
+    }
   } else {
     deleteStatus("Offscreen");
+    deleteStatus("Depth materials");
   }
   applyShaderParams();
   sortIndexBuffer();
+  if (renderable_) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Ok, "Visible splats",
+      QString("%1 / %2 instances").arg(visible_splat_count_).arg(splat_count_));
+    setStatus(
+      rviz_common::properties::StatusProperty::Ok, "CPU preparation",
+      QString("upload %1 ms, cull/sort %2 ms")
+      .arg(last_upload_ms_, 0, 'f', 2)
+      .arg(last_sort_ms_, 0, 'f', 2));
+  } else {
+    deleteStatus("Visible splats");
+    deleteStatus("CPU preparation");
+  }
 }
 
 void GaussianSplattingDisplay::processMessage(GaussianSplats::ConstSharedPtr msg)
@@ -222,8 +575,10 @@ void GaussianSplattingDisplay::processMessage(GaussianSplats::ConstSharedPtr msg
   antialiased_ =
     msg->rasterize_mode == GaussianSplats::RASTERIZE_MODE_ANTIALIASED ? 1.0f : 0.0f;
   applyShaderParams();
+  const auto upload_start = std::chrono::steady_clock::now();
   uploadSplats(*msg, count);
-  writeDrawIndices();
+  last_upload_ms_ = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - upload_start).count();
   sortIndexBuffer();
 }
 
@@ -324,28 +679,31 @@ void GaussianSplattingDisplay::registerOgreResources()
 
 void GaussianSplattingDisplay::clearMesh()
 {
-  if (entity_) {
-    scene_manager_->destroyEntity(entity_);
-    entity_ = nullptr;
+  if (renderable_) {
+    if (splat_node_) {
+      splat_node_->detachObject(renderable_.get());
+    }
+    renderable_.reset();
   }
 
-  if (mesh_) {
-    Ogre::MeshManager::getSingleton().remove(mesh_->getHandle());
-    mesh_.reset();
-  }
-
-  position_buffer_.reset();
-  colour_buffer_.reset();
-  scale_buffer_.reset();
-  quat_buffer_.reset();
-  index_buffer_.reset();
+  instance_buffer_.reset();
 
   splat_count_ = 0;
+  visible_splat_count_ = 0;
   positions_.clear();
   indices_.clear();
-  draw_indices_.clear();
+  instances_.clear();
+  sorted_instances_.clear();
   last_camera_position_ = Ogre::Vector3::ZERO;
   last_camera_direction_ = Ogre::Vector3::ZERO;
+  last_viewport_width_ = 0;
+  last_viewport_height_ = 0;
+  last_sigma_radius_ = -1.0f;
+  last_min_screen_radius_ = -1.0f;
+  last_culling_enabled_ = false;
+  last_upload_ms_ = 0.0;
+  last_sort_ms_ = 0.0;
+  sort_dirty_ = true;
 }
 
 void GaussianSplattingDisplay::allocateMesh(std::size_t count)
@@ -353,92 +711,82 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   clearMesh();
 
   splat_count_ = count;
-  const std::size_t vertex_count = count * kVerticesPerSplat;
 
   positions_.resize(count);
   indices_.resize(count);
   std::iota(indices_.begin(), indices_.end(), 0);
-  draw_indices_.resize(count * kIndicesPerSplat);
+  instances_.resize(count);
+  sorted_instances_.resize(count);
 
-  position_data_.resize(vertex_count * 3);
-  colour_data_.resize(vertex_count * 4);
-  scale_data_.resize(vertex_count * 3);
-  quat_data_.resize(vertex_count * 4);
+  auto * vertex_data = OGRE_NEW Ogre::VertexData();
+  vertex_data->vertexCount = kVerticesPerSplat;
 
-  mesh_ = Ogre::MeshManager::getSingleton().createManual(mesh_name_, kResourceGroup);
-  Ogre::SubMesh * submesh = mesh_->createSubMesh();
-  submesh->useSharedVertices = false;
-  submesh->operationType = Ogre::RenderOperation::OT_TRIANGLE_LIST;
-  submesh->setMaterialName(material_name_, kResourceGroup);
-  submesh->vertexData = OGRE_NEW Ogre::VertexData();
-  submesh->vertexData->vertexCount = vertex_count;
-
-  Ogre::VertexDeclaration * declaration = submesh->vertexData->vertexDeclaration;
-  declaration->addElement(0, 0, Ogre::VET_FLOAT3, Ogre::VES_POSITION);
-  declaration->addElement(1, 0, Ogre::VET_FLOAT4, Ogre::VES_DIFFUSE);
-  declaration->addElement(2, 0, Ogre::VET_FLOAT3, Ogre::VES_TEXTURE_COORDINATES, 0);
-  declaration->addElement(3, 0, Ogre::VET_FLOAT4, Ogre::VES_TEXTURE_COORDINATES, 1);
-  declaration->addElement(4, 0, Ogre::VET_FLOAT2, Ogre::VES_TEXTURE_COORDINATES, 2);
+  Ogre::VertexDeclaration * declaration = vertex_data->vertexDeclaration;
+  declaration->addElement(
+    0, offsetof(SplatInstance, position), Ogre::VET_FLOAT3, Ogre::VES_POSITION);
+  declaration->addElement(
+    0, offsetof(SplatInstance, colour), Ogre::VET_FLOAT4, Ogre::VES_DIFFUSE);
+  declaration->addElement(
+    0, offsetof(SplatInstance, scale), Ogre::VET_FLOAT3, Ogre::VES_TEXTURE_COORDINATES, 0);
+  declaration->addElement(
+    0, offsetof(SplatInstance, quat), Ogre::VET_FLOAT4, Ogre::VES_TEXTURE_COORDINATES, 1);
+  declaration->addElement(
+    1, 0, Ogre::VET_FLOAT2, Ogre::VES_TEXTURE_COORDINATES, 2);
 
   auto & hbm = Ogre::HardwareBufferManager::getSingleton();
   const auto dynamic = Ogre::HardwareBuffer::HBU_DYNAMIC_WRITE_ONLY;
   const auto stat1c = Ogre::HardwareBuffer::HBU_STATIC_WRITE_ONLY;
 
-  auto bind =
-    [&](unsigned short source, std::size_t components, Ogre::HardwareBuffer::Usage usage) {
-      Ogre::HardwareVertexBufferSharedPtr buffer =
-        hbm.createVertexBuffer(sizeof(float) * components, vertex_count, usage);
-      submesh->vertexData->vertexBufferBinding->setBinding(source, buffer);
-      return buffer;
-    };
-
-  position_buffer_ = bind(0, 3, dynamic);
-  colour_buffer_ = bind(1, 4, dynamic);
-  scale_buffer_ = bind(2, 3, dynamic);
-  quat_buffer_ = bind(3, 4, dynamic);
+  instance_buffer_ = hbm.createVertexBuffer(sizeof(SplatInstance), count, dynamic);
+  instance_buffer_->setIsInstanceData(true);
+  instance_buffer_->setInstanceDataStepRate(1);
+  vertex_data->vertexBufferBinding->setBinding(0, instance_buffer_);
 
   // The corner offsets never change, so this buffer is written once here and
   // left alone for the lifetime of the mesh.
-  Ogre::HardwareVertexBufferSharedPtr corner_buffer = bind(4, 2, stat1c);
-  std::vector<float> corner_data(vertex_count * 2);
-  for (std::size_t i = 0; i < count; ++i) {
-    for (std::size_t corner = 0; corner < kVerticesPerSplat; ++corner) {
-      const std::size_t vertex = i * kVerticesPerSplat + corner;
-      corner_data[vertex * 2 + 0] = kCorners[corner][0];
-      corner_data[vertex * 2 + 1] = kCorners[corner][1];
-    }
+  Ogre::HardwareVertexBufferSharedPtr corner_buffer =
+    hbm.createVertexBuffer(sizeof(float) * 2, kVerticesPerSplat, stat1c);
+  float corner_data[kVerticesPerSplat * 2];
+  for (std::size_t corner = 0; corner < kVerticesPerSplat; ++corner) {
+    corner_data[corner * 2] = kCorners[corner][0];
+    corner_data[corner * 2 + 1] = kCorners[corner][1];
   }
-  corner_buffer->writeData(0, corner_buffer->getSizeInBytes(), corner_data.data(), true);
+  corner_buffer->writeData(0, corner_buffer->getSizeInBytes(), corner_data, true);
+  vertex_data->vertexBufferBinding->setBinding(1, corner_buffer);
 
-  index_buffer_ = hbm.createIndexBuffer(
-    Ogre::HardwareIndexBuffer::IT_32BIT, count * kIndicesPerSplat, dynamic);
-  submesh->indexData->indexCount = count * kIndicesPerSplat;
-  submesh->indexData->indexBuffer = index_buffer_;
+  auto * index_data = OGRE_NEW Ogre::IndexData();
+  index_data->indexCount = kIndicesPerSplat;
+  index_data->indexBuffer = hbm.createIndexBuffer(
+    Ogre::HardwareIndexBuffer::IT_16BIT, kIndicesPerSplat, stat1c);
+  const std::uint16_t octagon_indices[kIndicesPerSplat] = {
+    0, 1, 2,
+    0, 2, 3,
+    0, 3, 4,
+    0, 4, 5,
+    0, 5, 6,
+    0, 6, 7,
+  };
+  index_data->indexBuffer->writeData(
+    0, index_data->indexBuffer->getSizeInBytes(), octagon_indices, true);
 
-  // Bounds are refreshed by uploadSplats(); start from something valid so the
-  // mesh can be loaded before any data has been written.
-  mesh_->_setBounds(Ogre::AxisAlignedBox::BOX_INFINITE);
-  mesh_->_setBoundingSphereRadius(std::numeric_limits<Ogre::Real>::max());
-  mesh_->load();
-
-  entity_ = scene_manager_->createEntity(mesh_name_);
-  entity_->setMaterialName(material_name_, kResourceGroup);
-  entity_->setVisible(!splat_texture_);
-  entity_->setRenderQueueGroup(kSplatRenderQueue);
-  splat_node_->attachObject(entity_);
+  renderable_ = std::make_unique<GaussianSplatRenderable>(mesh_name_);
+  renderable_->setGeometry(vertex_data, index_data, count);
+  renderable_->setMaterial(material_);
+  renderable_->setBoundingBox(Ogre::AxisAlignedBox::BOX_INFINITE);
+  renderable_->setVisible(!splat_texture_);
+  renderable_->setRenderQueueGroup(kSplatRenderQueue);
+  splat_node_->attachObject(renderable_.get());
 }
 
 void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::size_t count)
 {
   Ogre::AxisAlignedBox bounds;
   bounds.setNull();
-  Ogre::Real radius_sq = 0.0f;
 
   for (std::size_t i = 0; i < count; ++i) {
     const Ogre::Vector3 position(msg.means[i * 3], msg.means[i * 3 + 1], msg.means[i * 3 + 2]);
     positions_[i] = position;
     bounds.merge(position);
-    radius_sq = std::max(radius_sq, position.squaredLength());
 
     // Degree 0 spherical harmonics only. The higher order coefficients are
     // carried by the message but evaluating them needs the view direction per
@@ -448,41 +796,22 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
     const float b = clamp(msg.sh_dc[i * 3 + 2] * kSHC0 + 0.5f, 0.0f, 1.0f);
     const float a = clamp(msg.opacities[i], 0.0f, 1.0f);
 
-    for (std::size_t corner = 0; corner < kVerticesPerSplat; ++corner) {
-      const std::size_t vertex = i * kVerticesPerSplat + corner;
-
-      position_data_[vertex * 3 + 0] = msg.means[i * 3];
-      position_data_[vertex * 3 + 1] = msg.means[i * 3 + 1];
-      position_data_[vertex * 3 + 2] = msg.means[i * 3 + 2];
-
-      colour_data_[vertex * 4 + 0] = r;
-      colour_data_[vertex * 4 + 1] = g;
-      colour_data_[vertex * 4 + 2] = b;
-      colour_data_[vertex * 4 + 3] = a;
-
-      scale_data_[vertex * 3 + 0] = msg.scales[i * 3];
-      scale_data_[vertex * 3 + 1] = msg.scales[i * 3 + 1];
-      scale_data_[vertex * 3 + 2] = msg.scales[i * 3 + 2];
-
-      quat_data_[vertex * 4 + 0] = msg.quats[i * 4];
-      quat_data_[vertex * 4 + 1] = msg.quats[i * 4 + 1];
-      quat_data_[vertex * 4 + 2] = msg.quats[i * 4 + 2];
-      quat_data_[vertex * 4 + 3] = msg.quats[i * 4 + 3];
-    }
+    SplatInstance & instance = instances_[i];
+    std::copy_n(&msg.means[i * 3], 3, instance.position);
+    instance.colour[0] = r;
+    instance.colour[1] = g;
+    instance.colour[2] = b;
+    instance.colour[3] = a;
+    std::copy_n(&msg.scales[i * 3], 3, instance.scale);
+    std::copy_n(&msg.quats[i * 4], 4, instance.quat);
   }
 
-  position_buffer_->writeData(
-    0, position_buffer_->getSizeInBytes(), position_data_.data(), true);
-  colour_buffer_->writeData(0, colour_buffer_->getSizeInBytes(), colour_data_.data(), true);
-  scale_buffer_->writeData(0, scale_buffer_->getSizeInBytes(), scale_data_.data(), true);
-  quat_buffer_->writeData(0, quat_buffer_->getSizeInBytes(), quat_data_.data(), true);
-
-  mesh_->_setBounds(bounds);
-  mesh_->_setBoundingSphereRadius(std::sqrt(radius_sq));
+  if (renderable_) {
+    renderable_->setBoundingBox(bounds);
+  }
 
   // Force a fresh depth sort now that the geometry has changed.
-  last_camera_position_ = Ogre::Vector3::ZERO;
-  last_camera_direction_ = Ogre::Vector3::ZERO;
+  sort_dirty_ = true;
 }
 
 void GaussianSplattingDisplay::applyShaderParams()
@@ -510,29 +839,27 @@ void GaussianSplattingDisplay::applyShaderParams()
   params->setNamedConstant("sigma_radius", sigma_radius_property_->getFloat());
 }
 
-void GaussianSplattingDisplay::writeDrawIndices()
+void GaussianSplattingDisplay::writeSortedInstances()
 {
-  if (!index_buffer_) {
+  if (!instance_buffer_ || !renderable_) {
     return;
   }
 
-  std::size_t output = 0;
-  for (const std::uint32_t splat : indices_) {
-    const std::uint32_t base = splat * static_cast<std::uint32_t>(kVerticesPerSplat);
-    draw_indices_[output++] = base;
-    draw_indices_[output++] = base + 1;
-    draw_indices_[output++] = base + 2;
-    draw_indices_[output++] = base;
-    draw_indices_[output++] = base + 2;
-    draw_indices_[output++] = base + 3;
+  for (std::size_t output = 0; output < indices_.size(); ++output) {
+    sorted_instances_[output] = instances_[indices_[output]];
   }
 
-  index_buffer_->writeData(0, index_buffer_->getSizeInBytes(), draw_indices_.data(), true);
+  visible_splat_count_ = indices_.size();
+  renderable_->setInstanceCount(visible_splat_count_);
+  if (visible_splat_count_ > 0) {
+    instance_buffer_->writeData(
+      0, visible_splat_count_ * sizeof(SplatInstance), sorted_instances_.data(), true);
+  }
 }
 
 void GaussianSplattingDisplay::sortIndexBuffer()
 {
-  if (!index_buffer_ || positions_.empty() || !context_ || !context_->getViewManager()) {
+  if (!instance_buffer_ || positions_.empty() || !context_ || !context_->getViewManager()) {
     return;
   }
 
@@ -548,24 +875,103 @@ void GaussianSplattingDisplay::sortIndexBuffer()
 
   const Ogre::Vector3 camera_position = camera->getDerivedPosition();
   const Ogre::Vector3 camera_direction = camera->getDerivedDirection();
-  if ((camera_position - last_camera_position_).squaredLength() < 0.0001f &&
-    (camera_direction - last_camera_direction_).squaredLength() < 0.000001f)
+  Ogre::Viewport * viewport = camera->getViewport();
+  const unsigned int viewport_width = viewport ? viewport->getActualWidth() : 0;
+  const unsigned int viewport_height = viewport ? viewport->getActualHeight() : 0;
+  const bool culling_enabled = culling_property_->getBool();
+  const float min_screen_radius = min_screen_radius_property_->getFloat();
+  const float sigma_radius = sigma_radius_property_->getFloat();
+  if (!sort_dirty_ &&
+    (camera_position - last_camera_position_).squaredLength() < 0.0001f &&
+    (camera_direction - last_camera_direction_).squaredLength() < 0.000001f &&
+    viewport_width == last_viewport_width_ && viewport_height == last_viewport_height_ &&
+    culling_enabled == last_culling_enabled_ &&
+    std::abs(min_screen_radius - last_min_screen_radius_) < 0.0001f &&
+    std::abs(sigma_radius - last_sigma_radius_) < 0.0001f)
   {
     return;
   }
 
   last_camera_position_ = camera_position;
   last_camera_direction_ = camera_direction;
+  last_viewport_width_ = viewport_width;
+  last_viewport_height_ = viewport_height;
+  last_culling_enabled_ = culling_enabled;
+  last_min_screen_radius_ = min_screen_radius;
+  last_sigma_radius_ = sigma_radius;
+  sort_dirty_ = false;
+  const auto sort_start = std::chrono::steady_clock::now();
+
+  indices_.clear();
+  indices_.reserve(splat_count_);
+
+  const Ogre::Matrix4 world_transform = splat_node_->_getFullTransform();
+  const Ogre::Vector3 derived_scale = splat_node_->_getDerivedScale();
+  const float world_scale = std::max(
+    std::abs(derived_scale.x),
+    std::max(std::abs(derived_scale.y), std::abs(derived_scale.z)));
+  const Ogre::Matrix4 view_matrix = camera->getViewMatrix(true);
+  const float alpha_cutoff = 1.0f / 255.0f;
+  const float focal_y = viewport_height > 0 && camera->getProjectionType() == Ogre::PT_PERSPECTIVE ?
+    static_cast<float>(viewport_height) * 0.5f /
+    std::tan(static_cast<float>(camera->getFOVy().valueRadians()) * 0.5f) : 0.0f;
+
+  for (std::uint32_t i = 0; i < splat_count_; ++i) {
+    const SplatInstance & instance = instances_[i];
+    if (instance.colour[3] < alpha_cutoff) {
+      continue;
+    }
+
+    const float visible_radius = std::min(
+      sigma_radius,
+      std::sqrt(2.0f * std::log(instance.colour[3] / alpha_cutoff)));
+    const float max_sigma = std::max(
+      instance.scale[0], std::max(instance.scale[1], instance.scale[2]));
+    const float world_radius = visible_radius * max_sigma * world_scale;
+    const Ogre::Vector3 world_position = world_transform * positions_[i];
+
+    if (culling_enabled && !camera->isVisible(Ogre::Sphere(world_position, world_radius))) {
+      continue;
+    }
+
+    if (culling_enabled && min_screen_radius > 0.0f && viewport_height > 0) {
+      float screen_radius = 0.0f;
+      if (camera->getProjectionType() == Ogre::PT_PERSPECTIVE) {
+        const Ogre::Vector3 view_position = view_matrix * world_position;
+        const float depth = -view_position.z;
+        if (depth <= 0.0f) {
+          continue;
+        }
+        screen_radius = focal_y * world_radius /
+          std::max(depth - world_radius, camera->getNearClipDistance());
+      } else {
+        const Ogre::Matrix4 projection = camera->getProjectionMatrix();
+        screen_radius =
+          std::abs(static_cast<float>(projection[1][1])) * viewport_height * 0.5f * world_radius;
+      }
+
+      // eps2d adds this minimum variance in screen space before rasterisation.
+      const float blur_radius = visible_radius * std::sqrt(std::max(eps2d_, 0.0f));
+      screen_radius = std::sqrt(screen_radius * screen_radius + blur_radius * blur_radius);
+      if (screen_radius < min_screen_radius) {
+        continue;
+      }
+    }
+
+    indices_.push_back(i);
+  }
 
   const Ogre::Vector3 local_sort_direction =
     splat_node_->_getDerivedOrientation().Inverse() * (-camera_direction);
 
   std::sort(indices_.begin(), indices_.end(), [&](std::uint32_t a, std::uint32_t b) {
-    return positions_[a].dotProduct(local_sort_direction) <
-           positions_[b].dotProduct(local_sort_direction);
-  });
+      return positions_[a].dotProduct(local_sort_direction) <
+             positions_[b].dotProduct(local_sort_direction);
+    });
 
-  writeDrawIndices();
+  writeSortedInstances();
+  last_sort_ms_ = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - sort_start).count();
 }
 
 Ogre::Viewport * GaussianSplattingDisplay::mainViewport() const
@@ -580,10 +986,68 @@ Ogre::Viewport * GaussianSplattingDisplay::mainViewport() const
   return rviz_rendering::RenderWindowOgreAdapter::getOgreViewport(panel->getRenderWindow());
 }
 
+void GaussianSplattingDisplay::updateAutomaticRenderScale(float wall_dt)
+{
+  const float maximum_scale = render_scale_property_->getFloat();
+  const bool enabled = offscreen_property_->getBool() &&
+    automatic_render_scale_property_->getBool();
+  if (!enabled) {
+    effective_render_scale_ = maximum_scale;
+    automatic_scale_elapsed_ = 0.0f;
+    automatic_scale_was_enabled_ = false;
+    deleteStatus("Automatic scale");
+    return;
+  }
+
+  float minimum_scale = minimum_render_scale_property_->getFloat();
+  minimum_scale = std::min(minimum_scale, maximum_scale);
+  if (!automatic_scale_was_enabled_) {
+    effective_render_scale_ = maximum_scale;
+    automatic_scale_elapsed_ = 0.0f;
+    automatic_scale_was_enabled_ = true;
+  }
+  effective_render_scale_ = clamp(effective_render_scale_, minimum_scale, maximum_scale);
+
+  // Ogre updates lastFPS once per second. Sampling more frequently would act
+  // repeatedly on the same value and recreate the RTT unnecessarily.
+  automatic_scale_elapsed_ += clamp(wall_dt, 0.0f, 0.25f);
+  if (automatic_scale_elapsed_ < 1.0f) {
+    return;
+  }
+  automatic_scale_elapsed_ = 0.0f;
+
+  Ogre::Viewport * viewport = mainViewport();
+  if (!viewport || !viewport->getTarget()) {
+    return;
+  }
+  const float fps = viewport->getTarget()->getStatistics().lastFPS;
+  const float target_fps = target_frame_rate_property_->getFloat();
+  if (fps > 1.0f && target_fps > 1.0f) {
+    float next_scale = effective_render_scale_;
+    if (fps < target_fps * 0.95f && effective_render_scale_ > minimum_scale) {
+      // When splat fill dominates, FPS is approximately inverse-square in the
+      // render scale. Leave another 3% of headroom after the predicted step.
+      next_scale *= std::sqrt(fps / target_fps) * 0.97f;
+      next_scale = std::floor(next_scale * 20.0f) / 20.0f;
+    } else if (fps > target_fps * 1.08f && effective_render_scale_ < maximum_scale) {
+      // Recovery is intentionally slower than degradation to avoid oscillation.
+      next_scale += 0.05f;
+    }
+    effective_render_scale_ = clamp(next_scale, minimum_scale, maximum_scale);
+  }
+
+  setStatus(
+    rviz_common::properties::StatusProperty::Ok, "Automatic scale",
+    QString("%1x at %2 fps (target %3)")
+    .arg(effective_render_scale_, 0, 'f', 2)
+    .arg(fps, 0, 'f', 1)
+    .arg(target_fps, 0, 'f', 0));
+}
+
 void GaussianSplattingDisplay::setSplatsVisible(bool visible)
 {
-  if (entity_) {
-    entity_->setVisible(visible);
+  if (renderable_) {
+    renderable_->setVisible(visible);
   }
 }
 
@@ -601,8 +1065,8 @@ void GaussianSplattingDisplay::preRenderTargetUpdate(const Ogre::RenderTargetEve
   if (composite_rect_) {
     composite_rect_->setVisible(!is_offscreen && event.source == main_target_);
   }
-  if (!is_offscreen && entity_) {
-    entity_->setVisible(false);
+  if (!is_offscreen && renderable_) {
+    renderable_->setVisible(false);
   }
 }
 
@@ -618,8 +1082,12 @@ void GaussianSplattingDisplay::preViewportUpdate(const Ogre::RenderTargetViewpor
     return;
   }
 
-  if (entity_) {
-    entity_->setVisible(is_splat_pass);
+  if (renderable_) {
+    renderable_->setVisible(is_splat_pass);
+  }
+
+  if (is_depth_pass && depth_scheme_resolver_) {
+    depth_scheme_resolver_->beginFrame();
   }
 
   // The depth pass renders every queue except the hidden splat entity. The
@@ -671,14 +1139,14 @@ void GaussianSplattingDisplay::destroyRenderTarget()
   if (composite_rect_) {
     composite_rect_->setVisible(false);
   }
-  if (entity_) {
-    entity_->setVisible(true);
+  if (renderable_) {
+    renderable_->setVisible(true);
   }
 }
 
 void GaussianSplattingDisplay::updateRenderTarget()
 {
-  const float scale = render_scale_property_->getFloat();
+  const float scale = effective_render_scale_;
   Ogre::Viewport * main_viewport = mainViewport();
 
   if (!offscreen_property_->getBool() || !main_viewport) {
@@ -738,6 +1206,7 @@ void GaussianSplattingDisplay::updateRenderTarget()
   depth_viewport_->setBackgroundColour(Ogre::ColourValue(0.0f, 0.0f, 0.0f, 0.0f));
   depth_viewport_->setOverlaysEnabled(false);
   depth_viewport_->setShadowsEnabled(false);
+  depth_viewport_->setMaterialScheme(kDepthMaterialScheme);
 
   rtt_viewport_ = target->addViewport(camera, 1);
   // Transparent, and the splats write premultiplied alpha, so compositing with

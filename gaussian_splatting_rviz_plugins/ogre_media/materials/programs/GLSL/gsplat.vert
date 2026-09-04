@@ -107,11 +107,20 @@ void main()
   // with it applied, so it follows the message's rasterize_mode.
   splat_colour.a *= mix(1.0, compensation, antialiased);
 
-  if (splat_colour.a < 0.00392156862) {
+  const float alpha_cutoff = 0.00392156862;
+  if (splat_colour.a < alpha_cutoff) {
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
     splat_local_coord = vec2(0.0);
     return;
   }
+
+  // alpha = opacity * exp(-r^2 / 2). Pixels beyond this radius would be
+  // discarded by the fragment shader, so do not rasterise them in the first
+  // place. This is exact with respect to the shader's alpha cutoff and can
+  // shrink low-opacity splats substantially below the configured sigma cap.
+  float visible_radius = min(
+    sigma_radius,
+    sqrt(2.0 * log(splat_colour.a / alpha_cutoff)));
 
   float det = cov.x * cov.z - cov.y * cov.y;
   float mid = 0.5 * (cov.x + cov.z);
@@ -128,10 +137,10 @@ void main()
   vec2 axis2 = vec2(-axis1.y, axis1.x);
 
   vec2 pixel_offset =
-    uv2.x * axis1 * (sigma_radius * sqrt(lambda1)) +
-    uv2.y * axis2 * (sigma_radius * sqrt(lambda2));
+    uv2.x * axis1 * (visible_radius * sqrt(lambda1)) +
+    uv2.y * axis2 * (visible_radius * sqrt(lambda2));
   vec2 ndc_offset = pixel_offset * 2.0 / vpsize.xy;
 
-  splat_local_coord = uv2 * sigma_radius;
+  splat_local_coord = uv2 * visible_radius;
   gl_Position = vec4(p_proj.xy + ndc_offset, p_proj.z, 1.0);
 }
