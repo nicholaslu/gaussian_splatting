@@ -148,11 +148,15 @@ private:
   // concatenated in worker order, which keeps the draw order deterministic.
   std::vector<std::vector<std::uint64_t>> cull_partitions_;
 
-  // Spherical harmonics, kept in splat order because the view direction is not
-  // known until the camera moves. sh_coefficients_ is K-1, the count beyond the
-  // constant term, so it is 0, 3, 8 or 15.
-  std::vector<float> sh_dc_;
-  std::vector<float> sh_rest_;
+  // Spherical harmonics, needed until the camera stops moving rather than only
+  // during processMessage, so the message is held and pointed into instead of
+  // copied out of: at degree 3 the coefficients are 180 bytes a splat, and
+  // copying them measured 6 ms against a memory bandwidth that leaves nothing
+  // for threads to win. sh_coefficients_ is K-1, the count beyond the constant
+  // term, so it is 0, 3, 8 or 15.
+  GaussianSplats::ConstSharedPtr message_;
+  const float * sh_dc_ = nullptr;
+  const float * sh_rest_ = nullptr;
   std::size_t sh_coefficients_ = 0;
 
   // Three floats per splat index, filled for the splats that survive culling.

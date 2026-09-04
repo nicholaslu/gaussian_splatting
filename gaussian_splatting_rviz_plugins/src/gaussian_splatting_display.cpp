@@ -611,6 +611,14 @@ void GaussianSplattingDisplay::processMessage(GaussianSplats::ConstSharedPtr msg
     allocateMesh(count);
   }
 
+  // Held for as long as the harmonics are read out of it, which is until the
+  // next message or until the display is cleared. Assigning here releases the
+  // previous message, so the pointers into it are dropped in the same breath
+  // rather than left dangling until uploadSplats re-points them.
+  sh_dc_ = nullptr;
+  sh_rest_ = nullptr;
+  message_ = msg;
+
   eps2d_ = msg->eps2d;
   antialiased_ =
     msg->rasterize_mode == GaussianSplats::RASTERIZE_MODE_ANTIALIASED ? 1.0f : 0.0f;
@@ -753,8 +761,9 @@ void GaussianSplattingDisplay::clearMesh()
   records_.clear();
   draw_instances_.clear();
   colours_.clear();
-  sh_dc_.clear();
-  sh_rest_.clear();
+  message_.reset();
+  sh_dc_ = nullptr;
+  sh_rest_ = nullptr;
   sh_coefficients_ = 0;
   if (splat_data_texture_) {
     Ogre::TextureManager::getSingleton().remove(splat_data_texture_);
@@ -893,12 +902,17 @@ void GaussianSplattingDisplay::writeSplatDataTexture()
   const std::size_t floats_per_splat = kTexelsPerSplat * 4;
   const std::size_t splats_per_row = kSplatDataWidth / kTexelsPerSplat;
 
-  for (std::size_t row = 0; row * splats_per_row < records_.size(); ++row) {
-    const std::size_t first = row * splats_per_row;
-    const std::size_t here = std::min(splats_per_row, records_.size() - first);
-    std::memcpy(
-      destination + row * row_floats, &records_[first], here * floats_per_splat * sizeof(float));
-  }
+  const std::size_t rows = (records_.size() + splats_per_row - 1) / splats_per_row;
+  parallelFor(
+    rows, workerCount(records_.size()), [&](std::size_t begin, std::size_t end, std::size_t) {
+      for (std::size_t row = begin; row < end; ++row) {
+        const std::size_t first = row * splats_per_row;
+        const std::size_t here = std::min(splats_per_row, records_.size() - first);
+        std::memcpy(
+          destination + row * row_floats, &records_[first],
+          here * floats_per_splat * sizeof(float));
+      }
+    });
   buffer->unlock();
 }
 
@@ -936,29 +950,11 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
   // Colour cannot be baked in here: beyond degree 0 it depends on the view
   // direction, so the coefficients are kept and evaluated whenever the camera
   // moves. That is the same trigger the depth sort already uses.
-  //
-  // At degree 3 this is 180 bytes a splat, so the copy is worth splitting.
-  // Resized only when the size changes, because resize() value-initialises and
-  // a stream of equally sized messages would otherwise pay for zeroing what it
-  // is about to overwrite.
+  // Pointed at, not copied: message_ holds the message alive for exactly as
+  // long as these stay in use.
   sh_coefficients_ = (msg.sh_degree + 1u) * (msg.sh_degree + 1u) - 1u;
-  if (sh_dc_.size() != msg.sh_dc.size()) {
-    sh_dc_.resize(msg.sh_dc.size());
-  }
-  if (sh_rest_.size() != msg.sh_rest.size()) {
-    sh_rest_.resize(msg.sh_rest.size());
-  }
-  parallelFor(
-    sh_dc_.size(), workerCount(sh_dc_.size()),
-    [&](std::size_t begin, std::size_t end, std::size_t) {
-      std::memcpy(sh_dc_.data() + begin, msg.sh_dc.data() + begin, (end - begin) * sizeof(float));
-    });
-  parallelFor(
-    sh_rest_.size(), workerCount(sh_rest_.size()),
-    [&](std::size_t begin, std::size_t end, std::size_t) {
-      std::memcpy(
-        sh_rest_.data() + begin, msg.sh_rest.data() + begin, (end - begin) * sizeof(float));
-    });
+  sh_dc_ = msg.sh_dc.data();
+  sh_rest_ = msg.sh_rest.empty() ? nullptr : msg.sh_rest.data();
 
   writeSplatDataTexture();
 
@@ -1142,7 +1138,9 @@ void evaluateColour(
 
 void GaussianSplattingDisplay::sortIndexBuffer()
 {
-  if (!instance_buffer_ || positions_.empty() || !context_ || !context_->getViewManager()) {
+  if (!instance_buffer_ || positions_.empty() || !sh_dc_ || !context_ ||
+    !context_->getViewManager())
+  {
     return;
   }
 
