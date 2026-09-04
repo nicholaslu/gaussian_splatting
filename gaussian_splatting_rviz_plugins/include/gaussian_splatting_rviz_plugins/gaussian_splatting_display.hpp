@@ -71,7 +71,6 @@ private:
   // dominated by fill rate, so this trades splat sharpness for roughly the
   // square of the scale factor in fragments.
   Ogre::Viewport * mainViewport() const;
-  void updateAutomaticRenderScale(float wall_dt);
   void updateRenderTarget();
   void destroyRenderTarget();
   void setSplatsVisible(bool visible);
@@ -81,9 +80,6 @@ private:
   rviz_common::properties::FloatProperty * min_screen_radius_property_ = nullptr;
   rviz_common::properties::BoolProperty * offscreen_property_ = nullptr;
   rviz_common::properties::FloatProperty * render_scale_property_ = nullptr;
-  rviz_common::properties::BoolProperty * automatic_render_scale_property_ = nullptr;
-  rviz_common::properties::FloatProperty * minimum_render_scale_property_ = nullptr;
-  rviz_common::properties::FloatProperty * target_frame_rate_property_ = nullptr;
 
   Ogre::SceneNode * splat_node_ = nullptr;
   std::unique_ptr<GaussianSplatRenderable> renderable_;
@@ -100,9 +96,6 @@ private:
   std::unique_ptr<DepthSchemeResolver> depth_scheme_resolver_;
   unsigned int rtt_width_ = 0;
   unsigned int rtt_height_ = 0;
-  float effective_render_scale_ = 1.0f;
-  float automatic_scale_elapsed_ = 0.0f;
-  bool automatic_scale_was_enabled_ = false;
   double last_upload_ms_ = 0.0;
   double last_sort_ms_ = 0.0;
 

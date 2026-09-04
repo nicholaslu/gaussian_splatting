@@ -400,7 +400,7 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
   min_screen_radius_property_->setMax(8.0f);
 
   offscreen_property_ = new rviz_common::properties::BoolProperty(
-    "Offscreen Rendering", false,
+    "Offscreen Rendering", true,
     "Rasterise the splats into their own target and composite the result over "
     "the scene, instead of drawing them straight into the window.\n\n"
     "This is worth switching on even at full resolution: RViz configures the "
@@ -425,27 +425,6 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
   render_scale_property_->setMin(0.25f);
   render_scale_property_->setMax(1.0f);
 
-  automatic_render_scale_property_ = new rviz_common::properties::BoolProperty(
-    "Automatic Render Scale", false,
-    "Adjust the splat render target to hold the requested frame rate. Render "
-    "Scale remains the upper quality limit; other RViz displays stay at native resolution.",
-    offscreen_property_);
-
-  minimum_render_scale_property_ = new rviz_common::properties::FloatProperty(
-    "Minimum Render Scale", 0.35f,
-    "Lowest scale automatic control may select. Lower values recover more "
-    "frame rate at the cost of softer splats.",
-    automatic_render_scale_property_);
-  minimum_render_scale_property_->setMin(0.25f);
-  minimum_render_scale_property_->setMax(1.0f);
-
-  target_frame_rate_property_ = new rviz_common::properties::FloatProperty(
-    "Target Frame Rate", 55.0f,
-    "Frame-rate target used by automatic render scaling. A small margin below "
-    "RViz's 60 Hz cap leaves room for transient work.",
-    automatic_render_scale_property_);
-  target_frame_rate_property_->setMin(10.0f);
-  target_frame_rate_property_->setMax(240.0f);
 }
 
 GaussianSplattingDisplay::~GaussianSplattingDisplay()
@@ -503,7 +482,6 @@ void GaussianSplattingDisplay::reset()
 void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
 {
   rviz_common::MessageFilterDisplay<GaussianSplats>::update(wall_dt, ros_dt);
-  updateAutomaticRenderScale(wall_dt);
   updateRenderTarget();
   if (splat_texture_) {
     setStatus(
@@ -986,64 +964,6 @@ Ogre::Viewport * GaussianSplattingDisplay::mainViewport() const
   return rviz_rendering::RenderWindowOgreAdapter::getOgreViewport(panel->getRenderWindow());
 }
 
-void GaussianSplattingDisplay::updateAutomaticRenderScale(float wall_dt)
-{
-  const float maximum_scale = render_scale_property_->getFloat();
-  const bool enabled = offscreen_property_->getBool() &&
-    automatic_render_scale_property_->getBool();
-  if (!enabled) {
-    effective_render_scale_ = maximum_scale;
-    automatic_scale_elapsed_ = 0.0f;
-    automatic_scale_was_enabled_ = false;
-    deleteStatus("Automatic scale");
-    return;
-  }
-
-  float minimum_scale = minimum_render_scale_property_->getFloat();
-  minimum_scale = std::min(minimum_scale, maximum_scale);
-  if (!automatic_scale_was_enabled_) {
-    effective_render_scale_ = maximum_scale;
-    automatic_scale_elapsed_ = 0.0f;
-    automatic_scale_was_enabled_ = true;
-  }
-  effective_render_scale_ = clamp(effective_render_scale_, minimum_scale, maximum_scale);
-
-  // Ogre updates lastFPS once per second. Sampling more frequently would act
-  // repeatedly on the same value and recreate the RTT unnecessarily.
-  automatic_scale_elapsed_ += clamp(wall_dt, 0.0f, 0.25f);
-  if (automatic_scale_elapsed_ < 1.0f) {
-    return;
-  }
-  automatic_scale_elapsed_ = 0.0f;
-
-  Ogre::Viewport * viewport = mainViewport();
-  if (!viewport || !viewport->getTarget()) {
-    return;
-  }
-  const float fps = viewport->getTarget()->getStatistics().lastFPS;
-  const float target_fps = target_frame_rate_property_->getFloat();
-  if (fps > 1.0f && target_fps > 1.0f) {
-    float next_scale = effective_render_scale_;
-    if (fps < target_fps * 0.95f && effective_render_scale_ > minimum_scale) {
-      // When splat fill dominates, FPS is approximately inverse-square in the
-      // render scale. Leave another 3% of headroom after the predicted step.
-      next_scale *= std::sqrt(fps / target_fps) * 0.97f;
-      next_scale = std::floor(next_scale * 20.0f) / 20.0f;
-    } else if (fps > target_fps * 1.08f && effective_render_scale_ < maximum_scale) {
-      // Recovery is intentionally slower than degradation to avoid oscillation.
-      next_scale += 0.05f;
-    }
-    effective_render_scale_ = clamp(next_scale, minimum_scale, maximum_scale);
-  }
-
-  setStatus(
-    rviz_common::properties::StatusProperty::Ok, "Automatic scale",
-    QString("%1x at %2 fps (target %3)")
-    .arg(effective_render_scale_, 0, 'f', 2)
-    .arg(fps, 0, 'f', 1)
-    .arg(target_fps, 0, 'f', 0));
-}
-
 void GaussianSplattingDisplay::setSplatsVisible(bool visible)
 {
   if (renderable_) {
@@ -1146,7 +1066,7 @@ void GaussianSplattingDisplay::destroyRenderTarget()
 
 void GaussianSplattingDisplay::updateRenderTarget()
 {
-  const float scale = effective_render_scale_;
+  const float scale = render_scale_property_->getFloat();
   Ogre::Viewport * main_viewport = mainViewport();
 
   if (!offscreen_property_->getBool() || !main_viewport) {
