@@ -156,5 +156,6 @@ fragment half4 gsplat_fp(GaussianSplatOut in [[stage_in]])
     if (alpha < (1.0 / 255.0)) {
         metal::discard_fragment();
     }
-    return half4(half3(in.color.rgb), half(alpha));
+    // Premultiplied alpha; see the GLSL fragment shader for why.
+    return half4(half3(in.color.rgb * alpha), half(alpha));
 }

@@ -31,7 +31,7 @@ material GaussianSplatting/RViz
       lighting off
       cull_hardware none
       cull_software none
-      scene_blend alpha_blend
+      scene_blend one one_minus_src_alpha
       depth_write off
 
       vertex_program_ref GaussianSplatting/RVizVP {}

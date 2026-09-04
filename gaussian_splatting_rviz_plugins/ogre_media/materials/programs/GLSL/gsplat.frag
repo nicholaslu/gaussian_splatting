@@ -10,5 +10,8 @@ void main()
   if (alpha < 0.00392156862) {
     discard;
   }
-  gl_FragColor = vec4(splat_colour.rgb, alpha);
+  // Premultiplied alpha, paired with "scene_blend one one_minus_src_alpha".
+  // Identical to straight alpha when drawn over the scene, but also correct
+  // when drawn into the transparent half-resolution target and composited.
+  gl_FragColor = vec4(splat_colour.rgb * alpha, alpha);
 }

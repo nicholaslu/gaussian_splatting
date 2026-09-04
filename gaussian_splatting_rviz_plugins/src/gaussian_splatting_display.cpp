@@ -10,24 +10,32 @@
 #include <OgreCamera.h>
 #include <OgreEntity.h>
 #include <OgreGpuProgramParams.h>
+#include <OgreHardwarePixelBuffer.h>
 #include <OgreHardwareBufferManager.h>
 #include <OgreMaterialManager.h>
 #include <OgreMeshManager.h>
 #include <OgrePass.h>
+#include <OgreRectangle2D.h>
+#include <OgreRenderTexture.h>
 #include <OgreResourceGroupManager.h>
 #include <OgreRoot.h>
 #include <OgreSceneManager.h>
 #include <OgreSceneNode.h>
 #include <OgreSubMesh.h>
 #include <OgreTechnique.h>
+#include <OgreTextureManager.h>
 #include <OgreVertexIndexData.h>
+#include <OgreViewport.h>
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "rviz_common/display_context.hpp"
 #include "rviz_common/frame_manager_iface.hpp"
 #include "rviz_common/view_controller.hpp"
+#include "rviz_common/render_panel.hpp"
+#include "rviz_common/properties/bool_property.hpp"
 #include "rviz_common/view_manager.hpp"
+#include "rviz_rendering/render_window.hpp"
 
 namespace gaussian_splatting_rviz_plugins
 {
@@ -36,6 +44,13 @@ namespace
 
 constexpr const char * kResourceGroup = "GaussianSplattingRviz";
 constexpr const char * kMaterialName = "GaussianSplatting/RViz";
+constexpr const char * kCompositeMaterialName = "GaussianSplatting/Composite";
+
+// Splats get a render queue of their own so the offscreen pass can be told to
+// draw that queue and nothing else. Sitting just after RENDER_QUEUE_MAIN keeps
+// them on top of the opaque scene, which is where an alpha blended cloud
+// belongs anyway.
+constexpr Ogre::uint8 kSplatRenderQueue = Ogre::RENDER_QUEUE_MAIN + 1;
 
 // Degree 0 spherical harmonics basis, as used by the 3DGS reference
 // implementation: rgb = sh_dc * kSHC0 + 0.5
@@ -84,16 +99,54 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
     this);
   sigma_radius_property_->setMin(0.5f);
   sigma_radius_property_->setMax(4.0f);
+
+  offscreen_property_ = new rviz_common::properties::BoolProperty(
+    "Offscreen Rendering", false,
+    "Rasterise the splats into their own target and composite the result over "
+    "the scene, instead of drawing them straight into the window.\n\n"
+    "This is worth switching on even at full resolution: RViz configures the "
+    "window for 4x MSAA, which costs four samples per fragment and does "
+    "nothing for alpha blended splats, since they have no geometric edges to "
+    "antialias. The offscreen target has no MSAA, which measured roughly 3x "
+    "faster with no visible difference.\n\n"
+    "The cost is that the splats are NOT depth tested against the rest of the "
+    "scene while this is on, and are drawn over it, because the target does "
+    "not carry scene depth yet.",
+    this);
+
+  render_scale_property_ = new rviz_common::properties::FloatProperty(
+    "Render Scale", 1.0f,
+    "Fraction of the viewport resolution the splats are rasterised at. Fill "
+    "rate scales with the square of this value, so 0.5 costs a quarter of the "
+    "fragments in exchange for softer splats. Only the splats are affected; "
+    "every other display stays sharp. 1.0 is a 1:1 composite and loses "
+    "nothing.",
+    offscreen_property_);
+  render_scale_property_->setMin(0.25f);
+  render_scale_property_->setMax(1.0f);
 }
 
 GaussianSplattingDisplay::~GaussianSplattingDisplay()
 {
+  destroyRenderTarget();
   clearMesh();
 
   if (material_) {
     Ogre::MaterialManager::getSingleton().remove(material_);
     material_.reset();
   }
+
+  if (composite_material_) {
+    Ogre::MaterialManager::getSingleton().remove(composite_material_);
+    composite_material_.reset();
+  }
+
+  if (composite_node_) {
+    scene_manager_->destroySceneNode(composite_node_);
+    composite_node_ = nullptr;
+  }
+  delete composite_rect_;
+  composite_rect_ = nullptr;
 
   if (splat_node_) {
     scene_manager_->destroySceneNode(splat_node_);
@@ -118,6 +171,14 @@ void GaussianSplattingDisplay::reset()
 void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
 {
   rviz_common::MessageFilterDisplay<GaussianSplats>::update(wall_dt, ros_dt);
+  updateRenderTarget();
+  if (splat_texture_) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Ok, "Offscreen",
+      QString("splats rasterised at %1x%2").arg(rtt_width_).arg(rtt_height_));
+  } else {
+    deleteStatus("Offscreen");
+  }
   applyShaderParams();
   sortIndexBuffer();
 }
@@ -361,6 +422,8 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
 
   entity_ = scene_manager_->createEntity(mesh_name_);
   entity_->setMaterialName(material_name_, kResourceGroup);
+  entity_->setVisible(!splat_texture_);
+  entity_->setRenderQueueGroup(kSplatRenderQueue);
   splat_node_->attachObject(entity_);
 }
 
@@ -502,6 +565,182 @@ void GaussianSplattingDisplay::sortIndexBuffer()
   });
 
   writeDrawIndices();
+}
+
+Ogre::Viewport * GaussianSplattingDisplay::mainViewport() const
+{
+  if (!context_ || !context_->getViewManager()) {
+    return nullptr;
+  }
+  rviz_common::RenderPanel * panel = context_->getViewManager()->getRenderPanel();
+  if (!panel || !panel->getRenderWindow()) {
+    return nullptr;
+  }
+  return rviz_rendering::RenderWindowOgreAdapter::getOgreViewport(panel->getRenderWindow());
+}
+
+void GaussianSplattingDisplay::setSplatsVisible(bool visible)
+{
+  if (entity_) {
+    entity_->setVisible(visible);
+  }
+}
+
+void GaussianSplattingDisplay::preRenderTargetUpdate(const Ogre::RenderTargetEvent & event)
+{
+  if (!splat_texture_) {
+    return;
+  }
+
+  const bool is_offscreen = event.source == splat_texture_->getBuffer()->getRenderTarget();
+  if (entity_) {
+    entity_->setVisible(is_offscreen);
+  }
+  if (composite_rect_) {
+    composite_rect_->setVisible(!is_offscreen && event.source == main_target_);
+  }
+
+  if (is_offscreen) {
+    // Without this the offscreen pass draws the whole scene -- grid, axes,
+    // every other display -- and compositing it back over the window replaces
+    // all of them with an unantialiased copy.
+    scene_manager_->setSpecialCaseRenderQueueMode(Ogre::SceneManager::SCRQM_INCLUDE);
+    scene_manager_->clearSpecialCaseRenderQueues();
+    scene_manager_->addSpecialCaseRenderQueue(kSplatRenderQueue);
+  }
+}
+
+void GaussianSplattingDisplay::postRenderTargetUpdate(const Ogre::RenderTargetEvent &)
+{
+  // Neither belongs in the selection and pick textures, which RViz renders
+  // without notifying this listener, so leave both hidden between targets.
+  setSplatsVisible(false);
+  if (composite_rect_) {
+    composite_rect_->setVisible(false);
+  }
+
+  // Back to rendering every queue for whatever target comes next.
+  scene_manager_->clearSpecialCaseRenderQueues();
+  scene_manager_->setSpecialCaseRenderQueueMode(Ogre::SceneManager::SCRQM_EXCLUDE);
+}
+
+void GaussianSplattingDisplay::destroyRenderTarget()
+{
+  if (splat_texture_) {
+    Ogre::RenderTexture * target = splat_texture_->getBuffer()->getRenderTarget();
+    target->removeListener(this);
+    target->removeAllViewports();
+    Ogre::TextureManager::getSingleton().remove(splat_texture_);
+    splat_texture_.reset();
+  }
+
+  if (main_target_) {
+    main_target_->removeListener(this);
+    main_target_ = nullptr;
+  }
+
+  rtt_viewport_ = nullptr;
+  rtt_width_ = 0;
+  rtt_height_ = 0;
+
+  // Back to drawing straight into the scene.
+  if (composite_rect_) {
+    composite_rect_->setVisible(false);
+  }
+  if (entity_) {
+    entity_->setVisible(true);
+  }
+}
+
+void GaussianSplattingDisplay::updateRenderTarget()
+{
+  const float scale = render_scale_property_->getFloat();
+  Ogre::Viewport * main_viewport = mainViewport();
+
+  if (!offscreen_property_->getBool() || !main_viewport) {
+    if (splat_texture_) {
+      destroyRenderTarget();
+    }
+    return;
+  }
+
+  const auto width = static_cast<unsigned int>(
+    std::max(1.0f, static_cast<float>(main_viewport->getActualWidth()) * scale));
+  const auto height = static_cast<unsigned int>(
+    std::max(1.0f, static_cast<float>(main_viewport->getActualHeight()) * scale));
+  Ogre::Camera * camera = main_viewport->getCamera();
+  if (!camera) {
+    return;
+  }
+
+  // Switching view controller swaps in a different camera, which the offscreen
+  // viewport has to follow or it renders from a stale one.
+  if (splat_texture_ && width == rtt_width_ && height == rtt_height_ &&
+    rtt_viewport_ && rtt_viewport_->getCamera() == camera)
+  {
+    return;
+  }
+
+  destroyRenderTarget();
+
+  if (!composite_material_) {
+    Ogre::MaterialPtr base =
+      Ogre::MaterialManager::getSingleton().getByName(kCompositeMaterialName, kResourceGroup);
+    if (!base) {
+      setStatus(
+        rviz_common::properties::StatusProperty::Error, "Material",
+        QString("Material '%1' was not found; cannot render at reduced scale.")
+        .arg(kCompositeMaterialName));
+      offscreen_property_->setBool(false);
+      return;
+    }
+    composite_material_ = base->clone(material_name_ + "_Composite", true, kResourceGroup);
+  }
+
+  splat_texture_ = Ogre::TextureManager::getSingleton().createManual(
+    mesh_name_ + "_RTT", kResourceGroup, Ogre::TEX_TYPE_2D, width, height, 0,
+    Ogre::PF_A8R8G8B8, Ogre::TU_RENDERTARGET);
+
+  Ogre::RenderTexture * target = splat_texture_->getBuffer()->getRenderTarget();
+  rtt_viewport_ = target->addViewport(camera);
+  rtt_viewport_->setClearEveryFrame(true);
+  // Transparent, and the splats write premultiplied alpha, so compositing with
+  // "one one_minus_src_alpha" reproduces drawing them straight into the scene.
+  rtt_viewport_->setBackgroundColour(Ogre::ColourValue(0.0f, 0.0f, 0.0f, 0.0f));
+  rtt_viewport_->setOverlaysEnabled(false);
+  rtt_viewport_->setShadowsEnabled(false);
+  target->addListener(this);
+  // MetalRenderTexture's constructor leaves mActive false and never clears it
+  // (OgreMetalRenderTexture.mm), so RenderSystem::_updateAllRenderTargets()
+  // skips the target and it is never drawn. The GL render textures leave the
+  // base class default of true. RViz never hit this because its selection
+  // buffers call RenderTarget::update() directly rather than relying on the
+  // auto-update pass.
+  target->setActive(true);
+
+  main_target_ = main_viewport->getTarget();
+  if (main_target_) {
+    main_target_->addListener(this);
+  }
+
+  rtt_width_ = width;
+  rtt_height_ = height;
+
+  if (!composite_rect_) {
+    composite_rect_ = new Ogre::Rectangle2D(true);
+    composite_rect_->setCorners(-1.0f, 1.0f, 1.0f, -1.0f);
+    composite_rect_->setBoundingBox(Ogre::AxisAlignedBox::BOX_INFINITE);
+    composite_rect_->setRenderQueueGroup(Ogre::RENDER_QUEUE_OVERLAY);
+    composite_node_ = scene_manager_->getRootSceneNode()->createChildSceneNode();
+    composite_node_->attachObject(composite_rect_);
+  }
+
+  Ogre::Pass * pass = composite_material_->getTechnique(0)->getPass(0);
+  pass->getTextureUnitState(0)->setTextureName(splat_texture_->getName());
+  composite_material_->load();
+  composite_rect_->setMaterial(composite_material_);
+
+  setSplatsVisible(false);
 }
 
 }  // namespace gaussian_splatting_rviz_plugins
