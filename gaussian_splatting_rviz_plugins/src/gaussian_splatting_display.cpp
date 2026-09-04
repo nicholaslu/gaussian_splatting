@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <map>
 #include <string>
 #include <utility>
@@ -113,6 +114,44 @@ template<typename T>
 T clamp(T value, T low, T high)
 {
   return std::max(low, std::min(value, high));
+}
+
+// Splits [0, count) across the calling thread and a few others, calling
+// body(begin, end, worker). Threads are created per call rather than pooled:
+// at tens of microseconds each that is a fraction of a percent of the work
+// being split, and it keeps the display free of a pool's lifetime and
+// shutdown handling. Below the threshold the split costs more than it saves,
+// so the body runs inline as worker 0.
+constexpr std::size_t kParallelThreshold = 32768;
+
+std::size_t workerCount(std::size_t items)
+{
+  if (items < kParallelThreshold) {
+    return 1;
+  }
+  const unsigned hardware = std::thread::hardware_concurrency();
+  return std::max<std::size_t>(1, std::min<std::size_t>(hardware, 8));
+}
+
+template<typename Body>
+void parallelFor(std::size_t count, std::size_t workers, Body && body)
+{
+  if (workers <= 1 || count == 0) {
+    body(0, count, 0);
+    return;
+  }
+  std::vector<std::thread> pool;
+  pool.reserve(workers - 1);
+  for (std::size_t worker = 1; worker < workers; ++worker) {
+    pool.emplace_back(
+      [&body, count, workers, worker] {
+        body(count * worker / workers, count * (worker + 1) / workers, worker);
+      });
+  }
+  body(0, count / workers, 0);
+  for (std::thread & thread : pool) {
+    thread.join();
+  }
 }
 
 }  // namespace
@@ -865,28 +904,61 @@ void GaussianSplattingDisplay::writeSplatDataTexture()
 
 void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::size_t count)
 {
+  // Each worker writes a disjoint range of positions_ and records_, and keeps
+  // its own bounds so the reduction needs no lock.
+  const std::size_t workers = workerCount(count);
+  std::vector<Ogre::AxisAlignedBox> worker_bounds(workers);
+  parallelFor(
+    count, workers, [&](std::size_t begin, std::size_t end, std::size_t worker) {
+      Ogre::AxisAlignedBox local;
+      local.setNull();
+      for (std::size_t i = begin; i < end; ++i) {
+        const Ogre::Vector3 position(msg.means[i * 3], msg.means[i * 3 + 1], msg.means[i * 3 + 2]);
+        positions_[i] = position;
+        local.merge(position);
+
+        SplatRecord & record = records_[i];
+        std::copy_n(&msg.means[i * 3], 3, record.position);
+        record.opacity = clamp(msg.opacities[i], 0.0f, 1.0f);
+        std::copy_n(&msg.scales[i * 3], 3, record.scale);
+        std::copy_n(&msg.quats[i * 4], 4, record.quat);
+        record.pad0 = 0.0f;
+      }
+      worker_bounds[worker] = local;
+    });
+
   Ogre::AxisAlignedBox bounds;
   bounds.setNull();
-
-  for (std::size_t i = 0; i < count; ++i) {
-    const Ogre::Vector3 position(msg.means[i * 3], msg.means[i * 3 + 1], msg.means[i * 3 + 2]);
-    positions_[i] = position;
-    bounds.merge(position);
-
-    SplatRecord & record = records_[i];
-    std::copy_n(&msg.means[i * 3], 3, record.position);
-    record.opacity = clamp(msg.opacities[i], 0.0f, 1.0f);
-    std::copy_n(&msg.scales[i * 3], 3, record.scale);
-    std::copy_n(&msg.quats[i * 4], 4, record.quat);
-    record.pad0 = 0.0f;
+  for (const Ogre::AxisAlignedBox & local : worker_bounds) {
+    bounds.merge(local);
   }
 
   // Colour cannot be baked in here: beyond degree 0 it depends on the view
   // direction, so the coefficients are kept and evaluated whenever the camera
   // moves. That is the same trigger the depth sort already uses.
+  //
+  // At degree 3 this is 180 bytes a splat, so the copy is worth splitting.
+  // Resized only when the size changes, because resize() value-initialises and
+  // a stream of equally sized messages would otherwise pay for zeroing what it
+  // is about to overwrite.
   sh_coefficients_ = (msg.sh_degree + 1u) * (msg.sh_degree + 1u) - 1u;
-  sh_dc_.assign(msg.sh_dc.begin(), msg.sh_dc.end());
-  sh_rest_.assign(msg.sh_rest.begin(), msg.sh_rest.end());
+  if (sh_dc_.size() != msg.sh_dc.size()) {
+    sh_dc_.resize(msg.sh_dc.size());
+  }
+  if (sh_rest_.size() != msg.sh_rest.size()) {
+    sh_rest_.resize(msg.sh_rest.size());
+  }
+  parallelFor(
+    sh_dc_.size(), workerCount(sh_dc_.size()),
+    [&](std::size_t begin, std::size_t end, std::size_t) {
+      std::memcpy(sh_dc_.data() + begin, msg.sh_dc.data() + begin, (end - begin) * sizeof(float));
+    });
+  parallelFor(
+    sh_rest_.size(), workerCount(sh_rest_.size()),
+    [&](std::size_t begin, std::size_t end, std::size_t) {
+      std::memcpy(
+        sh_rest_.data() + begin, msg.sh_rest.data() + begin, (end - begin) * sizeof(float));
+    });
 
   writeSplatDataTexture();
 
@@ -940,13 +1012,18 @@ void GaussianSplattingDisplay::writeSortedInstances()
   }
 
   // The shader reads the record from the data texture, so only the index and
-  // the view-dependent colour move: eight bytes per splat, not a whole record.
-  for (std::size_t output = 0; output < order_.size(); ++output) {
-    const auto splat = static_cast<std::uint32_t>(order_[output]);
-    DrawInstance & instance = draw_instances_[output];
-    instance.index = static_cast<float>(splat);
-    std::copy_n(&colours_[splat * 3], 3, instance.colour);
-  }
+  // the view-dependent colour move: sixteen bytes per splat, not a whole
+  // record. Each worker writes a disjoint range of draw_instances_.
+  parallelFor(
+    order_.size(), workerCount(order_.size()),
+    [&](std::size_t begin, std::size_t end, std::size_t) {
+      for (std::size_t output = begin; output < end; ++output) {
+        const auto splat = static_cast<std::uint32_t>(order_[output]);
+        DrawInstance & instance = draw_instances_[output];
+        instance.index = static_cast<float>(splat);
+        std::copy_n(&colours_[splat * 3], 3, instance.colour);
+      }
+    });
 
   visible_splat_count_ = order_.size();
   renderable_->setInstanceCount(visible_splat_count_);
@@ -1129,64 +1206,101 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     std::max(std::abs(derived_scale.y), std::abs(derived_scale.z)));
   const Ogre::Matrix4 view_matrix = camera->getViewMatrix(true);
   const float alpha_cutoff = 1.0f / 255.0f;
-  const float focal_y = viewport_height > 0 && camera->getProjectionType() == Ogre::PT_PERSPECTIVE ?
+  const bool perspective = camera->getProjectionType() == Ogre::PT_PERSPECTIVE;
+  const float focal_y = viewport_height > 0 && perspective ?
     static_cast<float>(viewport_height) * 0.5f /
     std::tan(static_cast<float>(camera->getFOVy().valueRadians()) * 0.5f) : 0.0f;
+  const float near_clip = camera->getNearClipDistance();
+  const float far_clip = camera->getFarClipDistance();
+  const float ortho_scale = perspective ? 0.0f :
+    std::abs(static_cast<float>(camera->getProjectionMatrix()[1][1])) *
+    static_cast<float>(viewport_height) * 0.5f;
 
-  for (std::uint32_t i = 0; i < splat_count_; ++i) {
-    const SplatRecord & record = records_[i];
-    if (record.opacity < alpha_cutoff) {
-      continue;
-    }
+  // Everything the loop needs from the camera is taken here, on the render
+  // thread. Camera::isVisible() and getProjectionMatrix() update lazily cached
+  // state on first call, which several workers calling at once would race on;
+  // reading them now leaves the loop with nothing but plain values. The plane
+  // test below is Frustum::isVisible(Sphere) verbatim, far-plane case included.
+  Ogre::Plane frustum_planes[6];
+  std::copy_n(camera->getFrustumPlanes(), 6, frustum_planes);
 
-    const float visible_radius = std::min(
-      sigma_radius,
-      std::sqrt(2.0f * std::log(record.opacity / alpha_cutoff)));
-    const float max_sigma = std::max(
-      record.scale[0], std::max(record.scale[1], record.scale[2]));
-    const float world_radius = visible_radius * max_sigma * world_scale;
-    const Ogre::Vector3 world_position = world_transform * positions_[i];
+  const std::size_t workers = workerCount(splat_count_);
+  cull_partitions_.resize(workers);
+  parallelFor(
+    splat_count_, workers, [&](std::size_t begin, std::size_t end, std::size_t worker) {
+    std::vector<std::uint64_t> & partition = cull_partitions_[worker];
+    partition.clear();
+    partition.reserve(end - begin);
 
-    if (culling_enabled && !camera->isVisible(Ogre::Sphere(world_position, world_radius))) {
-      continue;
-    }
-
-    if (culling_enabled && min_screen_radius > 0.0f && viewport_height > 0) {
-      float screen_radius = 0.0f;
-      if (camera->getProjectionType() == Ogre::PT_PERSPECTIVE) {
-        const Ogre::Vector3 view_position = view_matrix * world_position;
-        const float depth = -view_position.z;
-        if (depth <= 0.0f) {
-          continue;
-        }
-        screen_radius = focal_y * world_radius /
-          std::max(depth - world_radius, camera->getNearClipDistance());
-      } else {
-        const Ogre::Matrix4 projection = camera->getProjectionMatrix();
-        screen_radius =
-          std::abs(static_cast<float>(projection[1][1])) * viewport_height * 0.5f * world_radius;
-      }
-
-      // eps2d adds this minimum variance in screen space before rasterisation.
-      const float blur_radius = visible_radius * std::sqrt(std::max(eps2d_, 0.0f));
-      screen_radius = std::sqrt(screen_radius * screen_radius + blur_radius * blur_radius);
-      if (screen_radius < min_screen_radius) {
+    for (std::uint32_t i = begin; i < end; ++i) {
+      const SplatRecord & record = records_[i];
+      if (record.opacity < alpha_cutoff) {
         continue;
       }
+
+      const float visible_radius = std::min(
+        sigma_radius,
+        std::sqrt(2.0f * std::log(record.opacity / alpha_cutoff)));
+      const float max_sigma = std::max(
+        record.scale[0], std::max(record.scale[1], record.scale[2]));
+      const float world_radius = visible_radius * max_sigma * world_scale;
+      const Ogre::Vector3 world_position = world_transform * positions_[i];
+
+      if (culling_enabled) {
+        bool outside = false;
+        for (int plane = 0; plane < 6; ++plane) {
+          if (plane == Ogre::FRUSTUM_PLANE_FAR && far_clip == 0.0f) {
+            continue;
+          }
+          if (frustum_planes[plane].getDistance(world_position) < -world_radius) {
+            outside = true;
+            break;
+          }
+        }
+        if (outside) {
+          continue;
+        }
+      }
+
+      if (culling_enabled && min_screen_radius > 0.0f && viewport_height > 0) {
+        float screen_radius = 0.0f;
+        if (perspective) {
+          const Ogre::Vector3 view_position = view_matrix * world_position;
+          const float depth = -view_position.z;
+          if (depth <= 0.0f) {
+            continue;
+          }
+          screen_radius = focal_y * world_radius / std::max(depth - world_radius, near_clip);
+        } else {
+          screen_radius = ortho_scale * world_radius;
+        }
+
+        // eps2d adds this minimum variance in screen space before rasterisation.
+        const float blur_radius = visible_radius * std::sqrt(std::max(eps2d_, 0.0f));
+        screen_radius = std::sqrt(screen_radius * screen_radius + blur_radius * blur_radius);
+        if (screen_radius < min_screen_radius) {
+          continue;
+        }
+      }
+
+      // Only the survivors get a colour: at a typical camera this is a third of
+      // the scene, and the evaluation is the most expensive thing in the loop.
+      evaluateColour(
+        &sh_dc_[i * 3],
+        rest_stride > 0 ? &sh_rest_[i * rest_stride] : nullptr,
+        sh_coefficients_,
+        (positions_[i] - local_camera).normalisedCopy(),
+        &colours_[i * 3]);
+
+      const std::uint32_t key = depthKey(positions_[i].dotProduct(local_sort_direction));
+      partition.push_back((static_cast<std::uint64_t>(key) << 32) | i);
     }
+  });
 
-    // Only the survivors get a colour: at a typical camera this is a third of
-    // the scene, and the evaluation is the most expensive thing in the loop.
-    evaluateColour(
-      &sh_dc_[i * 3],
-      rest_stride > 0 ? &sh_rest_[i * rest_stride] : nullptr,
-      sh_coefficients_,
-      (positions_[i] - local_camera).normalisedCopy(),
-      &colours_[i * 3]);
-
-    order_.push_back(
-      (static_cast<std::uint64_t>(depthKey(positions_[i].dotProduct(local_sort_direction))) << 32) |
-      i);
+  // Concatenated in worker order, so the input to the sort does not depend on
+  // how the workers happened to interleave.
+  for (const std::vector<std::uint64_t> & partition : cull_partitions_) {
+    order_.insert(order_.end(), partition.begin(), partition.end());
   }
 
   radixSortByHighWord(order_, order_scratch_);

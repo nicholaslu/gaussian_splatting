@@ -143,6 +143,11 @@ private:
   std::vector<SplatRecord> records_;
   std::vector<DrawInstance> draw_instances_;
 
+  // Per-worker output for the cull pass, kept between frames so that a frame
+  // does not allocate. Each worker fills its own vector and the results are
+  // concatenated in worker order, which keeps the draw order deterministic.
+  std::vector<std::vector<std::uint64_t>> cull_partitions_;
+
   // Spherical harmonics, kept in splat order because the view direction is not
   // known until the camera moves. sh_coefficients_ is K-1, the count beyond the
   // constant term, so it is 0, 3, 8 or 15.
