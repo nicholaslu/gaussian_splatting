@@ -31,6 +31,8 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy)
 from scipy.spatial.transform import Rotation
 from tf2_ros import StaticTransformBroadcaster
 
@@ -191,7 +193,21 @@ def estimate_ground_transform(
 class GaussianPlyPublisher(Node):
     def __init__(self, args):
         super().__init__("gaussian_ply_publisher")
-        self.publisher = self.create_publisher(GaussianSplats, args.topic, 1)
+        # Latched, if asked for: a reconstruction does not change, and sending
+        # it again every period is the wrong shape for a subscriber on a
+        # wireless link. Transient local hands the last sample to whoever
+        # connects, whenever they connect, so one transfer serves everyone -
+        # and it has as long as it needs, which is what lets a scene arrive
+        # that could not be pushed through at a fixed rate.
+        if getattr(args, "latch", False):
+            qos = QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST)
+            self.publisher = self.create_publisher(GaussianSplats, args.topic, qos)
+        else:
+            self.publisher = self.create_publisher(GaussianSplats, args.topic, 1)
         self.msg, self.means, self.opacities = load_3dgs_ply(
             args.ply,
             max_splats=args.max_splats,
@@ -211,7 +227,13 @@ class GaussianPlyPublisher(Node):
                 "--align-ground/--rpy do nothing without --parent-frame: there is no "
                 "transform to put the rotation on. Add e.g. --frame-id splats "
                 "--parent-frame map.")
-        self.timer = self.create_timer(1.0 / args.rate, self.publish_once)
+        if getattr(args, "latch", False):
+            # Once, and then nothing. The sample stays with the writer for
+            # anyone who subscribes later.
+            self.timer = None
+            self.publish_once()
+        else:
+            self.timer = self.create_timer(1.0 / args.rate, self.publish_once)
 
     def publish_static_transform(self, args):
         if args.align_ground:
@@ -272,6 +294,11 @@ def main():
         help="Keep at most this many splats. 0 (the default) keeps the whole file; "
              "a non-zero value truncates, which is useful for building a scaling series.")
     parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument(
+        "--latch", action="store_true",
+        help="Publish once, transient local, instead of repeating at --rate. "
+             "A subscriber that connects later still gets the scene, and the "
+             "transfer is not competing with the next copy of itself.")
     parser.add_argument(
         "--parent-frame", default=None,
         help="Publish a static transform from this frame to --frame-id. Without it "

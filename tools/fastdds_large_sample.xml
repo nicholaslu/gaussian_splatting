@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  Pacing for large samples.
+
+  A GaussianSplats message for a real scene is tens of megabytes, which UDP
+  carries as hundreds of fragments. Fast DDS sends those as fast as it can by
+  default: the receiver's socket buffer overflows, fragments are lost, and
+  although RELIABLE asks for them again the retransmissions arrive at the same
+  unpaced rate. Past some size the sample never completes and the subscriber
+  sees nothing at all - measured on an iPad at around 120,000 splats, or 28 MB.
+
+  A flow controller spreads the fragments over time instead. Publisher side
+  only: nothing on the subscriber needs to know.
+
+  Point it at Fast DDS with
+      export FASTRTPS_DEFAULT_PROFILES_FILE=<this file>
+-->
+<dds xmlns="http://www.eprosima.com">
+  <profiles>
+    <participant profile_name="large_sample_participant" is_default_profile="true">
+      <rtps>
+        <flow_controller_descriptor_list>
+          <flow_controller_descriptor>
+            <name>splat_limiter</name>
+            <scheduler>FIFO</scheduler>
+            <!-- 4 MB every 50 ms: 80 MB/s, well above what Wi-Fi will carry,
+                 so this paces the burst without becoming the bottleneck. -->
+            <max_bytes_per_period>4194304</max_bytes_per_period>
+            <period_ms>50</period_ms>
+          </flow_controller_descriptor>
+        </flow_controller_descriptor_list>
+      </rtps>
+    </participant>
+
+    <data_writer profile_name="large_sample_writer" is_default_profile="true">
+      <qos>
+        <!-- A flow controller only acts on an asynchronous writer. -->
+        <publishMode>
+          <kind>ASYNCHRONOUS</kind>
+          <flow_controller_name>splat_limiter</flow_controller_name>
+        </publishMode>
+      </qos>
+    </data_writer>
+  </profiles>
+</dds>
