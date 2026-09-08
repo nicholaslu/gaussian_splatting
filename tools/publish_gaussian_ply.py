@@ -76,14 +76,22 @@ def load_3dgs_ply(path, max_splats=None, stride=1, scale_mult=1.0):
     msg.eps2d = 0.3
     msg.sh_degree = sh_degree
 
-    msg.means = (means * scale_mult).reshape(-1).tolist()
-    msg.scales = (scales * scale_mult).reshape(-1).tolist()
-    msg.quats = quats.reshape(-1).tolist()
-    msg.opacities = opacities.tolist()
-    msg.sh_dc = sh0.reshape(-1).tolist()
+    # Assigned as numpy rather than through tolist(): the generated message
+    # class stores a float32 sequence as a numpy array either way, and the list
+    # is a detour through one Python float object per element. A million splats
+    # carry 52 million harmonic coefficients, which is a couple of gigabytes of
+    # boxed floats to build and throw away, and minutes spent doing it.
+    def f32(a):
+        return np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+
+    msg.means = f32(means * scale_mult)
+    msg.scales = f32(scales * scale_mult)
+    msg.quats = f32(quats)
+    msg.opacities = f32(opacities)
+    msg.sh_dc = f32(sh0)
     # gsply already returns shN as (N, K-1, 3), which is the coefficient-major
     # layout the message wants, so no transpose is needed here.
-    msg.sh_rest = shN.reshape(-1).tolist()
+    msg.sh_rest = f32(shN)
     return msg, means, opacities
 
 
