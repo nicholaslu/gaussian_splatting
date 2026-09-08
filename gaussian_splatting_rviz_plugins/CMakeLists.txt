@@ -10,12 +10,21 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rviz_common REQUIRED)
 find_package(rviz_rendering REQUIRED)
-find_package(pluginlib REQUIRED)
+find_package(pluginlib QUIET)
 find_package(ament_index_cpp REQUIRED)
 find_package(gaussian_splatting_msgs REQUIRED)
 
-add_library(${PROJECT_NAME} SHARED
+# iOS links everything into the signed application; elsewhere this stays a
+# plug-in that RViz loads.
+if(DEFINED BUILD_SHARED_LIBS AND NOT BUILD_SHARED_LIBS)
+  set(gaussian_splatting_library_type STATIC)
+else()
+  set(gaussian_splatting_library_type SHARED)
+endif()
+
+add_library(${PROJECT_NAME} ${gaussian_splatting_library_type}
   src/gaussian_splatting_display.cpp
+  src/static_plugins.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -29,12 +38,19 @@ ament_target_dependencies(${PROJECT_NAME}
   rclcpp
   rviz_common
   rviz_rendering
-  pluginlib
   ament_index_cpp
   gaussian_splatting_msgs
 )
 
-pluginlib_export_plugin_description_file(rviz_common plugins_description.xml)
+if(pluginlib_FOUND)
+  ament_target_dependencies(${PROJECT_NAME} pluginlib)
+endif()
+
+# A static build has no class loader to declare anything to, and pluginlib is
+# not built for it either.
+if(NOT gaussian_splatting_library_type STREQUAL "STATIC")
+  pluginlib_export_plugin_description_file(rviz_common plugins_description.xml)
+endif()
 
 install(TARGETS ${PROJECT_NAME}
   EXPORT ${PROJECT_NAME}
@@ -57,6 +73,8 @@ install(FILES plugins_description.xml
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
+# So an application can link this rather than load it, which is what iOS does.
+ament_export_targets(${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   rclcpp
   rviz_common

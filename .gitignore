@@ -5,3 +5,8 @@ __pycache__/
 
 # Test scenes, fetched separately -- see tools/publish_gaussian_ply.py.
 dataset/
+
+# colcon leaves these behind when it is run from inside a package
+build/
+install/
+log/

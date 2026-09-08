@@ -34,7 +34,14 @@
 #include <OgreViewport.h>
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
+#ifdef RVIZ_STATIC_PLUGINS_ONLY
+// An application that links this plug-in registers it by calling
+// registerStaticPlugins(); there is no class loader to export to, and the
+// registration object would only be dropped by the linker anyway.
+#define PLUGINLIB_EXPORT_CLASS(class_type, base_class_type)
+#else
 #include "pluginlib/class_list_macros.hpp"
+#endif
 #include "rviz_common/display_context.hpp"
 #include "rviz_common/frame_manager_iface.hpp"
 #include "rviz_common/view_controller.hpp"
