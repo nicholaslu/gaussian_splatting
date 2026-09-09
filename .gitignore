@@ -10,3 +10,8 @@ dataset/
 build/
 install/
 log/
+
+# Third-party scene data, whose licensing has not been established. Add one
+# deliberately with `git add -f` if its terms are known and allow it.
+*.ply
+*.mesh
