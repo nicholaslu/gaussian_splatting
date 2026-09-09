@@ -92,10 +92,52 @@ constexpr float kSHC3[7] = {
 // instance, so a depth sort rewrites one index and one colour per splat rather
 // than the whole record. Three RGBA32F texels hold it, and the width is a
 // whole number of splats so that a splat never straddles a row.
+//
+// The width is chosen per scene rather than fixed. A fixed 768 holds 256
+// splats per row, so the texture grows in height alone: 5.8 million splats ask
+// for 22,793 rows, which Metal refuses on a Mac and accepts on an M5 iPad -
+// Apple GPU family 10 allows a 32,768 side where families 7 to 9 allow 16,384,
+// and the failure is an aborted process, not a returned error. A square-ish
+// layout grows as the square root instead, so the same scene is 4,185 x 4,183
+// and no limit is anywhere near. Small scenes keep the old width, which is
+// already square enough for them.
 constexpr std::size_t kTexelsPerSplat = 3;
-constexpr unsigned int kSplatDataWidth = 768;
+constexpr unsigned int kMinSplatDataWidth = 768;
 static_assert(
-  kSplatDataWidth % kTexelsPerSplat == 0, "a texture row must hold whole splats");
+  kMinSplatDataWidth % kTexelsPerSplat == 0, "a texture row must hold whole splats");
+
+// The smallest 2D texture side among the render systems this runs on: Metal on
+// Apple GPU families 7 to 9, and OpenGL 3.3, both 16,384. Ogre 1.12 does not
+// report the device's own limit, so this is a constant rather than a query -
+// affordable because the square layout above only reaches it at 89 million
+// splats, which is 4 GB of texture and unreachable for other reasons first.
+constexpr unsigned int kMaxTextureDimension = 16384;
+
+// GLSL 120 has no integer texel fetch, so the OpenGL path addresses the data
+// texture in floats and is exact only below 2^24 texels.
+constexpr std::size_t kMaxGlslExactTexels = 1u << 24;
+
+// The smallest whole number of splats' worth of texels that is at least wanted.
+unsigned int roundUpToWholeSplats(std::size_t wanted)
+{
+  const std::size_t rounded =
+    (wanted + kTexelsPerSplat - 1) / kTexelsPerSplat * kTexelsPerSplat;
+  return static_cast<unsigned int>(rounded);
+}
+
+unsigned int splatDataWidth(std::size_t count)
+{
+  const auto texels = static_cast<double>(count * kTexelsPerSplat);
+  const auto square = static_cast<std::size_t>(std::ceil(std::sqrt(texels)));
+  return std::max(kMinSplatDataWidth, roundUpToWholeSplats(square));
+}
+
+unsigned int splatDataRows(std::size_t count)
+{
+  const std::size_t texels = count * kTexelsPerSplat;
+  const std::size_t width = splatDataWidth(count);
+  return static_cast<unsigned int>((texels + width - 1) / width);
+}
 
 constexpr std::size_t kVerticesPerSplat = 8;
 constexpr std::size_t kIndicesPerSplat = 18;
@@ -698,6 +740,29 @@ bool GaussianSplattingDisplay::validate(const GaussianSplats & msg, std::size_t 
     return false;
   }
 
+  // Refused here rather than at createManual(): Metal reports an oversized
+  // texture by aborting the process, so there is nothing to catch downstream.
+  const unsigned int rows = splatDataRows(count);
+  if (rows > kMaxTextureDimension) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Error, "Message",
+      QString("%1 splats need a %2 x %3 data texture, past the %4 this "
+      "render system allows.")
+      .arg(count).arg(splatDataWidth(count)).arg(rows).arg(kMaxTextureDimension));
+    return false;
+  }
+
+  // The OpenGL vertex program indexes texels in floats, so past 2^24 texels it
+  // reads the wrong record for some splats. Metal indexes in uint and is exact.
+  if (!usesMetalRenderSystem() && count * kTexelsPerSplat > kMaxGlslExactTexels) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, "Message",
+      QString("%1 splats: past %2, the OpenGL shader's float texel index is no "
+      "longer exact and some splats will read a neighbour's record.")
+      .arg(count).arg(kMaxGlslExactTexels / kTexelsPerSplat));
+    return true;
+  }
+
   setStatus(
     rviz_common::properties::StatusProperty::Ok, "Message",
     QString("%1 splats").arg(count));
@@ -867,13 +932,10 @@ void GaussianSplattingDisplay::createSplatDataTexture(std::size_t count)
     return;
   }
 
-  const std::size_t texels = count * kTexelsPerSplat;
-  const std::size_t rows = (texels + kSplatDataWidth - 1) / kSplatDataWidth;
-
   auto & texture_manager = Ogre::TextureManager::getSingleton();
   splat_data_texture_ = texture_manager.createManual(
     mesh_name_ + "/data", Ogre::ResourceGroupManager::DEFAULT_RESOURCE_GROUP_NAME,
-    Ogre::TEX_TYPE_2D, kSplatDataWidth, static_cast<unsigned int>(rows), 0,
+    Ogre::TEX_TYPE_2D, splatDataWidth(count), splatDataRows(count), 0,
     Ogre::PF_FLOAT32_RGBA, Ogre::TU_DYNAMIC_WRITE_ONLY);
 
   // The shader reads texels by integer coordinate, so this never samples and
@@ -907,7 +969,7 @@ void GaussianSplattingDisplay::writeSplatDataTexture()
   auto * destination = reinterpret_cast<float *>(box.data);
   const std::size_t row_floats = box.rowPitch * 4;
   const std::size_t floats_per_splat = kTexelsPerSplat * 4;
-  const std::size_t splats_per_row = kSplatDataWidth / kTexelsPerSplat;
+  const std::size_t splats_per_row = splat_data_texture_->getWidth() / kTexelsPerSplat;
 
   const std::size_t rows = (records_.size() + splats_per_row - 1) / splats_per_row;
   parallelFor(
