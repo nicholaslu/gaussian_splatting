@@ -83,11 +83,25 @@ constexpr float kSHC3[7] = {
   -0.5900435899266435f,
 };
 
-// Each splat is expanded from one instance record and a shared octagon. The
-// octagon circumscribes the unit circle, so it preserves every fragment that
-// the Gaussian shader can keep while removing 17.2% of the bounding square's
-// corner area. RViz's patched Ogre Metal render system maps instance buffers
-// to MTLVertexStepFunctionPerInstance; OpenGL uses the same Ogre declaration.
+// Each splat is expanded from one instance record and a shared quad. RViz's
+// patched Ogre Metal render system maps instance buffers to
+// MTLVertexStepFunctionPerInstance; OpenGL uses the same Ogre declaration.
+//
+// This was an octagon for a while. Both shapes circumscribe the circle at
+// which the fragment shader's alpha cutoff bites, so neither clips anything
+// the shader would keep and the two render identically; the octagon only
+// removes 17.2% of the square's dead corner area, which is a fill-rate trade.
+// Measurement says that trade is the wrong way round here. Frame time against
+// visible splats, on a 5.8 million splat scene:
+//
+//   octagon   13.8 ms + 31.4 ms per million
+//   quad      16.0 ms + 20.3 ms per million
+//
+// 1.55x cheaper per splat, and Render Scale does not move either of them - the
+// corners the octagon saves are free, while its 8 vertices and 6 triangles per
+// splat against the quad's 4 and 2 are not, since the whole per-splat
+// projection below runs once per vertex.
+//
 // The per-splat record is read from a texture rather than streamed per
 // instance, so a depth sort rewrites one index and one colour per splat rather
 // than the whole record. Three RGBA32F texels hold it, and the width is a
@@ -139,18 +153,13 @@ unsigned int splatDataRows(std::size_t count)
   return static_cast<unsigned int>((texels + width - 1) / width);
 }
 
-constexpr std::size_t kVerticesPerSplat = 8;
-constexpr std::size_t kIndicesPerSplat = 18;
-constexpr float kOctagonTangent = 0.41421356237f;
+constexpr std::size_t kVerticesPerSplat = 4;
+constexpr std::size_t kIndicesPerSplat = 6;
 constexpr float kCorners[kVerticesPerSplat][2] = {
-  {1.0f, kOctagonTangent},
-  {kOctagonTangent, 1.0f},
-  {-kOctagonTangent, 1.0f},
-  {-1.0f, kOctagonTangent},
-  {-1.0f, -kOctagonTangent},
-  {-kOctagonTangent, -1.0f},
-  {kOctagonTangent, -1.0f},
-  {1.0f, -kOctagonTangent},
+  {-1.0f, -1.0f},
+  {1.0f, -1.0f},
+  {1.0f, 1.0f},
+  {-1.0f, 1.0f},
 };
 
 bool usesMetalRenderSystem()
@@ -906,16 +915,12 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   index_data->indexCount = kIndicesPerSplat;
   index_data->indexBuffer = hbm.createIndexBuffer(
     Ogre::HardwareIndexBuffer::IT_16BIT, kIndicesPerSplat, stat1c);
-  const std::uint16_t octagon_indices[kIndicesPerSplat] = {
+  const std::uint16_t quad_indices[kIndicesPerSplat] = {
     0, 1, 2,
     0, 2, 3,
-    0, 3, 4,
-    0, 4, 5,
-    0, 5, 6,
-    0, 6, 7,
   };
   index_data->indexBuffer->writeData(
-    0, index_data->indexBuffer->getSizeInBytes(), octagon_indices, true);
+    0, index_data->indexBuffer->getSizeInBytes(), quad_indices, true);
 
   renderable_ = std::make_unique<GaussianSplatRenderable>(mesh_name_);
   renderable_->setGeometry(vertex_data, index_data, count);
