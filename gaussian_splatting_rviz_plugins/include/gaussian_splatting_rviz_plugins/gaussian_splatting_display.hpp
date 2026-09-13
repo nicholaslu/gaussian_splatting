@@ -27,6 +27,7 @@ namespace gaussian_splatting_rviz_plugins
 
 class DepthSchemeResolver;
 class GaussianSplatRenderable;
+class MetalViewPreparation;
 
 class GaussianSplattingDisplay
   : public rviz_common::MessageFilterDisplay<gaussian_splatting_msgs::msg::GaussianSplats>,
@@ -90,6 +91,7 @@ private:
 
   Ogre::SceneNode * splat_node_ = nullptr;
   std::unique_ptr<GaussianSplatRenderable> renderable_;
+  std::unique_ptr<MetalViewPreparation> metal_view_preparation_;
   Ogre::MaterialPtr material_;
   Ogre::HardwareVertexBufferSharedPtr instance_buffer_;
 
@@ -106,6 +108,12 @@ private:
   unsigned int rtt_height_ = 0;
   double last_upload_ms_ = 0.0;
   double last_sort_ms_ = 0.0;
+  double last_setup_ms_ = 0.0;
+  double last_cull_sh_ms_ = 0.0;
+  double last_merge_ms_ = 0.0;
+  double last_radix_ms_ = 0.0;
+  double last_gather_ms_ = 0.0;
+  double last_instance_upload_ms_ = 0.0;
 
   std::size_t splat_count_ = 0;
   std::size_t visible_splat_count_ = 0;
@@ -181,6 +189,7 @@ private:
   float last_sigma_radius_ = -1.0f;
   float last_min_screen_radius_ = -1.0f;
   bool last_culling_enabled_ = false;
+  bool using_gpu_preparation_ = false;
   bool sort_dirty_ = true;
   std::string mesh_name_;
   std::string material_name_;

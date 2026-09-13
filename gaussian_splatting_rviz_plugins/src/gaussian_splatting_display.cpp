@@ -1,9 +1,13 @@
 #include "gaussian_splatting_rviz_plugins/gaussian_splatting_display.hpp"
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+#include "gaussian_splatting_rviz_plugins/metal_view_preparation.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -42,6 +46,7 @@
 #else
 #include "pluginlib/class_list_macros.hpp"
 #endif
+#include "rclcpp/logging.hpp"
 #include "rviz_common/display_context.hpp"
 #include "rviz_common/frame_manager_iface.hpp"
 #include "rviz_common/view_controller.hpp"
@@ -587,6 +592,27 @@ void GaussianSplattingDisplay::onInitialize()
   rviz_common::MessageFilterDisplay<GaussianSplats>::onInitialize();
 
   registerOgreResources();
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  if (usesMetalRenderSystem() && !std::getenv("GSPLAT_DISABLE_GPU_PREPARATION")) {
+    const std::string shader_path =
+      ament_index_cpp::get_package_share_directory("gaussian_splatting_rviz_plugins") +
+      "/ogre_media/materials/programs/Metal/gsplat_prepare.metal";
+    metal_view_preparation_ = makeMetalViewPreparation(
+      Ogre::Root::getSingleton().getRenderSystem(), shader_path);
+    if (!metal_view_preparation_ || !metal_view_preparation_->error().empty()) {
+      const std::string error = metal_view_preparation_ ?
+        metal_view_preparation_->error() : "Metal backend factory returned no implementation";
+      setStatus(
+        rviz_common::properties::StatusProperty::Warn, "GPU preparation",
+        QString::fromStdString(error + "; using CPU fallback"));
+      metal_view_preparation_.reset();
+    } else {
+      setStatus(
+        rviz_common::properties::StatusProperty::Ok, "GPU preparation",
+        "Metal compute pipelines loaded");
+    }
+  }
+#endif
   depth_scheme_resolver_ = std::make_unique<DepthSchemeResolver>(mesh_name_);
   Ogre::MaterialManager::getSingleton().addListener(
     depth_scheme_resolver_.get(), kDepthMaterialScheme);
@@ -621,17 +647,39 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
   applyShaderParams();
   sortIndexBuffer();
   if (renderable_) {
-    setStatus(
-      rviz_common::properties::StatusProperty::Ok, "Visible splats",
-      QString("%1 / %2 instances").arg(visible_splat_count_).arg(splat_count_));
-    setStatus(
-      rviz_common::properties::StatusProperty::Ok, "CPU preparation",
-      QString("upload %1 ms, cull/sort %2 ms")
-      .arg(last_upload_ms_, 0, 'f', 2)
-      .arg(last_sort_ms_, 0, 'f', 2));
+    if (using_gpu_preparation_) {
+      setStatus(
+        rviz_common::properties::StatusProperty::Ok, "Visible splats",
+        QString("GPU indirect count / %1 total (no CPU readback)").arg(splat_count_));
+      setStatus(
+        rviz_common::properties::StatusProperty::Ok, "GPU preparation",
+        QString("Metal queued in %1 ms CPU time; exact 32-bit depth order")
+        .arg(last_sort_ms_, 0, 'f', 3));
+      deleteStatus("CPU preparation");
+      deleteStatus("CPU view stages");
+    } else {
+      setStatus(
+        rviz_common::properties::StatusProperty::Ok, "Visible splats",
+        QString("%1 / %2 instances").arg(visible_splat_count_).arg(splat_count_));
+      setStatus(
+        rviz_common::properties::StatusProperty::Ok, "CPU preparation",
+        QString("message upload %1 ms, view total %2 ms")
+        .arg(last_upload_ms_, 0, 'f', 2)
+        .arg(last_sort_ms_, 0, 'f', 2));
+      setStatus(
+        rviz_common::properties::StatusProperty::Ok, "CPU view stages",
+        QString("setup %1, cull/SH %2, merge %3, radix %4, gather %5, instance upload %6 ms")
+        .arg(last_setup_ms_, 0, 'f', 2)
+        .arg(last_cull_sh_ms_, 0, 'f', 2)
+        .arg(last_merge_ms_, 0, 'f', 2)
+        .arg(last_radix_ms_, 0, 'f', 2)
+        .arg(last_gather_ms_, 0, 'f', 2)
+        .arg(last_instance_upload_ms_, 0, 'f', 2));
+    }
   } else {
     deleteStatus("Visible splats");
     deleteStatus("CPU preparation");
+    deleteStatus("CPU view stages");
   }
 }
 
@@ -825,6 +873,11 @@ void GaussianSplattingDisplay::registerOgreResources()
 
 void GaussianSplattingDisplay::clearMesh()
 {
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  if (metal_view_preparation_) {
+    metal_view_preparation_->clear();
+  }
+#endif
   if (renderable_) {
     if (splat_node_) {
       splat_node_->detachObject(renderable_.get());
@@ -859,6 +912,13 @@ void GaussianSplattingDisplay::clearMesh()
   last_culling_enabled_ = false;
   last_upload_ms_ = 0.0;
   last_sort_ms_ = 0.0;
+  last_setup_ms_ = 0.0;
+  last_cull_sh_ms_ = 0.0;
+  last_merge_ms_ = 0.0;
+  last_radix_ms_ = 0.0;
+  last_gather_ms_ = 0.0;
+  last_instance_upload_ms_ = 0.0;
+  using_gpu_preparation_ = false;
   sort_dirty_ = true;
 }
 
@@ -929,6 +989,16 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   renderable_->setVisible(!splat_texture_);
   renderable_->setRenderQueueGroup(kSplatRenderQueue);
   splat_node_->attachObject(renderable_.get());
+
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  if (metal_view_preparation_ && !metal_view_preparation_->configure(
+      count, instance_buffer_, renderable_.get()))
+  {
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, "GPU preparation",
+      QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+  }
+#endif
 }
 
 void GaussianSplattingDisplay::createSplatDataTexture(std::size_t count)
@@ -1032,6 +1102,17 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
 
   writeSplatDataTexture();
 
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  if (metal_view_preparation_ && !metal_view_preparation_->uploadStaticData(
+      records_.data(), records_.size() * sizeof(SplatRecord),
+      sh_dc_, msg.sh_dc.size(), sh_rest_, msg.sh_rest.size()))
+  {
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, "GPU preparation",
+      QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+  }
+#endif
+
   if (renderable_) {
     renderable_->setBoundingBox(bounds);
   }
@@ -1081,6 +1162,7 @@ void GaussianSplattingDisplay::writeSortedInstances()
     return;
   }
 
+  const auto gather_start = std::chrono::steady_clock::now();
   // The shader reads the record from the data texture, so only the index and
   // the view-dependent colour move: sixteen bytes per splat, not a whole
   // record. Each worker writes a disjoint range of draw_instances_.
@@ -1094,13 +1176,19 @@ void GaussianSplattingDisplay::writeSortedInstances()
         std::copy_n(&colours_[splat * 3], 3, instance.colour);
       }
     });
+  const auto gather_end = std::chrono::steady_clock::now();
+  last_gather_ms_ = std::chrono::duration<double, std::milli>(
+    gather_end - gather_start).count();
 
   visible_splat_count_ = order_.size();
   renderable_->setInstanceCount(visible_splat_count_);
+  const auto upload_start = std::chrono::steady_clock::now();
   if (visible_splat_count_ > 0) {
     instance_buffer_->writeData(
       0, visible_splat_count_ * sizeof(DrawInstance), draw_instances_.data(), true);
   }
+  last_instance_upload_ms_ = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - upload_start).count();
 }
 
 namespace
@@ -1296,8 +1384,81 @@ void GaussianSplattingDisplay::sortIndexBuffer()
   Ogre::Plane frustum_planes[6];
   std::copy_n(camera->getFrustumPlanes(), 6, frustum_planes);
 
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  if (metal_view_preparation_) {
+    MetalViewParameters parameters{};
+    const auto copy_matrix = [](const Ogre::Matrix4 & matrix, float * rows) {
+        for (int row = 0; row < 4; ++row) {
+          for (int column = 0; column < 4; ++column) {
+            rows[row * 4 + column] = static_cast<float>(matrix[row][column]);
+          }
+        }
+      };
+    copy_matrix(world_transform, parameters.world_rows);
+    copy_matrix(view_matrix, parameters.view_rows);
+    for (int plane = 0; plane < 6; ++plane) {
+      const bool disabled_far = plane == Ogre::FRUSTUM_PLANE_FAR && far_clip == 0.0f;
+      parameters.frustum_planes[plane * 4] =
+        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].normal.x);
+      parameters.frustum_planes[plane * 4 + 1] =
+        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].normal.y);
+      parameters.frustum_planes[plane * 4 + 2] =
+        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].normal.z);
+      parameters.frustum_planes[plane * 4 + 3] =
+        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].d);
+    }
+    parameters.local_camera[0] = local_camera.x;
+    parameters.local_camera[1] = local_camera.y;
+    parameters.local_camera[2] = local_camera.z;
+    parameters.local_sort_direction[0] = local_sort_direction.x;
+    parameters.local_sort_direction[1] = local_sort_direction.y;
+    parameters.local_sort_direction[2] = local_sort_direction.z;
+    parameters.world_scale = world_scale;
+    parameters.focal_y = focal_y;
+    parameters.near_clip = near_clip;
+    parameters.far_clip = far_clip;
+    parameters.ortho_scale = ortho_scale;
+    parameters.sigma_radius = sigma_radius;
+    parameters.min_screen_radius = min_screen_radius;
+    parameters.eps2d = eps2d_;
+    parameters.count = static_cast<std::uint32_t>(splat_count_);
+    parameters.viewport_height = viewport_height;
+    parameters.sh_coefficients = static_cast<std::uint32_t>(sh_coefficients_);
+    parameters.flags = (culling_enabled ? 1u : 0u) | (perspective ? 2u : 0u);
+
+    if (metal_view_preparation_->encode(parameters)) {
+      if (!using_gpu_preparation_) {
+        RCLCPP_INFO(
+          rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
+          "Metal GPU view preparation enabled: %zu splats, exact 32-bit radix, indirect draw",
+          splat_count_);
+      }
+      renderable_->setInstanceCount(splat_count_);
+      using_gpu_preparation_ = true;
+      last_setup_ms_ = 0.0;
+      last_cull_sh_ms_ = 0.0;
+      last_merge_ms_ = 0.0;
+      last_radix_ms_ = 0.0;
+      last_gather_ms_ = 0.0;
+      last_instance_upload_ms_ = 0.0;
+      last_sort_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - sort_start).count();
+      return;
+    }
+
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, "GPU preparation",
+      QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+  }
+#endif
+
+  using_gpu_preparation_ = false;
+
   const std::size_t workers = workerCount(splat_count_);
   cull_partitions_.resize(workers);
+  const auto cull_start = std::chrono::steady_clock::now();
+  last_setup_ms_ = std::chrono::duration<double, std::milli>(
+    cull_start - sort_start).count();
   parallelFor(
     splat_count_, workers, [&](std::size_t begin, std::size_t end, std::size_t worker) {
     std::vector<std::uint64_t> & partition = cull_partitions_[worker];
@@ -1368,18 +1529,39 @@ void GaussianSplattingDisplay::sortIndexBuffer()
       partition.push_back((static_cast<std::uint64_t>(key) << 32) | i);
     }
   });
+  const auto cull_end = std::chrono::steady_clock::now();
+  last_cull_sh_ms_ = std::chrono::duration<double, std::milli>(
+    cull_end - cull_start).count();
 
   // Concatenated in worker order, so the input to the sort does not depend on
   // how the workers happened to interleave.
+  const auto merge_start = std::chrono::steady_clock::now();
   for (const std::vector<std::uint64_t> & partition : cull_partitions_) {
     order_.insert(order_.end(), partition.begin(), partition.end());
   }
+  const auto merge_end = std::chrono::steady_clock::now();
+  last_merge_ms_ = std::chrono::duration<double, std::milli>(
+    merge_end - merge_start).count();
 
+  const auto radix_start = std::chrono::steady_clock::now();
   radixSortByHighWord(order_, order_scratch_);
+  const auto radix_end = std::chrono::steady_clock::now();
+  last_radix_ms_ = std::chrono::duration<double, std::milli>(
+    radix_end - radix_start).count();
 
   writeSortedInstances();
   last_sort_ms_ = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - sort_start).count();
+
+  if (std::getenv("GSPLAT_PROFILE_CPU")) {
+    RCLCPP_INFO(
+      rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
+      "CPU view preparation: total=%.3f ms setup=%.3f cull_sh=%.3f merge=%.3f "
+      "radix=%.3f gather=%.3f instance_upload=%.3f visible=%zu total_splats=%zu",
+      last_sort_ms_, last_setup_ms_, last_cull_sh_ms_, last_merge_ms_,
+      last_radix_ms_, last_gather_ms_, last_instance_upload_ms_,
+      visible_splat_count_, splat_count_);
+  }
 }
 
 Ogre::Viewport * GaussianSplattingDisplay::mainViewport() const

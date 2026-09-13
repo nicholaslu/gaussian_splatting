@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rviz_common REQUIRED)
 find_package(rviz_rendering REQUIRED)
+find_package(rviz_ogre_vendor REQUIRED)
 find_package(pluginlib QUIET)
 find_package(ament_index_cpp REQUIRED)
 find_package(gaussian_splatting_msgs REQUIRED)
@@ -27,6 +28,34 @@ add_library(${PROJECT_NAME} ${gaussian_splatting_library_type}
   src/static_plugins.cpp
 )
 
+if(APPLE)
+  enable_language(OBJCXX)
+  get_filename_component(_rviz_prefix "${rviz_ogre_vendor_DIR}/../../.." REALPATH)
+  set(_ogre_prefix "${_rviz_prefix}/opt/rviz_ogre_vendor")
+  find_path(OGRE_METAL_INCLUDE_DIR OgreMetalRenderSystem.h
+    HINTS "${_ogre_prefix}/include/OGRE/RenderSystems/Metal")
+  # Ogre plug-ins intentionally omit the usual lib prefix, so find_library()
+  # does not recognise this dylib even though it is linkable.
+  unset(OGRE_METAL_LIBRARY CACHE)
+  find_file(OGRE_METAL_LIBRARY RenderSystem_Metal.dylib
+    HINTS "${_ogre_prefix}/lib/OGRE" NO_DEFAULT_PATH)
+  find_library(METAL_FRAMEWORK Metal)
+  find_library(FOUNDATION_FRAMEWORK Foundation)
+  if(NOT OGRE_METAL_INCLUDE_DIR OR NOT OGRE_METAL_LIBRARY OR
+    NOT METAL_FRAMEWORK OR NOT FOUNDATION_FRAMEWORK)
+    message(FATAL_ERROR "The Metal Gaussian preparation backend requires Ogre Metal and Apple Metal")
+  endif()
+  target_sources(${PROJECT_NAME} PRIVATE src/metal_view_preparation.mm)
+  target_include_directories(${PROJECT_NAME} PRIVATE "${OGRE_METAL_INCLUDE_DIR}")
+  # RViz can still select OpenGL on macOS. A normal dependency would make the
+  # class loader require RenderSystem_Metal even in that process; weak linking
+  # leaves the CPU/OpenGL fallback independently loadable.
+  target_link_libraries(${PROJECT_NAME}
+    "-Wl,-weak_library,${OGRE_METAL_LIBRARY}"
+    "${METAL_FRAMEWORK}" "${FOUNDATION_FRAMEWORK}")
+  target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_HAS_METAL_PREPARATION=1)
+endif()
+
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
@@ -38,6 +67,7 @@ ament_target_dependencies(${PROJECT_NAME}
   rclcpp
   rviz_common
   rviz_rendering
+  rviz_ogre_vendor
   ament_index_cpp
   gaussian_splatting_msgs
 )
@@ -79,6 +109,7 @@ ament_export_dependencies(
   rclcpp
   rviz_common
   rviz_rendering
+  rviz_ogre_vendor
   pluginlib
   ament_index_cpp
   gaussian_splatting_msgs
