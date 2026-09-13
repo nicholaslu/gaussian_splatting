@@ -150,18 +150,18 @@ void main()
     sigma_radius,
     sqrt(2.0 * log(splat_colour.a / alpha_cutoff)));
 
-  float det = cov.x * cov.z - cov.y * cov.y;
+  // The eigen decomposition as in ../Metal/gsplat.metal, whose comments say
+  // why its formulas avoid cancellation.
   float mid = 0.5 * (cov.x + cov.z);
-  float root = sqrt(max(0.0, mid * mid - det));
+  float half_difference = 0.5 * (cov.x - cov.z);
+  float root = sqrt(half_difference * half_difference + cov.y * cov.y);
   float lambda1 = max(mid + root, 0.01);
   float lambda2 = max(mid - root, 0.01);
 
-  vec2 axis1;
-  if (abs(cov.y) > 1e-5) {
-    axis1 = normalize(vec2(cov.y, lambda1 - cov.x));
-  } else {
-    axis1 = cov.x >= cov.z ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
-  }
+  vec2 axis1 = half_difference >= 0.0 ?
+    vec2(half_difference + root, cov.y) : vec2(cov.y, root - half_difference);
+  float axis_length = length(axis1);
+  axis1 = axis_length > 0.0 ? axis1 / axis_length : vec2(1.0, 0.0);
   vec2 axis2 = vec2(-axis1.y, axis1.x);
 
   vec2 pixel_offset =

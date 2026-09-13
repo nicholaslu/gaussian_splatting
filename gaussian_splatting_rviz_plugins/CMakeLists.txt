@@ -28,6 +28,9 @@ add_library(${PROJECT_NAME} ${gaussian_splatting_library_type}
   src/static_plugins.cpp
 )
 
+# GPU view preparation needs Ogre's Metal render system. Without it the display
+# still builds, with CPU view preparation only.
+set(GSPLAT_METAL_PREPARATION OFF)
 if(APPLE)
   enable_language(OBJCXX)
   get_filename_component(_rviz_prefix "${rviz_ogre_vendor_DIR}/../../.." REALPATH)
@@ -41,18 +44,39 @@ if(APPLE)
     HINTS "${_ogre_prefix}/lib/OGRE" NO_DEFAULT_PATH)
   find_library(METAL_FRAMEWORK Metal)
   find_library(FOUNDATION_FRAMEWORK Foundation)
-  if(NOT OGRE_METAL_INCLUDE_DIR OR NOT OGRE_METAL_LIBRARY OR
-    NOT METAL_FRAMEWORK OR NOT FOUNDATION_FRAMEWORK)
-    message(FATAL_ERROR "The Metal Gaussian preparation backend requires Ogre Metal and Apple Metal")
+  # A static build is linked into an application that links the Metal render
+  # system itself, so only the shared plug-in needs the dylib.
+  if(gaussian_splatting_library_type STREQUAL "STATIC" OR OGRE_METAL_LIBRARY)
+    set(_ogre_metal_linkable TRUE)
+  else()
+    set(_ogre_metal_linkable FALSE)
   endif()
-  target_sources(${PROJECT_NAME} PRIVATE src/metal_view_preparation.mm)
+  if(OGRE_METAL_INCLUDE_DIR AND _ogre_metal_linkable AND METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+    set(GSPLAT_METAL_PREPARATION ON)
+  else()
+    message(WARNING
+      "Ogre's Metal render system or Apple's Metal framework was not found; "
+      "building with CPU view preparation only")
+  endif()
+endif()
+
+if(GSPLAT_METAL_PREPARATION)
+  set(gaussian_splatting_metal_sources
+    src/metal_view_preparation.mm
+    src/metal_view_preparation_core.mm)
+  target_sources(${PROJECT_NAME} PRIVATE ${gaussian_splatting_metal_sources})
+  # These hold Objective-C objects in C++ members and rely on ARC to release
+  # them; compiled without it, every buffer a scene allocates is leaked.
+  set_source_files_properties(${gaussian_splatting_metal_sources}
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_include_directories(${PROJECT_NAME} PRIVATE "${OGRE_METAL_INCLUDE_DIR}")
-  # RViz can still select OpenGL on macOS. A normal dependency would make the
-  # class loader require RenderSystem_Metal even in that process; weak linking
-  # leaves the CPU/OpenGL fallback independently loadable.
-  target_link_libraries(${PROJECT_NAME}
-    "-Wl,-weak_library,${OGRE_METAL_LIBRARY}"
-    "${METAL_FRAMEWORK}" "${FOUNDATION_FRAMEWORK}")
+  target_link_libraries(${PROJECT_NAME} "${METAL_FRAMEWORK}" "${FOUNDATION_FRAMEWORK}")
+  if(NOT gaussian_splatting_library_type STREQUAL "STATIC")
+    # RViz can still select OpenGL on macOS. A normal dependency would make the
+    # class loader require RenderSystem_Metal even in that process; weak linking
+    # leaves the CPU/OpenGL fallback independently loadable.
+    target_link_libraries(${PROJECT_NAME} "-Wl,-weak_library,${OGRE_METAL_LIBRARY}")
+  endif()
   target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_HAS_METAL_PREPARATION=1)
 endif()
 
@@ -97,7 +121,8 @@ install(DIRECTORY ogre_media
   DESTINATION share/${PROJECT_NAME}
 )
 
-install(FILES plugins_description.xml
+# The notice travels with the shader it covers.
+install(FILES plugins_description.xml THIRD_PARTY_NOTICES.md
   DESTINATION share/${PROJECT_NAME}
 )
 
@@ -125,6 +150,24 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  if(GSPLAT_METAL_PREPARATION AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # Runs the GPU kernels and the CPU path on identical synthetic views and
+    # requires exact agreement; see test/verify_gpu_preparation.mm.
+    add_executable(verify_gpu_preparation
+      test/verify_gpu_preparation.mm
+      src/metal_view_preparation_core.mm)
+    set_source_files_properties(test/verify_gpu_preparation.mm
+      PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_include_directories(verify_gpu_preparation PRIVATE include src)
+    target_compile_features(verify_gpu_preparation PRIVATE cxx_std_17)
+    target_link_libraries(verify_gpu_preparation "${METAL_FRAMEWORK}" "${FOUNDATION_FRAMEWORK}")
+    add_test(NAME verify_gpu_preparation
+      COMMAND verify_gpu_preparation --quick
+        "${CMAKE_CURRENT_SOURCE_DIR}/ogre_media/materials/programs/Metal/gsplat_prepare.metal")
+    # A machine with no Metal device skips rather than fails.
+    set_tests_properties(verify_gpu_preparation PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()
 
 ament_package()

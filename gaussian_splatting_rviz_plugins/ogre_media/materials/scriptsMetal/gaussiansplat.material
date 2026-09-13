@@ -66,3 +66,47 @@ material GaussianSplatting/RViz
     scheme Depth
   }
 }
+
+// GPU preparation writes each instance already projected, so its vertex program
+// does no per-splat work; the pass state is the same as GaussianSplatting/RViz.
+vertex_program GaussianSplatting/RVizProjectedVP metal
+{
+  source gsplat.metal
+  entry_point gsplat_projected_vp
+}
+
+fragment_program GaussianSplatting/RVizProjectedFP metal
+{
+  source gsplat.metal
+  entry_point gsplat_fp
+  shader_reflection_pair_hint GaussianSplatting/RVizProjectedVP
+}
+
+material GaussianSplatting/RVizProjected
+{
+  technique render
+  {
+    pass
+    {
+      lighting off
+      cull_hardware none
+      cull_software none
+      scene_blend one one_minus_src_alpha
+      depth_write off
+
+      vertex_program_ref GaussianSplatting/RVizProjectedVP {}
+      fragment_program_ref GaussianSplatting/RVizProjectedFP {}
+    }
+  }
+
+  // See GaussianSplatting/RViz.
+  technique pick
+  {
+    scheme Pick
+  }
+
+  technique depth
+  {
+    scheme Depth
+  }
+}

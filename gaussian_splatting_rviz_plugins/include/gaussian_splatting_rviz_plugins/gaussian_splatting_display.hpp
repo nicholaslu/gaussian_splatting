@@ -1,18 +1,23 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <OgreFrameListener.h>
 #include <OgreHardwareVertexBuffer.h>
 #include <OgreMaterial.h>
+#include <OgreMatrix4.h>
 #include <OgrePrerequisites.h>
 #include <OgreRenderTargetListener.h>
 #include <OgreTexture.h>
 #include <OgreVector.h>
 
 #include "gaussian_splatting_msgs/msg/gaussian_splats.hpp"
+#include "gaussian_splatting_rviz_plugins/splat_view.hpp"
 #include "rviz_common/message_filter_display.hpp"
 #include "rviz_common/properties/bool_property.hpp"
 #include "rviz_common/properties/float_property.hpp"
@@ -31,7 +36,8 @@ class MetalViewPreparation;
 
 class GaussianSplattingDisplay
   : public rviz_common::MessageFilterDisplay<gaussian_splatting_msgs::msg::GaussianSplats>,
-  public Ogre::RenderTargetListener
+  public Ogre::RenderTargetListener,
+  public Ogre::FrameListener
 {
 public:
   GaussianSplattingDisplay();
@@ -47,6 +53,13 @@ public:
   void preRenderTargetUpdate(const Ogre::RenderTargetEvent & event) override;
   void postRenderTargetUpdate(const Ogre::RenderTargetEvent & event) override;
   void preViewportUpdate(const Ogre::RenderTargetViewportEvent & event) override;
+
+  // View preparation and the offscreen redraw decision. Run here rather than in
+  // update(): RViz moves the camera in the view controller's update, which comes
+  // after every display's, and it also renders frames from Qt redraw requests
+  // with no display update at all. frameStarted() precedes every render target
+  // update of every frame, with the camera already where it will be drawn.
+  bool frameStarted(const Ogre::FrameEvent & event) override;
 
 private:
   using GaussianSplats = gaussian_splatting_msgs::msg::GaussianSplats;
@@ -82,17 +95,29 @@ private:
   void updateRenderTarget();
   void destroyRenderTarget();
   void setSplatsVisible(bool visible);
+  // Decides whether this frame redraws the offscreen splat image or reuses the
+  // last one, and activates the offscreen target accordingly.
+  void updateOffscreenReuse();
+  // What the vertex program used to receive as auto parameters, for the
+  // viewport that rasterises the splats.
+  ProjectionParameters makeProjectionParameters(Ogre::Camera * camera, float sigma_radius);
+  // Rebuilds the mesh in the CPU path's format and prepares it there, for when
+  // GPU preparation fails with projected instances already allocated.
+  void fallBackToCpuPreparation();
 
   rviz_common::properties::FloatProperty * sigma_radius_property_ = nullptr;
   rviz_common::properties::BoolProperty * culling_property_ = nullptr;
   rviz_common::properties::FloatProperty * min_screen_radius_property_ = nullptr;
   rviz_common::properties::BoolProperty * offscreen_property_ = nullptr;
   rviz_common::properties::FloatProperty * render_scale_property_ = nullptr;
+  rviz_common::properties::FloatProperty * static_refresh_property_ = nullptr;
 
   Ogre::SceneNode * splat_node_ = nullptr;
   std::unique_ptr<GaussianSplatRenderable> renderable_;
   std::unique_ptr<MetalViewPreparation> metal_view_preparation_;
   Ogre::MaterialPtr material_;
+  // Draws instances GPU preparation has already projected; see allocateMesh().
+  Ogre::MaterialPtr projected_material_;
   Ogre::HardwareVertexBufferSharedPtr instance_buffer_;
 
   Ogre::TexturePtr splat_texture_;
@@ -106,6 +131,19 @@ private:
   std::unique_ptr<DepthSchemeResolver> depth_scheme_resolver_;
   unsigned int rtt_width_ = 0;
   unsigned int rtt_height_ = 0;
+
+  // Offscreen image reuse. The image is redrawn when anything it depends on
+  // changes, and otherwise only every Static Refresh Interval, which is what
+  // picks up other displays moving relative to the splats.
+  bool offscreen_image_dirty_ = true;
+  Ogre::Matrix4 last_drawn_view_ = Ogre::Matrix4::IDENTITY;
+  Ogre::Matrix4 last_drawn_projection_ = Ogre::Matrix4::IDENTITY;
+  Ogre::Matrix4 last_drawn_node_transform_ = Ogre::Matrix4::IDENTITY;
+  float last_drawn_sigma_radius_ = -1.0f;
+  float last_drawn_eps2d_ = -1.0f;
+  float last_drawn_antialiased_ = -1.0f;
+  std::chrono::steady_clock::time_point last_offscreen_draw_;
+  std::deque<std::chrono::steady_clock::time_point> recent_offscreen_draws_;
   double last_upload_ms_ = 0.0;
   double last_sort_ms_ = 0.0;
   double last_setup_ms_ = 0.0;
@@ -117,35 +155,6 @@ private:
 
   std::size_t splat_count_ = 0;
   std::size_t visible_splat_count_ = 0;
-
-  // One splat as the shader reads it, laid out as whole texels so a row of the
-  // data texture is a whole number of splats. Colour is absent because it is
-  // view dependent; it arrives per instance instead.
-  struct SplatRecord
-  {
-    float position[3];
-    float opacity;
-    float scale[3];
-    float pad0;
-    float quat[4];
-  };
-  static_assert(sizeof(SplatRecord) == 12 * sizeof(float), "three texels per splat");
-
-  // What each drawn instance carries: which splat, and the colour its
-  // spherical harmonics give for this view. Sixteen bytes, against the 56 the
-  // whole record used to cost per camera move.
-  //
-  // Float rather than a packed byte colour: the reference rasteriser keeps
-  // max(sh, 0) with no upper bound and only clamps after blending, and on this
-  // scene 7.5% of opaque splats have a channel above 1.0, reaching 3.5. Those
-  // are the specular highlights, so clamping them per splat flattens exactly
-  // the surfaces the higher order coefficients exist to reproduce.
-  struct DrawInstance
-  {
-    float index;
-    float colour[3];
-  };
-  static_assert(sizeof(DrawInstance) == 16, "index plus an unclamped colour");
 
   std::vector<Ogre::Vector3> positions_;
   std::vector<SplatRecord> records_;
@@ -190,6 +199,9 @@ private:
   float last_min_screen_radius_ = -1.0f;
   bool last_culling_enabled_ = false;
   bool using_gpu_preparation_ = false;
+  // The mesh holds ProjectedInstance records rather than DrawInstance ones.
+  bool gpu_projected_ = false;
+  ProjectionParameters last_projection_{};
   bool sort_dirty_ = true;
   std::string mesh_name_;
   std::string material_name_;

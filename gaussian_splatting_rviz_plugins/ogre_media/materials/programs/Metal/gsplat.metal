@@ -172,18 +172,23 @@ vertex GaussianSplatOut gsplat_vp(
         u.sigma_radius,
         metal::sqrt(2.0 * metal::log(out.color.a / alphaCutoff)));
 
-    const float det = cov.x * cov.z - cov.y * cov.y;
+    // The half spread of the eigenvalues, sqrt(mid^2 - det) rewritten so that
+    // it adds rather than subtracts: for a nearly axis-aligned ellipse mid^2
+    // and det are large and close, and their difference was mostly rounding.
     const float mid = 0.5 * (cov.x + cov.z);
-    const float root = metal::sqrt(metal::max(0.0, mid * mid - det));
+    const float halfDifference = 0.5 * (cov.x - cov.z);
+    const float root = metal::sqrt(halfDifference * halfDifference + cov.y * cov.y);
     const float lambda1 = metal::max(mid + root, 0.01);
     const float lambda2 = metal::max(mid - root, 0.01);
 
-    float2 axis1;
-    if (metal::abs(cov.y) > 1e-5) {
-        axis1 = metal::normalize(float2(cov.y, lambda1 - cov.x));
-    } else {
-        axis1 = cov.x >= cov.z ? float2(1.0, 0.0) : float2(0.0, 1.0);
-    }
+    // The major axis, from whichever row of Sigma - lambda1 I does not cancel
+    // lambda1 against the larger diagonal entry. (b, lambda1 - a) alone does
+    // when a > c: for a nearly axis-aligned ellipse that difference is smaller
+    // than the rounding in lambda1, which swung the axis by degrees.
+    float2 axis1 = halfDifference >= 0.0 ?
+        float2(halfDifference + root, cov.y) : float2(cov.y, root - halfDifference);
+    const float axisLength = metal::length(axis1);
+    axis1 = axisLength > 0.0 ? axis1 / axisLength : float2(1.0, 0.0);
     const float2 axis2 = float2(-axis1.y, axis1.x);
 
     const float2 pixelOffset =
@@ -193,6 +198,28 @@ vertex GaussianSplatOut gsplat_vp(
 
     out.position = float4(projected.xy + ndcOffset, projected.z, 1.0);
     out.localCoord = in.corner * visibleRadius;
+    return out;
+}
+
+// The vertex program for GPU preparation, which writes every instance already
+// projected (gather_instances in gsplat_prepare.metal). Everything gsplat_vp
+// derives per vertex arrives per instance, so this only places the corner.
+struct GaussianSplatProjectedIn
+{
+    float4 centreRadius [[attribute(8)]];   // NDC centre and depth, visible radius
+    float4 axes         [[attribute(9)]];   // scaled ellipse axes in NDC
+    float4 color        [[attribute(3)]];   // rgb, compensated opacity
+    float2 corner       [[attribute(10)]];  // quad corner in [-1, 1]
+};
+
+vertex GaussianSplatOut gsplat_projected_vp(GaussianSplatProjectedIn in [[stage_in]])
+{
+    GaussianSplatOut out;
+    out.position = float4(
+        in.centreRadius.xy + in.corner.x * in.axes.xy + in.corner.y * in.axes.zw,
+        in.centreRadius.z, 1.0);
+    out.color = in.color;
+    out.localCoord = in.corner * in.centreRadius.w;
     return out;
 }
 

@@ -124,7 +124,7 @@ sorting it would otherwise require a CPU readback or sorting the full capacity.
 The custom radix consumes an explicit count buffer and can stay on Ogre's Metal
 command timeline. Its tile/histogram/scatter structure is adapted from the MIT-
 licensed [MetalSprocketsGaussianSplats GPU sorter](https://github.com/schwa/MetalSprocketsGaussianSplats),
-with the license retained in `tools/THIRD_PARTY_NOTICES.md`.
+with the license retained in `gaussian_splatting_rviz_plugins/THIRD_PARTY_NOTICES.md`.
 
 The exact 32-bit radix reduces the measured 1.65-million-key CPU radix from
 11.60 ms to about 5.77 ms. A 16-bit half-depth key needs only two passes and
@@ -230,3 +230,91 @@ decision must be measured for both macOS and iPadOS.
 - Metal uses the GPU path; legacy OpenGL remains correct through the CPU path;
   GL 4.3 and CUDA are capability-selected additions rather than build-time
   requirements.
+
+## Implementation status
+
+The Metal path now follows the target pipeline end to end, with one change from
+the first prototype: survivors are compacted before the sort.
+
+- `make_depth_keys` marks a rejected splat in the index half of its record, so
+  keys stay exact. `compact_count`, `compact_scan` and `compact_scatter` pack the
+  survivors, in index order, into the front of the key buffer, and write the
+  visible count, the indirect dispatch sizes and the draw arguments.
+- The radix and the gather size themselves to the survivors through indirect
+  dispatch. Nothing is read back; the visible count reaches the status panel
+  from a command buffer completion handler, one frame late.
+- `MetalViewPreparationCore` holds the pipelines, buffers and dispatch sequence
+  with no Ogre dependency. The display's Ogre adapter and
+  `test/verify_gpu_preparation.mm` both encode through it.
+- The CPU path and the kernels read one `ViewParameters` block and share
+  `prepareSplat()` in `splat_view.hpp`, which follows Ogre's evaluation order so
+  the CPU path is bit-identical to the Ogre-based loop it replaced.
+- The gather also projects each survivor, once per splat, with the matrices,
+  viewport and field of view the vertex program used to take as auto
+  parameters (`ProjectionParameters`). It writes the NDC centre, the scaled
+  ellipse axes and the compensated colour, so `gsplat_projected_vp` only places
+  the corners. Because the projection is baked in, GPU mode prepares again on
+  any exact change of view rather than past the sort thresholds; `projectSplat()`
+  in `splat_view.hpp` is its CPU reference. The CPU path keeps its instance
+  format and the per-vertex projection in `gsplat_vp`.
+- The eigen decomposition in every copy (`gsplat_vp`, `gsplat.vert`, the gather)
+  now avoids two cancellations inherited from the reference: the eigenvalue
+  spread is `sqrt(((a - c) / 2)^2 + b^2)` rather than `sqrt(mid^2 - det)`, and
+  the major axis comes from the row of `Sigma - lambda1 I` that does not subtract
+  nearly equal numbers. Nearly axis-aligned ellipses had been swinging by
+  degrees under float rounding.
+
+Measured on the M3 on synthetic scenes (uniformly random splats, not the real
+Garden data), 5,834,784 splats at degree 3 with 2,285,046 visible, median of 7:
+
+| Stage | Prototype | Compacted | Projection in gather |
+| --- | ---: | ---: | ---: |
+| Keys (and compaction) | 3.59 ms | 5.39 ms | 5.34 ms |
+| Radix sort | 16.12 ms | 8.05 ms | 7.98 ms |
+| Gather and SH (and projection) | 22.11 ms | 22.06 ms | 26.38 ms |
+| One command buffer, as shipped | 41.74 ms | 35.42 ms | 39.78 ms |
+| CPU encode | 0.019 ms | 0.018 ms | 0.017 ms |
+
+Compaction halves the sort. The gather did not move, so its cost is SH
+evaluation for the visible splats rather than dispatching threads that have
+nothing to do; it is now the largest stage, and the total still exceeds a 60 Hz
+frame at this scale.
+
+Moving the projection into the gather adds about 4 ms there and removes the
+per-vertex covariance, eigen decomposition and texture reads from the vertex
+program, which had been the larger cost while moving (about 2.8 ns per vertex,
+four vertices per splat). In RViz on the Garden scene, moving the camera now
+starts at 60 fps where it had been 30 to 50, and settles at 20 to 25 fps once
+the fanless M3 throttles under sustained load.
+
+Against the acceptance criteria:
+
+- CPU preparation below 2 ms with no readback: met; encoding takes 0.018 ms.
+- GPU timing per stage: available with `GSPLAT_PROFILE_GPU` set, which runs the
+  stages in command buffers of their own and waits for each. That stalls the
+  render thread and is for measurement only.
+- CPU/GPU agreement: `test/verify_gpu_preparation.mm`, registered with CTest,
+  requires identical visible counts, draw arguments and depth order including
+  ties, colours within 1e-4 (observed at most 7.2e-7), and every projected quad
+  within float rounding: centres and ellipses compared in pixels, opacity and
+  radius within 1e-3 relative (the compensation's own cancellation), worst case
+  0.25 of tolerance. It covers tile-edge
+  counts, heavy ties, orthographic and infinite-far views, culling off, an empty
+  view, buffer reuse under a narrower view, in-place re-upload and a splat at
+  the camera. `--quick` skips the Garden-sized scene.
+- A stationary camera does no preparation: unchanged.
+- Backend selection: Metal uses the GPU path and any failure falls back to the
+  CPU path. A build without Ogre's Metal render system now warns and builds the
+  CPU path instead of failing, and non-Metal builds compile again. GL 4.3 and
+  CUDA are not started.
+
+Still open:
+
+- Degree-3 SH is uploaded as float32, about 1 GiB at this count. Uploads now
+  reuse the buffers in place, but the precision question is undecided: half
+  precision would halve it at the cost of exact agreement with the CPU colours.
+- Gather, SH and projection, 26 ms at Garden scale, is the largest stage.
+  Frame pacing is the next target: the sort could be spread over several frames
+  in slices, with the gather re-projecting the last completed order every
+  frame. That needs a guard band on the culling, since a stale cull would
+  otherwise drop splats entering the view.

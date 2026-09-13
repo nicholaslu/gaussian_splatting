@@ -10,6 +10,7 @@ dataset/
 build/
 install/
 log/
+symlink_install_manifest.txt
 
 # Third-party scene data, whose licensing has not been established. Add one
 # deliberately with `git add -f` if its terms are known and allow it.

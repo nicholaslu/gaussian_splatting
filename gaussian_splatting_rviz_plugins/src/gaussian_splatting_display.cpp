@@ -1,7 +1,7 @@
 #include "gaussian_splatting_rviz_plugins/gaussian_splatting_display.hpp"
-#ifdef GSPLAT_HAS_METAL_PREPARATION
+// Unconditional: the display holds a unique_ptr to this interface, and
+// destroying one needs the complete type in every build, Metal or not.
 #include "gaussian_splatting_rviz_plugins/metal_view_preparation.hpp"
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -62,6 +62,7 @@ namespace
 
 constexpr const char * kResourceGroup = "GaussianSplattingRviz";
 constexpr const char * kMaterialName = "GaussianSplatting/RViz";
+constexpr const char * kProjectedMaterialName = "GaussianSplatting/RVizProjected";
 constexpr const char * kCompositeMaterialName = "GaussianSplatting/Composite";
 constexpr const char * kDepthMaterialName = "GaussianSplatting/DepthOnly";
 constexpr const char * kDepthMaterialScheme = "GaussianDepthOnly";
@@ -72,21 +73,8 @@ constexpr const char * kDepthMaterialScheme = "GaussianDepthOnly";
 // belongs anyway.
 constexpr Ogre::uint8 kSplatRenderQueue = Ogre::RENDER_QUEUE_MAIN + 1;
 
-// Spherical harmonics basis constants, as used by the 3DGS reference
-// implementation. Degree 0 alone gives rgb = sh_dc * kSHC0 + 0.5; the rest add
-// the view dependence that a specular surface is almost entirely made of.
-constexpr float kSHC0 = 0.28209479177387814f;
-constexpr std::uint8_t kMaxShDegree = 3;
-constexpr float kSHC1 = 0.4886025119029199f;
-constexpr float kSHC2[5] = {
-  1.0925484305920792f, -1.0925484305920792f, 0.31539156525252005f,
-  -1.0925484305920792f, 0.5462742152960396f,
-};
-constexpr float kSHC3[7] = {
-  -0.5900435899266435f, 2.890611442640554f, -0.4570457994644658f,
-  0.3731763325901154f, -0.4570457994644658f, 1.445305721320277f,
-  -0.5900435899266435f,
-};
+// ViewParameters carries the frustum planes in Ogre's order.
+static_assert(kFrustumPlaneFar == Ogre::FRUSTUM_PLANE_FAR, "frustum plane order");
 
 // Each splat is expanded from one instance record and a shared quad. RViz's
 // patched Ogre Metal render system maps instance buffers to
@@ -460,6 +448,13 @@ public:
     mRenderOp.indexData = index_data;
     mRenderOp.numberOfInstances = instance_count;
     mRenderOp.useGlobalInstancingVertexBufferIsAvailable = false;
+    // SceneManager sets srcRenderable and then calls getRenderOperation(),
+    // which copies mRenderOp over it whole, so it has to be carried here or
+    // it arrives null. The Metal render system finds the GPU-written indirect
+    // draw arguments by this pointer; without it the draw silently fell back to
+    // numberOfInstances, a visible count reported frames late, which cut off
+    // the nearest splats whenever the visible set grew.
+    mRenderOp.srcRenderable = this;
   }
 
   void setInstanceCount(std::size_t instance_count)
@@ -550,10 +545,26 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
   render_scale_property_->setMin(0.25f);
   render_scale_property_->setMax(1.0f);
 
+  static_refresh_property_ = new rviz_common::properties::FloatProperty(
+    "Static Refresh Interval", 0.5f,
+    "While the camera, the splats and this display's settings stay unchanged, the "
+    "offscreen splat image is reused rather than rasterised again, which leaves the "
+    "GPU nearly idle and keeps a fanless machine from throttling. Any such change "
+    "redraws it on the same frame.\n\n"
+    "Other displays moving in front of or behind the splats cannot be detected, so "
+    "their occlusion of the splats is only refreshed every this many seconds. 0 "
+    "redraws every frame.",
+    offscreen_property_);
+  static_refresh_property_->setMin(0.0f);
+  static_refresh_property_->setMax(10.0f);
+
 }
 
 GaussianSplattingDisplay::~GaussianSplattingDisplay()
 {
+  if (Ogre::Root * root = Ogre::Root::getSingletonPtr()) {
+    root->removeFrameListener(this);
+  }
   destroyRenderTarget();
 
   if (depth_scheme_resolver_) {
@@ -567,6 +578,11 @@ GaussianSplattingDisplay::~GaussianSplattingDisplay()
   if (material_) {
     Ogre::MaterialManager::getSingleton().remove(material_);
     material_.reset();
+  }
+
+  if (projected_material_) {
+    Ogre::MaterialManager::getSingleton().remove(projected_material_);
+    projected_material_.reset();
   }
 
   if (composite_material_) {
@@ -593,7 +609,9 @@ void GaussianSplattingDisplay::onInitialize()
 
   registerOgreResources();
 #ifdef GSPLAT_HAS_METAL_PREPARATION
-  if (usesMetalRenderSystem() && !std::getenv("GSPLAT_DISABLE_GPU_PREPARATION")) {
+  if (usesMetalRenderSystem() && projected_material_ &&
+    !std::getenv("GSPLAT_DISABLE_GPU_PREPARATION"))
+  {
     const std::string shader_path =
       ament_index_cpp::get_package_share_directory("gaussian_splatting_rviz_plugins") +
       "/ogre_media/materials/programs/Metal/gsplat_prepare.metal";
@@ -617,6 +635,7 @@ void GaussianSplattingDisplay::onInitialize()
   Ogre::MaterialManager::getSingleton().addListener(
     depth_scheme_resolver_.get(), kDepthMaterialScheme);
   splat_node_ = scene_manager_->getRootSceneNode()->createChildSceneNode();
+  Ogre::Root::getSingleton().addFrameListener(this);
 }
 
 void GaussianSplattingDisplay::reset()
@@ -632,7 +651,8 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
   if (splat_texture_) {
     setStatus(
       rviz_common::properties::StatusProperty::Ok, "Offscreen",
-      QString("splats rasterised at %1x%2").arg(rtt_width_).arg(rtt_height_));
+      QString("splats rasterised at %1x%2, redrawn %3 times in the last second")
+      .arg(rtt_width_).arg(rtt_height_).arg(recent_offscreen_draws_.size()));
     if (depth_scheme_resolver_) {
       const auto stats = depth_scheme_resolver_->stats();
       setStatus(
@@ -645,19 +665,45 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
     deleteStatus("Depth materials");
   }
   applyShaderParams();
-  sortIndexBuffer();
+  // Preparation and the redraw decision run from frameStarted(); the statuses
+  // below report the previous frame's, which is as current as they can be here.
   if (renderable_) {
-    if (using_gpu_preparation_) {
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+    if (using_gpu_preparation_ && metal_view_preparation_) {
+      // Refreshed every frame, moving or not, because the count arrives from a
+      // completion handler after the frame that prepared it. The draw itself
+      // takes its instance count from the GPU-written indirect arguments; this
+      // keeps Ogre's statistics right, and bounds a draw that somehow missed
+      // the indirect buffer by the last reported count rather than every splat.
+      const std::int64_t visible = metal_view_preparation_->lastVisibleCount();
+      visible_splat_count_ = visible > 0 ? static_cast<std::size_t>(visible) : 0u;
+      renderable_->setInstanceCount(visible_splat_count_);
       setStatus(
         rviz_common::properties::StatusProperty::Ok, "Visible splats",
-        QString("GPU indirect count / %1 total (no CPU readback)").arg(splat_count_));
-      setStatus(
-        rviz_common::properties::StatusProperty::Ok, "GPU preparation",
-        QString("Metal queued in %1 ms CPU time; exact 32-bit depth order")
-        .arg(last_sort_ms_, 0, 'f', 3));
+        visible < 0 ?
+        QString("pending / %1 instances (GPU)").arg(splat_count_) :
+        QString("%1 / %2 instances (GPU, as of the last finished frame)")
+        .arg(visible).arg(splat_count_));
+      if (metal_view_preparation_->profiling()) {
+        const MetalViewPreparation::StageTimes times = metal_view_preparation_->lastStageTimes();
+        setStatus(
+          rviz_common::properties::StatusProperty::Ok, "GPU preparation",
+          QString("GPU cull+compact %1, sort %2, gather+SH %3 ms "
+          "(GSPLAT_PROFILE_GPU: stages run synchronously)")
+          .arg(times.cull_ms, 0, 'f', 2)
+          .arg(times.sort_ms, 0, 'f', 2)
+          .arg(times.gather_ms, 0, 'f', 2));
+      } else {
+        setStatus(
+          rviz_common::properties::StatusProperty::Ok, "GPU preparation",
+          QString("Metal queued in %1 ms CPU time; set GSPLAT_PROFILE_GPU to time GPU stages")
+          .arg(last_sort_ms_, 0, 'f', 3));
+      }
       deleteStatus("CPU preparation");
       deleteStatus("CPU view stages");
-    } else {
+    } else
+#endif
+    {
       setStatus(
         rviz_common::properties::StatusProperty::Ok, "Visible splats",
         QString("%1 / %2 instances").arg(visible_splat_count_).arg(splat_count_));
@@ -866,6 +912,17 @@ void GaussianSplattingDisplay::registerOgreResources()
 
   material_ = base->clone(material_name_, true, kResourceGroup);
   material_->load();
+
+  // Only Metal has GPU preparation, and so only Metal needs the material that
+  // draws its projected instances.
+  if (usesMetalRenderSystem()) {
+    const Ogre::MaterialPtr projected = Ogre::MaterialManager::getSingleton().getByName(
+      kProjectedMaterialName, kResourceGroup);
+    if (projected) {
+      projected_material_ = projected->clone(material_name_ + "_Projected", true, kResourceGroup);
+      projected_material_->load();
+    }
+  }
   setStatus(rviz_common::properties::StatusProperty::Ok, "Material", "loaded");
 
   resources_registered_ = true;
@@ -919,7 +976,17 @@ void GaussianSplattingDisplay::clearMesh()
   last_gather_ms_ = 0.0;
   last_instance_upload_ms_ = 0.0;
   using_gpu_preparation_ = false;
+  gpu_projected_ = false;
+  last_projection_ = ProjectionParameters{};
   sort_dirty_ = true;
+
+  // What was on screen has gone, so the empty result has to be drawn at least
+  // once. This also runs from reset() when the display is disabled, and a
+  // disabled display gets no update() calls in which to schedule that draw.
+  offscreen_image_dirty_ = true;
+  if (splat_texture_) {
+    splat_texture_->getBuffer()->getRenderTarget()->setActive(true);
+  }
 }
 
 void GaussianSplattingDisplay::allocateMesh(std::size_t count)
@@ -939,14 +1006,27 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   auto * vertex_data = OGRE_NEW Ogre::VertexData();
   vertex_data->vertexCount = kVerticesPerSplat;
 
-  // A float rather than an integer type: indices are exact in float32 up to
-  // 2^24, far past any splat count that fits in memory, and this keeps the
-  // attribute a plain float on both back ends.
+  // GPU preparation writes each instance already projected, so its vertex
+  // program only places the corners; the CPU path hands over an index and a
+  // colour and leaves the projection to the vertex program, once per vertex.
+  gpu_projected_ = metal_view_preparation_ != nullptr && projected_material_;
   Ogre::VertexDeclaration * declaration = vertex_data->vertexDeclaration;
-  declaration->addElement(
-    0, offsetof(DrawInstance, index), Ogre::VET_FLOAT1, Ogre::VES_TEXTURE_COORDINATES, 0);
-  declaration->addElement(
-    0, offsetof(DrawInstance, colour), Ogre::VET_FLOAT3, Ogre::VES_DIFFUSE);
+  if (gpu_projected_) {
+    declaration->addElement(
+      0, offsetof(ProjectedInstance, centre), Ogre::VET_FLOAT4, Ogre::VES_TEXTURE_COORDINATES, 0);
+    declaration->addElement(
+      0, offsetof(ProjectedInstance, axes), Ogre::VET_FLOAT4, Ogre::VES_TEXTURE_COORDINATES, 1);
+    declaration->addElement(
+      0, offsetof(ProjectedInstance, colour), Ogre::VET_FLOAT4, Ogre::VES_DIFFUSE);
+  } else {
+    // A float rather than an integer type: indices are exact in float32 up to
+    // 2^24, far past any splat count that fits in memory, and this keeps the
+    // attribute a plain float on both back ends.
+    declaration->addElement(
+      0, offsetof(DrawInstance, index), Ogre::VET_FLOAT1, Ogre::VES_TEXTURE_COORDINATES, 0);
+    declaration->addElement(
+      0, offsetof(DrawInstance, colour), Ogre::VET_FLOAT3, Ogre::VES_DIFFUSE);
+  }
   declaration->addElement(
     1, 0, Ogre::VET_FLOAT2, Ogre::VES_TEXTURE_COORDINATES, 2);
 
@@ -954,7 +1034,8 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   const auto dynamic = Ogre::HardwareBuffer::HBU_DYNAMIC_WRITE_ONLY;
   const auto stat1c = Ogre::HardwareBuffer::HBU_STATIC_WRITE_ONLY;
 
-  instance_buffer_ = hbm.createVertexBuffer(sizeof(DrawInstance), count, dynamic);
+  instance_buffer_ = hbm.createVertexBuffer(
+    gpu_projected_ ? sizeof(ProjectedInstance) : sizeof(DrawInstance), count, dynamic);
   instance_buffer_->setIsInstanceData(true);
   instance_buffer_->setInstanceDataStepRate(1);
   vertex_data->vertexBufferBinding->setBinding(0, instance_buffer_);
@@ -984,19 +1065,22 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
 
   renderable_ = std::make_unique<GaussianSplatRenderable>(mesh_name_);
   renderable_->setGeometry(vertex_data, index_data, count);
-  renderable_->setMaterial(material_);
+  renderable_->setMaterial(gpu_projected_ ? projected_material_ : material_);
   renderable_->setBoundingBox(Ogre::AxisAlignedBox::BOX_INFINITE);
   renderable_->setVisible(!splat_texture_);
   renderable_->setRenderQueueGroup(kSplatRenderQueue);
   splat_node_->attachObject(renderable_.get());
 
 #ifdef GSPLAT_HAS_METAL_PREPARATION
-  if (metal_view_preparation_ && !metal_view_preparation_->configure(
-      count, instance_buffer_, renderable_.get()))
+  if (gpu_projected_ && !metal_view_preparation_->configure(
+      count, kIndicesPerSplat, instance_buffer_, renderable_.get()))
   {
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
       QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+    // Built for projected instances, which only GPU preparation writes.
+    metal_view_preparation_.reset();
+    allocateMesh(count);
   }
 #endif
 }
@@ -1104,7 +1188,7 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
 
 #ifdef GSPLAT_HAS_METAL_PREPARATION
   if (metal_view_preparation_ && !metal_view_preparation_->uploadStaticData(
-      records_.data(), records_.size() * sizeof(SplatRecord),
+      records_.data(), records_.size(),
       sh_dc_, msg.sh_dc.size(), sh_rest_, msg.sh_rest.size()))
   {
     setStatus(
@@ -1117,8 +1201,9 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
     renderable_->setBoundingBox(bounds);
   }
 
-  // Force a fresh depth sort now that the geometry has changed.
+  // Force a fresh depth sort, and a fresh image, now that the geometry has changed.
   sort_dirty_ = true;
+  offscreen_image_dirty_ = true;
 }
 
 void GaussianSplattingDisplay::applyShaderParams()
@@ -1194,17 +1279,6 @@ void GaussianSplattingDisplay::writeSortedInstances()
 namespace
 {
 
-// Maps a float onto a uint32 whose unsigned order matches the float's ordering,
-// so depths can be sorted by their bits: flip the sign bit for positives, and
-// invert everything for negatives, whose magnitude ordering runs backwards.
-// This also gives NaN a defined place, which the old comparator did not.
-std::uint32_t depthKey(float depth)
-{
-  std::uint32_t bits;
-  std::memcpy(&bits, &depth, sizeof(bits));
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
-
 // Least-significant-byte-first radix sort on the high word, i.e. on the depth
 // key, leaving the packed index along for the ride. Four linear passes rather
 // than the n log n random accesses a comparison sort spends here.
@@ -1242,60 +1316,6 @@ void radixSortByHighWord(
   }
 }
 
-// Evaluates the spherical harmonics for one splat along a unit view direction.
-// This is eval_sh() from the 3DGS reference implementation, degree for degree;
-// `rest` is laid out coefficient major, matching sh_rest in GaussianSplats.msg.
-// Like the reference it clamps below at zero and not above, leaving highlights
-// brighter than white to be resolved by blending.
-void evaluateColour(
-  const float * dc, const float * rest, std::size_t coefficients, const Ogre::Vector3 & view,
-  float * colour)
-{
-  float channel[3];
-  for (int c = 0; c < 3; ++c) {
-    channel[c] = kSHC0 * dc[c] + 0.5f;
-  }
-
-  const float x = view.x;
-  const float y = view.y;
-  const float z = view.z;
-
-  if (coefficients >= 3) {
-    for (int c = 0; c < 3; ++c) {
-      channel[c] += -kSHC1 * y * rest[c] + kSHC1 * z * rest[3 + c] - kSHC1 * x * rest[6 + c];
-    }
-  }
-  if (coefficients >= 8) {
-    const float xx = x * x, yy = y * y, zz = z * z;
-    const float xy = x * y, yz = y * z, xz = x * z;
-    for (int c = 0; c < 3; ++c) {
-      channel[c] +=
-        kSHC2[0] * xy * rest[9 + c] +
-        kSHC2[1] * yz * rest[12 + c] +
-        kSHC2[2] * (2.0f * zz - xx - yy) * rest[15 + c] +
-        kSHC2[3] * xz * rest[18 + c] +
-        kSHC2[4] * (xx - yy) * rest[21 + c];
-    }
-  }
-  if (coefficients >= 15) {
-    const float xx = x * x, yy = y * y, zz = z * z, xy = x * y;
-    for (int c = 0; c < 3; ++c) {
-      channel[c] +=
-        kSHC3[0] * y * (3.0f * xx - yy) * rest[24 + c] +
-        kSHC3[1] * xy * z * rest[27 + c] +
-        kSHC3[2] * y * (4.0f * zz - xx - yy) * rest[30 + c] +
-        kSHC3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * rest[33 + c] +
-        kSHC3[4] * x * (4.0f * zz - xx - yy) * rest[36 + c] +
-        kSHC3[5] * z * (xx - yy) * rest[39 + c] +
-        kSHC3[6] * x * (xx - 3.0f * yy) * rest[42 + c];
-    }
-  }
-
-  for (int c = 0; c < 3; ++c) {
-    colour[c] = std::max(0.0f, channel[c]);
-  }
-}
-
 }  // namespace
 
 void GaussianSplattingDisplay::sortIndexBuffer()
@@ -1324,7 +1344,18 @@ void GaussianSplattingDisplay::sortIndexBuffer()
   const bool culling_enabled = culling_property_->getBool();
   const float min_screen_radius = min_screen_radius_property_->getFloat();
   const float sigma_radius = sigma_radius_property_->getFloat();
-  if (!sort_dirty_ &&
+
+  // GPU preparation bakes the projection into every instance, so unlike the
+  // draw order it has to follow the camera exactly: any change to what the
+  // vertex program used to be handed means preparing again.
+  ProjectionParameters projection{};
+  if (gpu_projected_) {
+    projection = makeProjectionParameters(camera, sigma_radius);
+  }
+  const bool projection_changed = gpu_projected_ &&
+    std::memcmp(&projection, &last_projection_, sizeof(projection)) != 0;
+
+  if (!sort_dirty_ && !projection_changed &&
     (camera_position - last_camera_position_).squaredLength() < 0.0001f &&
     (camera_direction - last_camera_direction_).squaredLength() < 0.000001f &&
     viewport_width == last_viewport_width_ && viewport_height == last_viewport_height_ &&
@@ -1342,7 +1373,10 @@ void GaussianSplattingDisplay::sortIndexBuffer()
   last_culling_enabled_ = culling_enabled;
   last_min_screen_radius_ = min_screen_radius;
   last_sigma_radius_ = sigma_radius;
+  last_projection_ = projection;
   sort_dirty_ = false;
+  // Anything that needed a new draw order needs a new image too.
+  offscreen_image_dirty_ = true;
   const auto sort_start = std::chrono::steady_clock::now();
 
   order_.clear();
@@ -1365,75 +1399,67 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     std::abs(derived_scale.x),
     std::max(std::abs(derived_scale.y), std::abs(derived_scale.z)));
   const Ogre::Matrix4 view_matrix = camera->getViewMatrix(true);
-  const float alpha_cutoff = 1.0f / 255.0f;
   const bool perspective = camera->getProjectionType() == Ogre::PT_PERSPECTIVE;
-  const float focal_y = viewport_height > 0 && perspective ?
+
+  // Everything preparation needs from the camera and the node, taken here on
+  // the render thread as plain values: getFrustumPlanes() and
+  // getProjectionMatrix() update lazily cached state on first call, which
+  // several workers calling at once would race on. Both paths consume this one
+  // block - the CPU path through prepareSplat(), the GPU kernels through their
+  // mirror of it - so they cannot be handed different views.
+  ViewParameters parameters{};
+  const auto copy_rows = [](const Ogre::Matrix4 & matrix, float * rows) {
+      for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+          rows[row * 4 + column] = static_cast<float>(matrix[row][column]);
+        }
+      }
+    };
+  copy_rows(world_transform, parameters.world_rows);
+  copy_rows(view_matrix, parameters.view_rows);
+  const Ogre::Plane * frustum_planes = camera->getFrustumPlanes();
+  for (int plane = 0; plane < 6; ++plane) {
+    float * target = &parameters.frustum_planes[plane * 4];
+    target[0] = static_cast<float>(frustum_planes[plane].normal.x);
+    target[1] = static_cast<float>(frustum_planes[plane].normal.y);
+    target[2] = static_cast<float>(frustum_planes[plane].normal.z);
+    target[3] = static_cast<float>(frustum_planes[plane].d);
+  }
+  parameters.local_camera[0] = local_camera.x;
+  parameters.local_camera[1] = local_camera.y;
+  parameters.local_camera[2] = local_camera.z;
+  parameters.local_sort_direction[0] = local_sort_direction.x;
+  parameters.local_sort_direction[1] = local_sort_direction.y;
+  parameters.local_sort_direction[2] = local_sort_direction.z;
+  parameters.world_scale = world_scale;
+  parameters.focal_y = viewport_height > 0 && perspective ?
     static_cast<float>(viewport_height) * 0.5f /
     std::tan(static_cast<float>(camera->getFOVy().valueRadians()) * 0.5f) : 0.0f;
-  const float near_clip = camera->getNearClipDistance();
-  const float far_clip = camera->getFarClipDistance();
-  const float ortho_scale = perspective ? 0.0f :
+  parameters.near_clip = camera->getNearClipDistance();
+  parameters.far_clip = camera->getFarClipDistance();
+  parameters.ortho_scale = perspective ? 0.0f :
     std::abs(static_cast<float>(camera->getProjectionMatrix()[1][1])) *
     static_cast<float>(viewport_height) * 0.5f;
-
-  // Everything the loop needs from the camera is taken here, on the render
-  // thread. Camera::isVisible() and getProjectionMatrix() update lazily cached
-  // state on first call, which several workers calling at once would race on;
-  // reading them now leaves the loop with nothing but plain values. The plane
-  // test below is Frustum::isVisible(Sphere) verbatim, far-plane case included.
-  Ogre::Plane frustum_planes[6];
-  std::copy_n(camera->getFrustumPlanes(), 6, frustum_planes);
+  parameters.sigma_radius = sigma_radius;
+  parameters.min_screen_radius = min_screen_radius;
+  parameters.eps2d = eps2d_;
+  parameters.count = static_cast<std::uint32_t>(splat_count_);
+  parameters.viewport_height = viewport_height;
+  parameters.sh_coefficients = static_cast<std::uint32_t>(sh_coefficients_);
+  parameters.flags =
+    (culling_enabled ? kViewCulling : 0u) | (perspective ? kViewPerspective : 0u);
 
 #ifdef GSPLAT_HAS_METAL_PREPARATION
   if (metal_view_preparation_) {
-    MetalViewParameters parameters{};
-    const auto copy_matrix = [](const Ogre::Matrix4 & matrix, float * rows) {
-        for (int row = 0; row < 4; ++row) {
-          for (int column = 0; column < 4; ++column) {
-            rows[row * 4 + column] = static_cast<float>(matrix[row][column]);
-          }
-        }
-      };
-    copy_matrix(world_transform, parameters.world_rows);
-    copy_matrix(view_matrix, parameters.view_rows);
-    for (int plane = 0; plane < 6; ++plane) {
-      const bool disabled_far = plane == Ogre::FRUSTUM_PLANE_FAR && far_clip == 0.0f;
-      parameters.frustum_planes[plane * 4] =
-        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].normal.x);
-      parameters.frustum_planes[plane * 4 + 1] =
-        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].normal.y);
-      parameters.frustum_planes[plane * 4 + 2] =
-        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].normal.z);
-      parameters.frustum_planes[plane * 4 + 3] =
-        disabled_far ? 0.0f : static_cast<float>(frustum_planes[plane].d);
-    }
-    parameters.local_camera[0] = local_camera.x;
-    parameters.local_camera[1] = local_camera.y;
-    parameters.local_camera[2] = local_camera.z;
-    parameters.local_sort_direction[0] = local_sort_direction.x;
-    parameters.local_sort_direction[1] = local_sort_direction.y;
-    parameters.local_sort_direction[2] = local_sort_direction.z;
-    parameters.world_scale = world_scale;
-    parameters.focal_y = focal_y;
-    parameters.near_clip = near_clip;
-    parameters.far_clip = far_clip;
-    parameters.ortho_scale = ortho_scale;
-    parameters.sigma_radius = sigma_radius;
-    parameters.min_screen_radius = min_screen_radius;
-    parameters.eps2d = eps2d_;
-    parameters.count = static_cast<std::uint32_t>(splat_count_);
-    parameters.viewport_height = viewport_height;
-    parameters.sh_coefficients = static_cast<std::uint32_t>(sh_coefficients_);
-    parameters.flags = (culling_enabled ? 1u : 0u) | (perspective ? 2u : 0u);
-
-    if (metal_view_preparation_->encode(parameters)) {
+    if (metal_view_preparation_->encode(parameters, projection)) {
       if (!using_gpu_preparation_) {
         RCLCPP_INFO(
           rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
-          "Metal GPU view preparation enabled: %zu splats, exact 32-bit radix, indirect draw",
-          splat_count_);
+          "Metal GPU view preparation enabled: %zu splats, compacted 32-bit radix, "
+          "indirect draw%s",
+          splat_count_, metal_view_preparation_->profiling() ?
+          "; GSPLAT_PROFILE_GPU runs the stages synchronously" : "");
       }
-      renderable_->setInstanceCount(splat_count_);
       using_gpu_preparation_ = true;
       last_setup_ms_ = 0.0;
       last_cull_sh_ms_ = 0.0;
@@ -1449,6 +1475,9 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
       QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+    // The mesh holds projected instances, which only GPU preparation writes.
+    fallBackToCpuPreparation();
+    return;
   }
 #endif
 
@@ -1466,66 +1495,15 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     partition.reserve(end - begin);
 
     for (std::uint32_t i = begin; i < end; ++i) {
-      const SplatRecord & record = records_[i];
-      if (record.opacity < alpha_cutoff) {
-        continue;
-      }
-
-      const float visible_radius = std::min(
-        sigma_radius,
-        std::sqrt(2.0f * std::log(record.opacity / alpha_cutoff)));
-      const float max_sigma = std::max(
-        record.scale[0], std::max(record.scale[1], record.scale[2]));
-      const float world_radius = visible_radius * max_sigma * world_scale;
-      const Ogre::Vector3 world_position = world_transform * positions_[i];
-
-      if (culling_enabled) {
-        bool outside = false;
-        for (int plane = 0; plane < 6; ++plane) {
-          if (plane == Ogre::FRUSTUM_PLANE_FAR && far_clip == 0.0f) {
-            continue;
-          }
-          if (frustum_planes[plane].getDistance(world_position) < -world_radius) {
-            outside = true;
-            break;
-          }
-        }
-        if (outside) {
-          continue;
-        }
-      }
-
-      if (culling_enabled && min_screen_radius > 0.0f && viewport_height > 0) {
-        float screen_radius = 0.0f;
-        if (perspective) {
-          const Ogre::Vector3 view_position = view_matrix * world_position;
-          const float depth = -view_position.z;
-          if (depth <= 0.0f) {
-            continue;
-          }
-          screen_radius = focal_y * world_radius / std::max(depth - world_radius, near_clip);
-        } else {
-          screen_radius = ortho_scale * world_radius;
-        }
-
-        // eps2d adds this minimum variance in screen space before rasterisation.
-        const float blur_radius = visible_radius * std::sqrt(std::max(eps2d_, 0.0f));
-        screen_radius = std::sqrt(screen_radius * screen_radius + blur_radius * blur_radius);
-        if (screen_radius < min_screen_radius) {
-          continue;
-        }
-      }
-
       // Only the survivors get a colour: at a typical camera this is a third of
       // the scene, and the evaluation is the most expensive thing in the loop.
-      evaluateColour(
-        &sh_dc_[i * 3],
-        rest_stride > 0 ? &sh_rest_[i * rest_stride] : nullptr,
-        sh_coefficients_,
-        (positions_[i] - local_camera).normalisedCopy(),
-        &colours_[i * 3]);
-
-      const std::uint32_t key = depthKey(positions_[i].dotProduct(local_sort_direction));
+      std::uint32_t key = 0;
+      if (!prepareSplat(
+          parameters, records_[i], &sh_dc_[i * 3],
+          rest_stride > 0 ? &sh_rest_[i * rest_stride] : nullptr, &colours_[i * 3], key))
+      {
+        continue;
+      }
       partition.push_back((static_cast<std::uint64_t>(key) << 32) | i);
     }
   });
@@ -1580,6 +1558,121 @@ void GaussianSplattingDisplay::setSplatsVisible(bool visible)
 {
   if (renderable_) {
     renderable_->setVisible(visible);
+  }
+}
+
+ProjectionParameters GaussianSplattingDisplay::makeProjectionParameters(
+  Ogre::Camera * camera, float sigma_radius)
+{
+  // The viewport that rasterises the splats: the offscreen target when there is
+  // one, the window otherwise.
+  Ogre::Viewport * raster = splat_texture_ && rtt_viewport_ ? rtt_viewport_ : mainViewport();
+  const unsigned int width = raster ? raster->getActualWidth() : 0;
+  const unsigned int height = raster ? raster->getActualHeight() : 0;
+
+  // RViz gives its camera an automatic aspect ratio, which Ogre sets from each
+  // viewport as it renders it, so the projection the rasteriser gets is the one
+  // for this viewport's shape, not for whichever viewport was rendered last.
+  Ogre::Matrix4 projection_matrix = camera->getProjectionMatrixWithRSDepth();
+  const Ogre::Real raster_aspect =
+    height > 0 ? static_cast<Ogre::Real>(width) / static_cast<Ogre::Real>(height) : 0;
+  if (camera->getAutoAspectRatio() && height > 0 && camera->getAspectRatio() != raster_aspect) {
+    // Setting the aspect invalidates the frustum, so only when it differs.
+    const Ogre::Real aspect = camera->getAspectRatio();
+    camera->setAspectRatio(raster_aspect);
+    projection_matrix = camera->getProjectionMatrixWithRSDepth();
+    camera->setAspectRatio(aspect);
+  }
+  const Ogre::Matrix4 view = camera->getViewMatrix(true);
+  const Ogre::Matrix4 world = splat_node_->_getFullTransform();
+  const Ogre::Matrix4 worldview = view * world;
+  const Ogre::Matrix4 worldviewproj = projection_matrix * worldview;
+
+  ProjectionParameters projection{};
+  for (int row = 0; row < 4; ++row) {
+    for (int column = 0; column < 4; ++column) {
+      projection.worldview_rows[row * 4 + column] = static_cast<float>(worldview[row][column]);
+      projection.worldviewproj_rows[row * 4 + column] =
+        static_cast<float>(worldviewproj[row][column]);
+    }
+  }
+  projection.viewport_size[0] = static_cast<float>(width);
+  projection.viewport_size[1] = static_cast<float>(height);
+  projection.viewport_size[2] = width > 0 ? 1.0f / static_cast<float>(width) : 0.0f;
+  projection.viewport_size[3] = height > 0 ? 1.0f / static_cast<float>(height) : 0.0f;
+  projection.fovy = static_cast<float>(camera->getFOVy().valueRadians());
+  projection.eps2d = eps2d_;
+  projection.antialiased = antialiased_;
+  projection.sigma_radius = sigma_radius;
+  return projection;
+}
+
+void GaussianSplattingDisplay::fallBackToCpuPreparation()
+{
+  // Held across clearMesh(), which drops the display's own reference.
+  const GaussianSplats::ConstSharedPtr message = message_;
+  metal_view_preparation_.reset();
+  using_gpu_preparation_ = false;
+  clearMesh();
+  if (message) {
+    processMessage(message);
+  }
+}
+
+bool GaussianSplattingDisplay::frameStarted(const Ogre::FrameEvent &)
+{
+  // A disabled display is still a registered listener but draws nothing.
+  if (isEnabled()) {
+    sortIndexBuffer();
+    updateOffscreenReuse();
+  }
+  return true;
+}
+
+void GaussianSplattingDisplay::updateOffscreenReuse()
+{
+  if (!splat_texture_ || !rtt_viewport_ || !splat_node_) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const float interval = static_refresh_property_->getFloat();
+
+  // Compared exactly rather than through the depth sort's thresholds: a camera
+  // move too small to change the draw order still moves every splat on screen.
+  bool redraw = offscreen_image_dirty_ || interval <= 0.0f;
+  if (Ogre::Camera * camera = rtt_viewport_->getCamera()) {
+    const Ogre::Matrix4 view = camera->getViewMatrix(true);
+    const Ogre::Matrix4 projection = camera->getProjectionMatrix();
+    redraw = redraw || view != last_drawn_view_ || projection != last_drawn_projection_;
+    last_drawn_view_ = view;
+    last_drawn_projection_ = projection;
+  } else {
+    redraw = true;
+  }
+  const Ogre::Matrix4 node_transform = splat_node_->_getFullTransform();
+  const float sigma_radius = sigma_radius_property_->getFloat();
+  redraw = redraw || node_transform != last_drawn_node_transform_ ||
+    sigma_radius != last_drawn_sigma_radius_ || eps2d_ != last_drawn_eps2d_ ||
+    antialiased_ != last_drawn_antialiased_ ||
+    now - last_offscreen_draw_ >= std::chrono::duration<float>(interval);
+  last_drawn_node_transform_ = node_transform;
+  last_drawn_sigma_radius_ = sigma_radius;
+  last_drawn_eps2d_ = eps2d_;
+  last_drawn_antialiased_ = antialiased_;
+
+  // An inactive target is skipped by RenderSystem::_updateAllRenderTargets()
+  // and keeps its last contents, which the composite in the window goes on
+  // sampling, so skipping a frame costs neither pass over this target.
+  splat_texture_->getBuffer()->getRenderTarget()->setActive(redraw);
+  if (redraw) {
+    offscreen_image_dirty_ = false;
+    last_offscreen_draw_ = now;
+    recent_offscreen_draws_.push_back(now);
+  }
+  while (!recent_offscreen_draws_.empty() &&
+    now - recent_offscreen_draws_.front() > std::chrono::seconds(1))
+  {
+    recent_offscreen_draws_.pop_front();
   }
 }
 
@@ -1770,6 +1863,7 @@ void GaussianSplattingDisplay::updateRenderTarget()
   // buffers call RenderTarget::update() directly rather than relying on the
   // auto-update pass.
   target->setActive(true);
+  offscreen_image_dirty_ = true;
 
   main_target_ = main_viewport->getTarget();
   if (main_target_) {

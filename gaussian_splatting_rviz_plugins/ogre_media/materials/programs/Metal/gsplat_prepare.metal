@@ -1,7 +1,25 @@
+// GPU view preparation for the Gaussian splat display: cull, compact, sort and
+// gather, encoded into the frame's command buffer with no CPU readback.
+//
+// The per-splat arithmetic mirrors prepareSplat() in splat_view.hpp and the
+// structs mirror that header's layouts; test/verify_gpu_preparation.mm checks
+// the two against each other.
+//
+// The tiled radix sort - radix_histogram, radix_scan_offsets,
+// radix_scan_digit_bases and radix_scatter - is adapted from the GPU sorter in
+// MetalSprocketsGaussianSplats (https://github.com/schwa/MetalSprocketsGaussianSplats),
+// copyright (c) 2025 Jonathan Wight, and compact_scatter reuses its lane-ranked
+// scatter. MIT licensed; see THIRD_PARTY_NOTICES.md in this package.
+
 #include <metal_stdlib>
 using namespace metal;
 
 constant uint kRadix = 256;
+// Marks a rejected splat in the index half of its record. Keys stay exact, and
+// no splat index can reach this value.
+constant uint kRejected = 0xffffffffu;
+// Ogre's FRUSTUM_PLANE_FAR.
+constant uint kFrustumPlaneFar = 1;
 constant float kSHC0 = 0.28209479177387814;
 constant float kSHC1 = 0.4886025119029199;
 constant float kSHC2[5] = {
@@ -21,10 +39,24 @@ struct SplatRecord
   float4 quat;
 };
 
-struct DrawInstance
+// Mirrors ProjectionParameters and ProjectedInstance in splat_view.hpp.
+struct ProjectionParameters
 {
-  float index;
-  packed_float3 colour;
+  float4 worldview_rows[4];
+  float4 worldviewproj_rows[4];
+  float4 viewport_size;
+  float fovy;
+  float eps2d;
+  float antialiased;
+  float sigma_radius;
+};
+
+struct ProjectedInstance
+{
+  packed_float3 centre;
+  float visible_radius;
+  float4 axes;
+  float4 colour;
 };
 
 struct ViewParameters
@@ -48,12 +80,31 @@ struct ViewParameters
   uint flags;
 };
 
-struct RadixParameters
+// Written once per preparation, by compact_scan, and read by every stage after
+// it: the sort and the gather size themselves to the survivors without the CPU
+// ever learning how many there are.
+struct PreparationState
 {
-  uint count;
+  uint visible;
+  uint visible_tiles;
+  uint gather_groups;
+  uint reserved;
+};
+
+struct TileParameters
+{
+  uint count;              // splats the buffers were sized for
+  uint tile_count;         // tiles in that capacity; the stride of the radix tables
+  uint elements_per_tile;
+  uint shift;              // the radix digit being sorted on
+};
+
+struct ScanParameters
+{
   uint tile_count;
   uint elements_per_tile;
-  uint shift;
+  uint gather_width;
+  uint index_count;
 };
 
 struct DrawIndexedArguments
@@ -63,6 +114,12 @@ struct DrawIndexedArguments
   uint index_start;
   int base_vertex;
   uint base_instance;
+};
+
+// MTLDispatchThreadgroupsIndirectArguments.
+struct DispatchArguments
+{
+  uint threadgroups[3];
 };
 
 static float3 transformPoint(constant float4 * rows, float3 point)
@@ -77,27 +134,12 @@ static uint orderedFloatKey(float value)
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-kernel void reset_view(
-  device atomic_uint * visible_count [[buffer(0)]],
-  device DrawIndexedArguments * arguments [[buffer(1)]],
-  uint id [[thread_position_in_grid]])
-{
-  if (id != 0) {
-    return;
-  }
-  atomic_store_explicit(visible_count, 0u, memory_order_relaxed);
-  arguments->index_count = 6u;
-  arguments->instance_count = 0u;
-  arguments->index_start = 0u;
-  arguments->base_vertex = 0;
-  arguments->base_instance = 0u;
-}
-
+// Stage 1: a depth key per splat, or the rejection mark, written in place so
+// the buffer stays in index order for the compaction to preserve.
 kernel void make_depth_keys(
   device const SplatRecord * splats [[buffer(0)]],
   device uint2 * records [[buffer(1)]],
-  device atomic_uint * visible_count [[buffer(2)]],
-  constant ViewParameters & p [[buffer(3)]],
+  constant ViewParameters & p [[buffer(2)]],
   uint i [[thread_position_in_grid]])
 {
   if (i >= p.count) {
@@ -115,6 +157,9 @@ kernel void make_depth_keys(
 
   if (visible && (p.flags & 1u)) {
     for (uint plane = 0; plane < 6; ++plane) {
+      if (plane == kFrustumPlaneFar && p.far_clip == 0.0) {
+        continue;
+      }
       if (dot(p.frustum_planes[plane].xyz, world_position) +
         p.frustum_planes[plane].w < -world_radius)
       {
@@ -143,22 +188,126 @@ kernel void make_depth_keys(
     }
   }
 
-  if (visible) {
-    uint key = orderedFloatKey(dot(float3(splat.position), p.local_sort_direction.xyz));
-    // UINT_MAX is reserved for rejected records, which the ascending radix
-    // moves behind all visible records.
-    key = min(key, 0xfffffffeu);
-    records[i] = uint2(key, i);
-    atomic_fetch_add_explicit(visible_count, 1u, memory_order_relaxed);
-  } else {
-    records[i] = uint2(0xffffffffu, i);
+  records[i] = visible ?
+    uint2(orderedFloatKey(dot(float3(splat.position), p.local_sort_direction.xyz)), i) :
+    uint2(0u, kRejected);
+}
+
+// Stage 2a: survivors per tile.
+kernel void compact_count(
+  device const uint2 * records [[buffer(0)]],
+  device uint * tile_counts [[buffer(1)]],
+  constant TileParameters & parameters [[buffer(2)]],
+  uint tile [[thread_position_in_grid]])
+{
+  if (tile >= parameters.tile_count) {
+    return;
+  }
+  const uint begin = tile * parameters.elements_per_tile;
+  const uint end = min(begin + parameters.elements_per_tile, parameters.count);
+  uint survivors = 0;
+  for (uint i = begin; i < end; ++i) {
+    survivors += records[i].y != kRejected ? 1u : 0u;
+  }
+  tile_counts[tile] = survivors;
+}
+
+// Stage 2b: where each tile's survivors start in the compacted buffer, and
+// every count the later stages need - the visible total, how many tiles and
+// gather threadgroups it spans, and the arguments Ogre's indirect draw reads.
+// One thread; a scan over a few thousand tiles.
+kernel void compact_scan(
+  device const uint * tile_counts [[buffer(0)]],
+  device uint * tile_offsets [[buffer(1)]],
+  device PreparationState * state [[buffer(2)]],
+  device DispatchArguments * tile_dispatch [[buffer(3)]],
+  device DispatchArguments * gather_dispatch [[buffer(4)]],
+  device DrawIndexedArguments * draw [[buffer(5)]],
+  constant ScanParameters & parameters [[buffer(6)]],
+  uint id [[thread_position_in_grid]])
+{
+  if (id != 0) {
+    return;
+  }
+  uint visible = 0;
+  for (uint tile = 0; tile < parameters.tile_count; ++tile) {
+    tile_offsets[tile] = visible;
+    visible += tile_counts[tile];
+  }
+  const uint visible_tiles =
+    (visible + parameters.elements_per_tile - 1u) / parameters.elements_per_tile;
+  const uint gather_groups = (visible + parameters.gather_width - 1u) / parameters.gather_width;
+
+  state->visible = visible;
+  state->visible_tiles = visible_tiles;
+  state->gather_groups = gather_groups;
+  state->reserved = 0u;
+
+  // At least one threadgroup even when nothing is visible, so that no indirect
+  // dispatch is empty; every kernel bounds itself by state->visible.
+  tile_dispatch->threadgroups[0] = max(visible_tiles, 1u);
+  tile_dispatch->threadgroups[1] = 1u;
+  tile_dispatch->threadgroups[2] = 1u;
+  gather_dispatch->threadgroups[0] = max(gather_groups, 1u);
+  gather_dispatch->threadgroups[1] = 1u;
+  gather_dispatch->threadgroups[2] = 1u;
+
+  draw->index_count = parameters.index_count;
+  draw->instance_count = visible;
+  draw->index_start = 0u;
+  draw->base_vertex = 0;
+  draw->base_instance = 0u;
+}
+
+// Stage 2c: moves each tile's survivors, in index order, to the tile's offset
+// in the compacted buffer. Lanes of a threadgroup rank themselves with
+// simd_ballot exactly as radix_scatter does, with a single bucket.
+kernel void compact_scatter(
+  device const uint2 * records [[buffer(0)]],
+  device uint2 * compacted [[buffer(1)]],
+  device const uint * tile_offsets [[buffer(2)]],
+  constant TileParameters & parameters [[buffer(3)]],
+  uint tile [[threadgroup_position_in_grid]],
+  uint lane [[thread_position_in_threadgroup]],
+  uint thread_count [[threads_per_threadgroup]])
+{
+  threadgroup uint cursor[1];
+  if (lane == 0) {
+    cursor[0] = tile_offsets[tile];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint begin = tile * parameters.elements_per_tile;
+  const uint end = min(begin + parameters.elements_per_tile, parameters.count);
+  const uint tile_size = end > begin ? end - begin : 0;
+  for (uint chunk = 0; chunk < parameters.elements_per_tile; chunk += thread_count) {
+    const uint local = chunk + lane;
+    const uint2 record = local < tile_size ? records[begin + local] : uint2(0u, kRejected);
+    const bool active = record.y != kRejected;
+
+    const uint peers = uint((simd_vote::vote_t)simd_ballot(active));
+    const uint rank = popcount(peers & ((1u << lane) - 1u));
+    const uint peer_count = popcount(peers);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint base = cursor[0];
+    if (active) {
+      compacted[base + rank] = record;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active && rank == 0) {
+      cursor[0] += peer_count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
+// Stage 3: stable LSD radix over the compacted survivors only.
 kernel void radix_histogram(
   device const uint2 * records [[buffer(0)]],
   device uint * histograms [[buffer(1)]],
-  constant RadixParameters & parameters [[buffer(2)]],
+  constant TileParameters & parameters [[buffer(2)]],
+  device const PreparationState & state [[buffer(3)]],
   uint tile [[threadgroup_position_in_grid]],
   uint lane [[thread_position_in_threadgroup]],
   uint thread_count [[threads_per_threadgroup]])
@@ -170,7 +319,7 @@ kernel void radix_histogram(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const uint begin = tile * parameters.elements_per_tile;
-  const uint end = min(begin + parameters.elements_per_tile, parameters.count);
+  const uint end = min(begin + parameters.elements_per_tile, state.visible);
   for (uint i = begin + lane; i < end; i += thread_count) {
     const uint digit = (records[i].x >> parameters.shift) & 0xffu;
     atomic_fetch_add_explicit(&local_histogram[digit], 1u, memory_order_relaxed);
@@ -187,7 +336,8 @@ kernel void radix_scan_offsets(
   device const uint * histograms [[buffer(0)]],
   device uint * offsets [[buffer(1)]],
   device uint * totals [[buffer(2)]],
-  constant RadixParameters & parameters [[buffer(3)]],
+  constant TileParameters & parameters [[buffer(3)]],
+  device const PreparationState & state [[buffer(4)]],
   uint digit [[thread_position_in_grid]])
 {
   if (digit >= kRadix) {
@@ -195,7 +345,7 @@ kernel void radix_scan_offsets(
   }
   uint running = 0;
   const uint base = digit * parameters.tile_count;
-  for (uint tile = 0; tile < parameters.tile_count; ++tile) {
+  for (uint tile = 0; tile < state.visible_tiles; ++tile) {
     offsets[base + tile] = running;
     running += histograms[base + tile];
   }
@@ -222,7 +372,8 @@ kernel void radix_scatter(
   device uint2 * output [[buffer(1)]],
   device const uint * offsets [[buffer(2)]],
   device const uint * digit_bases [[buffer(3)]],
-  constant RadixParameters & parameters [[buffer(4)]],
+  constant TileParameters & parameters [[buffer(4)]],
+  device const PreparationState & state [[buffer(5)]],
   uint tile [[threadgroup_position_in_grid]],
   uint lane [[thread_position_in_threadgroup]],
   uint thread_count [[threads_per_threadgroup]])
@@ -234,7 +385,7 @@ kernel void radix_scatter(
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const uint begin = tile * parameters.elements_per_tile;
-  const uint end = min(begin + parameters.elements_per_tile, parameters.count);
+  const uint end = min(begin + parameters.elements_per_tile, state.visible);
   const uint tile_size = end > begin ? end - begin : 0;
   for (uint chunk = 0; chunk < parameters.elements_per_tile; chunk += thread_count) {
     const uint local = chunk + lane;
@@ -270,7 +421,13 @@ static float3 evaluateSH(
   constant ViewParameters & p)
 {
   float3 colour = kSHC0 * float3(dc[splat * 3u], dc[splat * 3u + 1u], dc[splat * 3u + 2u]) + 0.5;
-  const float3 direction = normalize(position - p.local_camera.xyz);
+  // Vector3::normalise(), guard included, as in prepareSplat(): a splat at the
+  // camera keeps a zero direction instead of a NaN one.
+  float3 direction = position - p.local_camera.xyz;
+  const float length = sqrt(dot(direction, direction));
+  if (length > 0.0) {
+    direction *= 1.0 / length;
+  }
   const float x = direction.x;
   const float y = direction.y;
   const float z = direction.z;
@@ -313,27 +470,108 @@ static float3 evaluateSH(
   return max(colour, 0.0);
 }
 
+// gsplat_vp from gsplat.metal, less the corner displacement, done once per
+// splat here instead of once per quad vertex; projectSplat() in splat_view.hpp
+// is the reference it is checked against.
+static ProjectedInstance projectSplat(
+  SplatRecord splat, float3 colour, constant ProjectionParameters & q)
+{
+  ProjectedInstance out;
+  out.centre = packed_float3(0.0, 0.0, 2.0);
+  out.visible_radius = 0.0;
+  out.axes = float4(0.0);
+  out.colour = float4(0.0);
+
+  const float4 p = float4(float3(splat.position), 1.0);
+  const float clip_w = dot(q.worldviewproj_rows[3], p);
+  if (clip_w <= 0.0) {
+    return out;
+  }
+
+  const float x = splat.quat.x;
+  const float y = splat.quat.y;
+  const float z = splat.quat.z;
+  const float w = splat.quat.w;
+  const float3x3 rotation = float3x3(
+    float3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y)),
+    float3(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x)),
+    float3(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)));
+  const float3 s = float3(splat.scale);
+  const float3x3 m = float3x3(rotation[0] * s.x, rotation[1] * s.y, rotation[2] * s.z);
+  const float3x3 sigma = m * transpose(m);
+
+  const float tanFovy = tan(q.fovy * 0.5);
+  const float tanFovx = tanFovy * q.viewport_size.x / q.viewport_size.y;
+  const float focalY = q.viewport_size.y / (2.0 * tanFovy);
+  const float focalX = q.viewport_size.x / (2.0 * tanFovx);
+  float3 t = float3(
+    dot(q.worldview_rows[0], p), dot(q.worldview_rows[1], p), dot(q.worldview_rows[2], p));
+  const float limx = 1.3 * tanFovx;
+  const float limy = 1.3 * tanFovy;
+  t.x = clamp(t.x / t.z, -limx, limx) * t.z;
+  t.y = clamp(t.y / t.z, -limy, limy) * t.z;
+  const float3 t0 = (focalX / t.z) * q.worldview_rows[0].xyz +
+    (-(focalX * t.x) / (t.z * t.z)) * q.worldview_rows[2].xyz;
+  const float3 t1 = (focalY / t.z) * q.worldview_rows[1].xyz +
+    (-(focalY * t.y) / (t.z * t.z)) * q.worldview_rows[2].xyz;
+  float a = dot(t0, sigma * t0);
+  const float b = dot(t0, sigma * t1);
+  float c = dot(t1, sigma * t1);
+
+  const float detOriginal = a * c - b * b;
+  a += q.eps2d;
+  c += q.eps2d;
+  const float detBlurred = a * c - b * b;
+  const float compensation = sqrt(max(detOriginal / detBlurred, 0.0));
+  const float alpha = splat.opacity * mix(1.0, compensation, q.antialiased);
+  const float alphaCutoff = 1.0 / 255.0;
+  if (alpha < alphaCutoff) {
+    return out;
+  }
+
+  const float visibleRadius = min(q.sigma_radius, sqrt(2.0 * log(alpha / alphaCutoff)));
+  // The eigen decomposition as in gsplat_vp, whose comments say why its
+  // formulas avoid cancellation.
+  const float mid = 0.5 * (a + c);
+  const float halfDifference = 0.5 * (a - c);
+  const float root = sqrt(halfDifference * halfDifference + b * b);
+  const float lambda1 = max(mid + root, 0.01);
+  const float lambda2 = max(mid - root, 0.01);
+  float2 axis1 = halfDifference >= 0.0 ?
+    float2(halfDifference + root, b) : float2(b, root - halfDifference);
+  const float axisLength = length(axis1);
+  axis1 = axisLength > 0.0 ? axis1 / axisLength : float2(1.0, 0.0);
+  const float2 axis2 = float2(-axis1.y, axis1.x);
+
+  out.centre = packed_float3(float3(
+    dot(q.worldviewproj_rows[0], p), dot(q.worldviewproj_rows[1], p),
+    dot(q.worldviewproj_rows[2], p)) / clip_w);
+  out.visible_radius = visibleRadius;
+  out.axes = float4(
+    axis1 * (visibleRadius * sqrt(lambda1)) * 2.0 / q.viewport_size.xy,
+    axis2 * (visibleRadius * sqrt(lambda2)) * 2.0 / q.viewport_size.xy);
+  out.colour = float4(colour, alpha);
+  return out;
+}
+
+// Stage 4: the draw stream for the sorted survivors, coloured and already
+// projected, so the vertex program only has to place each quad's corners.
 kernel void gather_instances(
   device const uint2 * sorted [[buffer(0)]],
   device const SplatRecord * splats [[buffer(1)]],
   device const float * sh_dc [[buffer(2)]],
   device const float * sh_rest [[buffer(3)]],
-  device const atomic_uint * visible_count [[buffer(4)]],
-  device DrawInstance * instances [[buffer(5)]],
-  device DrawIndexedArguments * arguments [[buffer(6)]],
-  constant ViewParameters & p [[buffer(7)]],
+  device const PreparationState & state [[buffer(4)]],
+  device ProjectedInstance * instances [[buffer(5)]],
+  constant ViewParameters & p [[buffer(6)]],
+  constant ProjectionParameters & q [[buffer(7)]],
   uint output [[thread_position_in_grid]])
 {
-  const uint count = atomic_load_explicit(visible_count, memory_order_relaxed);
-  if (output == 0u) {
-    arguments->instance_count = count;
-  }
-  if (output >= count) {
+  if (output >= state.visible) {
     return;
   }
-  const uint splat = sorted[output].y;
-  DrawInstance instance;
-  instance.index = float(splat);
-  instance.colour = evaluateSH(splat, float3(splats[splat].position), sh_dc, sh_rest, p);
-  instances[output] = instance;
+  const uint index = sorted[output].y;
+  const SplatRecord splat = splats[index];
+  const float3 colour = evaluateSH(index, float3(splat.position), sh_dc, sh_rest, p);
+  instances[output] = projectSplat(splat, colour, q);
 }
