@@ -70,7 +70,10 @@ if(GSPLAT_METAL_PREPARATION)
   set_source_files_properties(${gaussian_splatting_metal_sources}
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_include_directories(${PROJECT_NAME} PRIVATE "${OGRE_METAL_INCLUDE_DIR}")
-  target_link_libraries(${PROJECT_NAME} "${METAL_FRAMEWORK}" "${FOUNDATION_FRAMEWORK}")
+  # By name, not by the paths find_library() returned above: those point into
+  # the SDK this was configured with, and they are exported with the target,
+  # so an application built against any other SDK failed to compile.
+  target_link_libraries(${PROJECT_NAME} "-framework Metal" "-framework Foundation")
   if(NOT gaussian_splatting_library_type STREQUAL "STATIC")
     # RViz can still select OpenGL on macOS. A normal dependency would make the
     # class loader require RenderSystem_Metal even in that process; weak linking
@@ -161,7 +164,7 @@ if(BUILD_TESTING)
       PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_include_directories(verify_gpu_preparation PRIVATE include src)
     target_compile_features(verify_gpu_preparation PRIVATE cxx_std_17)
-    target_link_libraries(verify_gpu_preparation "${METAL_FRAMEWORK}" "${FOUNDATION_FRAMEWORK}")
+    target_link_libraries(verify_gpu_preparation "-framework Metal" "-framework Foundation")
     add_test(NAME verify_gpu_preparation
       COMMAND verify_gpu_preparation --quick
         "${CMAKE_CURRENT_SOURCE_DIR}/ogre_media/materials/programs/Metal/gsplat_prepare.metal")
