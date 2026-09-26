@@ -272,6 +272,11 @@ private:
         [&](id<MTLComputeCommandEncoder> encoder) {
           return core_->encodeCull(encoder, parameters, draw);
         });
+    times.shade_ms = stage(@"Gaussian splat preparation: shade",
+        [&](id<MTLComputeCommandEncoder> encoder) {
+          core_->encodeShade(encoder, parameters);
+          return true;
+        });
     times.sort_ms = stage(@"Gaussian splat preparation: sort",
         [&](id<MTLComputeCommandEncoder> encoder) {
           sorted = core_->encodeSort(encoder, 32u);
@@ -282,7 +287,7 @@ private:
           if (!sorted) {
             return false;
           }
-          core_->encodeGather(encoder, parameters, projection, sorted, instances);
+          core_->encodeGather(encoder, projection, sorted, instances);
           return true;
         });
     if (!ok) {

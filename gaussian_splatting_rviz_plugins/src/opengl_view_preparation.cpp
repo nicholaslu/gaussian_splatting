@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -71,6 +73,55 @@ const ComputeFunctions & computeFunctions()
       return resolved;
     }();
   return functions;
+}
+
+// GSPLAT_PROFILE_GPU times each stage with timestamp queries, taken from the GL
+// library for the same reason as the dispatch entry points above.
+struct TimerFunctions
+{
+  void (*gen_queries)(GLsizei, GLuint *) = nullptr;
+  void (*delete_queries)(GLsizei, const GLuint *) = nullptr;
+  void (*query_counter)(GLuint, GLenum) = nullptr;
+  void (*get_query_result)(GLuint, GLenum, GLuint64 *) = nullptr;
+
+  bool resolved() const
+  {
+    return gen_queries && delete_queries && query_counter && get_query_result;
+  }
+};
+
+const TimerFunctions & timerFunctions()
+{
+  static const TimerFunctions functions = [] {
+      TimerFunctions found;
+      for (const char * name : {"libGL.so.1", "libOpenGL.so.0"}) {
+        void * library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (!library) {
+          continue;
+        }
+        found.gen_queries = reinterpret_cast<void (*)(GLsizei, GLuint *)>(
+          dlsym(library, "glGenQueries"));
+        found.delete_queries = reinterpret_cast<void (*)(GLsizei, const GLuint *)>(
+          dlsym(library, "glDeleteQueries"));
+        found.query_counter = reinterpret_cast<void (*)(GLuint, GLenum)>(
+          dlsym(library, "glQueryCounter"));
+        found.get_query_result = reinterpret_cast<void (*)(GLuint, GLenum, GLuint64 *)>(
+          dlsym(library, "glGetQueryObjectui64v"));
+        if (found.resolved()) {
+          break;
+        }
+        found = TimerFunctions{};
+      }
+      return found;
+    }();
+  return functions;
+}
+
+// Set and not "0", as for the Metal backend.
+bool environmentFlag(const char * name)
+{
+  const char * value = std::getenv(name);
+  return value && *value && std::strcmp(value, "0") != 0;
 }
 
 #undef glDispatchCompute
@@ -188,11 +239,20 @@ public:
     programs_[7] = compile("GSPLAT_STAGE_RADIX_SCATTER");
     programs_[8] = compile("GSPLAT_STAGE_GATHER");
     programs_[9] = compile("GSPLAT_STAGE_CLEAR_TAIL");
+    programs_[10] = compile("GSPLAT_STAGE_SHADE_VISIBLE");
+
+    profiling_ = environmentFlag("GSPLAT_PROFILE_GPU") && timerFunctions().resolved();
+    if (profiling_) {
+      timerFunctions().gen_queries(static_cast<GLsizei>(queries_.size()), queries_.data());
+    }
   }
 
   ~OpenGlViewPreparation() override
   {
     clear();
+    if (profiling_) {
+      timerFunctions().delete_queries(static_cast<GLsizei>(queries_.size()), queries_.data());
+    }
     for (GLuint program : programs_) {
       if (program != 0u) {
         glDeleteProgram(program);
@@ -228,10 +288,11 @@ public:
     const std::size_t pair_bytes = count * sizeof(std::uint32_t) * 2u;
     const std::size_t tile_bytes = static_cast<std::size_t>(tile_count_) * sizeof(std::uint32_t);
     const std::size_t table_bytes = tile_bytes * kRadix;
-    const std::array<std::size_t, 8> storage_sizes = {
+    const std::size_t colour_bytes = count * sizeof(float) * 4u;
+    const std::array<std::size_t, 9> storage_sizes = {
       pair_bytes, pair_bytes, tile_bytes, tile_bytes,
       table_bytes, table_bytes, kRadix * sizeof(std::uint32_t),
-      count * sizeof(ProjectedInstance)};
+      count * sizeof(ProjectedInstance), colour_bytes};
     for (std::size_t bytes : storage_sizes) {
       if (bytes > static_cast<std::size_t>(max_storage_block_bytes_)) {
         error_ = "scene requires an SSBO larger than GL_MAX_SHADER_STORAGE_BLOCK_SIZE";
@@ -252,6 +313,7 @@ public:
     tile_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
     gather_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
     clear_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
+    colours_ = newBuffer(colour_bytes, GL_DYNAMIC_COPY);
     view_parameters_ = newBuffer(sizeof(ViewParameters), GL_STREAM_DRAW);
     projection_parameters_ = newBuffer(sizeof(ProjectionParameters), GL_STREAM_DRAW);
     for (Readback & readback : readbacks_) {
@@ -259,8 +321,9 @@ public:
     }
     if (!keys_a_ || !keys_b_ || !tile_counts_ || !tile_offsets_ || !histograms_ ||
       !offsets_ || !totals_ || !digit_bases_ || !state_ || !tile_dispatch_ ||
-      !gather_dispatch_ || !clear_dispatch_ || !view_parameters_ || !projection_parameters_ ||
-      !readbacks_[0].buffer || !readbacks_[1].buffer || !readbacks_[2].buffer)
+      !gather_dispatch_ || !clear_dispatch_ || !colours_ || !view_parameters_ ||
+      !projection_parameters_ || !readbacks_[0].buffer || !readbacks_[1].buffer ||
+      !readbacks_[2].buffer)
     {
       const std::string failure = error_.empty() ? "allocating OpenGL preparation buffers" : error_;
       clear();
@@ -359,6 +422,7 @@ public:
     updateBuffer(view_parameters_, &parameters, sizeof(parameters));
     updateBuffer(projection_parameters_, &projection, sizeof(projection));
 
+    mark(0);
     use(programs_[0]);
     bind(0, splats_); bind(1, keys_b_); bind(2, view_parameters_);
     glDispatchCompute(groups(count_, 256u), 1, 1);
@@ -388,6 +452,16 @@ public:
     // count describes compacted tiles and is used only by the radix stages.
     glDispatchCompute(tile_count_, 1, 1);
     storageBarrier();
+    mark(1);
+
+    // Colour before the sort, while the survivors are still in index order;
+    // see GSPLAT_STAGE_SHADE_VISIBLE. The sort's second pass overwrites keys_a_.
+    use(programs_[10]);
+    bind(0, keys_a_); bind(1, splats_); bind(2, sh_dc_); bind(3, sh_rest_);
+    bind(4, state_); bind(5, colours_); bind(6, view_parameters_);
+    dispatchIndirect(gather_dispatch_);
+    storageBarrier();
+    mark(2);
 
     GLuint input = keys_a_;
     GLuint output = keys_b_;
@@ -418,11 +492,11 @@ public:
       storageBarrier();
       std::swap(input, output);
     }
+    mark(3);
 
     use(programs_[8]);
-    bind(0, input); bind(1, splats_); bind(2, sh_dc_); bind(3, sh_rest_);
-    bind(4, state_); bind(5, instance_gl_); bind(6, view_parameters_);
-    bind(7, projection_parameters_);
+    bind(0, input); bind(1, splats_); bind(2, colours_);
+    bind(4, state_); bind(5, instance_gl_); bind(7, projection_parameters_);
     dispatchIndirect(gather_dispatch_);
     if (!kOgreIndirectDraw) {
       storageBarrier();
@@ -433,7 +507,9 @@ public:
     glMemoryBarrier(
       GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT |
       GL_COMMAND_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    mark(4);
     queueReadback();
+    readStageTimes();
 
     for (GLuint binding = 0; binding < 8; ++binding) {
       glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, 0);
@@ -464,12 +540,12 @@ public:
 
   bool profiling() const override
   {
-    return false;
+    return profiling_;
   }
 
   StageTimes lastStageTimes() const override
   {
-    return {};
+    return times_;
   }
 
   void clear() override
@@ -491,10 +567,10 @@ public:
         readback.fence = nullptr;
       }
     }
-    std::array<GLuint *, 19> buffers = {
+    std::array<GLuint *, 20> buffers = {
       &splats_, &sh_dc_, &sh_rest_, &keys_a_, &keys_b_, &tile_counts_, &tile_offsets_,
       &histograms_, &offsets_, &totals_, &digit_bases_, &state_, &tile_dispatch_,
-      &gather_dispatch_, &clear_dispatch_, &draw_arguments_, &view_parameters_,
+      &gather_dispatch_, &clear_dispatch_, &colours_, &draw_arguments_, &view_parameters_,
       &projection_parameters_, &readbacks_[0].buffer};
     // The first readback is included above; delete the other two separately.
     for (GLuint * buffer : buffers) {
@@ -527,6 +603,33 @@ private:
     GLuint buffer = 0u;
     GLsync fence = nullptr;
   };
+
+  // Timestamps at the stage boundaries, read back at once: the read waits for
+  // the GPU, so GSPLAT_PROFILE_GPU serialises every preparation with the CPU.
+  void mark(std::size_t boundary)
+  {
+    if (profiling_) {
+      timerFunctions().query_counter(queries_[boundary], GL_TIMESTAMP);
+    }
+  }
+
+  void readStageTimes()
+  {
+    if (!profiling_) {
+      return;
+    }
+    std::array<GLuint64, 5> ticks{};
+    for (std::size_t i = 0; i < ticks.size(); ++i) {
+      timerFunctions().get_query_result(queries_[i], GL_QUERY_RESULT, &ticks[i]);
+    }
+    const auto ms = [&ticks](std::size_t from, std::size_t to) {
+        return static_cast<double>(ticks[to] - ticks[from]) / 1.0e6;
+      };
+    times_.cull_ms = ms(0, 1);
+    times_.shade_ms = ms(1, 2);
+    times_.sort_ms = ms(2, 3);
+    times_.gather_ms = ms(3, 4);
+  }
 
   bool ready() const
   {
@@ -685,7 +788,10 @@ private:
   Ogre::HardwareVertexBufferSharedPtr indirect_buffer_;
   std::string shader_source_;
   std::string error_;
-  std::array<GLuint, 10> programs_{};
+  std::array<GLuint, 11> programs_{};
+  bool profiling_ = false;
+  std::array<GLuint, 5> queries_{};
+  StageTimes times_;
   GLuint current_program_ = 0u;
   GLint64 max_storage_block_bytes_ = 0;
   std::uint32_t count_ = 0u;
@@ -708,6 +814,8 @@ private:
   GLuint tile_dispatch_ = 0u;
   GLuint gather_dispatch_ = 0u;
   GLuint clear_dispatch_ = 0u;
+  // One colour per splat, by splat index, from SHADE_VISIBLE for the gather.
+  GLuint colours_ = 0u;
   // The draw arguments when Ogre cannot use them; otherwise Ogre owns them.
   GLuint draw_arguments_ = 0u;
   GLuint view_parameters_ = 0u;

@@ -470,6 +470,30 @@ static float3 evaluateSH(
   return max(colour, 0.0);
 }
 
+// Stage 3: the colour of every survivor, between compaction and the sort. The
+// compacted list is still in index order here, so the spherical harmonics - by
+// far the scene's largest arrays - are read in the order they are stored.
+// Evaluated after the sort, as the gather once did, the same reads land in
+// depth order, scattered over the whole coefficient buffer: on an RTX 4090 with
+// the full Garden scene that made the gather 24 times slower. Written by splat
+// index, for the gather to pick up in sorted order.
+kernel void shade_visible(
+  device const uint2 * compacted [[buffer(0)]],
+  device const SplatRecord * splats [[buffer(1)]],
+  device const float * sh_dc [[buffer(2)]],
+  device const float * sh_rest [[buffer(3)]],
+  device const PreparationState & state [[buffer(4)]],
+  device float4 * colours [[buffer(5)]],
+  constant ViewParameters & p [[buffer(6)]],
+  uint slot [[thread_position_in_grid]])
+{
+  if (slot >= state.visible) {
+    return;
+  }
+  const uint index = compacted[slot].y;
+  colours[index] = float4(evaluateSH(index, float3(splats[index].position), sh_dc, sh_rest, p), 0.0);
+}
+
 // gsplat_vp from gsplat.metal, less the corner displacement, done once per
 // splat here instead of once per quad vertex; projectSplat() in splat_view.hpp
 // is the reference it is checked against.
@@ -554,16 +578,15 @@ static ProjectedInstance projectSplat(
   return out;
 }
 
-// Stage 4: the draw stream for the sorted survivors, coloured and already
-// projected, so the vertex program only has to place each quad's corners.
+// Stage 5: the draw stream for the sorted survivors, projected here with the
+// colour shade_visible left for each, so the vertex program only has to place
+// each quad's corners.
 kernel void gather_instances(
   device const uint2 * sorted [[buffer(0)]],
   device const SplatRecord * splats [[buffer(1)]],
-  device const float * sh_dc [[buffer(2)]],
-  device const float * sh_rest [[buffer(3)]],
+  device const float4 * colours [[buffer(2)]],
   device const PreparationState & state [[buffer(4)]],
   device ProjectedInstance * instances [[buffer(5)]],
-  constant ViewParameters & p [[buffer(6)]],
   constant ProjectionParameters & q [[buffer(7)]],
   uint output [[thread_position_in_grid]])
 {
@@ -571,7 +594,5 @@ kernel void gather_instances(
     return;
   }
   const uint index = sorted[output].y;
-  const SplatRecord splat = splats[index];
-  const float3 colour = evaluateSH(index, float3(splat.position), sh_dc, sh_rest, p);
-  instances[output] = projectSplat(splat, colour, q);
+  instances[output] = projectSplat(splats[index], colours[index].xyz, q);
 }

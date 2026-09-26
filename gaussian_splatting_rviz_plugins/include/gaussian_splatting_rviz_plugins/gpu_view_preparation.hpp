@@ -27,6 +27,7 @@ public:
   struct StageTimes
   {
     double cull_ms = 0.0;
+    double shade_ms = 0.0;
     double sort_ms = 0.0;
     double gather_ms = 0.0;
   };

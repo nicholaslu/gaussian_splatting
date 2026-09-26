@@ -427,16 +427,24 @@ void main()
   }
 }
 
-#elif defined(GSPLAT_STAGE_GATHER)
+#elif defined(GSPLAT_STAGE_SHADE_VISIBLE) || defined(GSPLAT_STAGE_GATHER)
+// SHADE_VISIBLE evaluates colour between compaction and the sort, while the
+// compacted list is still in index order, so the spherical harmonics - by far
+// the scene's largest arrays - are read in the order they are stored. After the
+// sort the same reads land in depth order, scattered over the whole coefficient
+// buffer: on an RTX 4090 with the full Garden scene that made the gather 24
+// times slower. GATHER then only projects, taking each colour by splat index.
+// Each stage binds seven blocks at most, within the eight OpenGL guarantees.
 layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer Sorted {uvec2 sorted_records[];};
+layout(std430, binding = 0) readonly buffer Records {uvec2 records[];};
 layout(std430, binding = 1) readonly buffer Splats {SplatRecord splats[];};
+layout(std430, binding = 4) readonly buffer State {PreparationState state;};
+
+#if defined(GSPLAT_STAGE_SHADE_VISIBLE)
 layout(std430, binding = 2) readonly buffer Dc {float sh_dc[];};
 layout(std430, binding = 3) readonly buffer Rest {float sh_rest[];};
-layout(std430, binding = 4) readonly buffer State {PreparationState state;};
-layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
+layout(std430, binding = 5) writeonly buffer Colours {vec4 colours[];};
 layout(std430, binding = 6) readonly buffer ViewBlock {ViewParameters p;};
-layout(std430, binding = 7) readonly buffer ProjectionBlock {ProjectionParameters q;};
 
 vec3 evaluateSH(uint splat, vec3 position)
 {
@@ -478,6 +486,21 @@ vec3 evaluateSH(uint splat, vec3 position)
   }
   return max(colour, vec3(0.0));
 }
+
+void main()
+{
+  uint slot = gl_GlobalInvocationID.x;
+  if (slot >= state.visible) {
+    return;
+  }
+  uint index = records[slot].y;
+  colours[index] = vec4(evaluateSH(index, splats[index].position_opacity.xyz), 0.0);
+}
+
+#else
+layout(std430, binding = 2) readonly buffer Colours {vec4 colours[];};
+layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
+layout(std430, binding = 7) readonly buffer ProjectionBlock {ProjectionParameters q;};
 
 ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
 {
@@ -557,11 +580,10 @@ void main()
   if (output_index >= state.visible) {
     return;
   }
-  uint index = sorted_records[output_index].y;
-  SplatRecord splat = splats[index];
-  vec3 colour = evaluateSH(index, splat.position_opacity.xyz);
-  instances[output_index] = projectSplat(splat, colour);
+  uint index = records[output_index].y;
+  instances[output_index] = projectSplat(splats[index], colours[index].xyz);
 }
+#endif
 
 #elif defined(GSPLAT_STAGE_CLEAR_TAIL)
 // Empties instance slots in [visible, clear_end) for a renderer that draws

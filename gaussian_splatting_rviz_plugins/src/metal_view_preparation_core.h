@@ -22,9 +22,10 @@ namespace gaussian_splatting_rviz_plugins
 // One preparation: make_depth_keys writes a key, or a rejection mark, per
 // splat; compact_count, compact_scan and compact_scatter pack the survivors in
 // index order into the front of the key buffer and write the visible count,
-// the indirect dispatch sizes and the draw arguments; the radix sorts only
-// those survivors; gather_instances colours and projects them. Nothing is
-// read back on the CPU.
+// the indirect dispatch sizes and the draw arguments; shade_visible evaluates
+// their colour while they are still in index order; the radix sorts only those
+// survivors; gather_instances projects them in depth order. Nothing is read
+// back on the CPU.
 class MetalViewPreparationCore
 {
 public:
@@ -64,10 +65,11 @@ public:
   bool encodeCull(
     id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
     id<MTLBuffer> draw_arguments);
+  void encodeShade(id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters);
   id<MTLBuffer> encodeSort(id<MTLComputeCommandEncoder> encoder, std::uint32_t key_bits = 32);
   void encodeGather(
-    id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
-    const ProjectionParameters & projection, id<MTLBuffer> sorted, id<MTLBuffer> instances);
+    id<MTLComputeCommandEncoder> encoder, const ProjectionParameters & projection,
+    id<MTLBuffer> sorted, id<MTLBuffer> instances);
   id<MTLBuffer> encode(
     id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
     const ProjectionParameters & projection, id<MTLBuffer> instances,
@@ -101,6 +103,7 @@ private:
   id<MTLComputePipelineState> offset_pipeline_ = nil;
   id<MTLComputePipelineState> base_pipeline_ = nil;
   id<MTLComputePipelineState> scatter_pipeline_ = nil;
+  id<MTLComputePipelineState> shade_pipeline_ = nil;
   id<MTLComputePipelineState> gather_pipeline_ = nil;
 
   std::uint32_t count_ = 0;
@@ -122,6 +125,8 @@ private:
   id<MTLBuffer> state_ = nil;
   id<MTLBuffer> tile_dispatch_ = nil;
   id<MTLBuffer> gather_dispatch_ = nil;
+  // One colour per splat, by splat index, from shade_visible for the gather.
+  id<MTLBuffer> colours_ = nil;
   std::string error_;
 };
 

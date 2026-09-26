@@ -432,7 +432,7 @@ bool verify(
 void timeStages(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection)
 {
-  std::vector<double> encode, whole, cull, sort, gather;
+  std::vector<double> encode, whole, cull, shade, sort, gather;
   for (int rep = 0; rep < 7; ++rep) {
     const Run run = prepare(context, view, projection);
     encode.push_back(run.encode_ms);
@@ -452,11 +452,14 @@ void timeStages(
     cull.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
         context.core->encodeCull(encoder, view, context.draw);
       }));
+    shade.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
+        context.core->encodeShade(encoder, view);
+      }));
     sort.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
         sorted = context.core->encodeSort(encoder);
       }));
     gather.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
-        context.core->encodeGather(encoder, view, projection, sorted, context.instances);
+        context.core->encodeGather(encoder, projection, sorted, context.instances);
       }));
   }
   const auto * state =
@@ -464,8 +467,9 @@ void timeStages(
   std::printf("\nTiming, median of 7, %u of %u visible:\n", state->visible, view.count);
   std::printf("  CPU encode of one preparation      %8.3f ms\n", median(encode));
   std::printf("  GPU, one command buffer as shipped %8.2f ms\n", median(whole));
-  std::printf("  GPU by stage: cull+compact %.2f | sort %.2f | gather+SH+projection %.2f ms\n",
-    median(cull), median(sort), median(gather));
+  std::printf(
+    "  GPU by stage: cull+compact %.2f | shade %.2f | sort %.2f | gather+projection %.2f ms\n",
+    median(cull), median(shade), median(sort), median(gather));
   std::printf("  preparation scratch buffers %.0f MiB\n\n",
     double(context.core->scratchBytes()) / (1024.0 * 1024.0));
 }

@@ -334,13 +334,53 @@ Against the acceptance criteria:
   a synchronous readback. CUDA has a reserved factory and buffer contract but
   no implementation yet.
 
+Colour is evaluated before the sort. `shade_visible` (Metal) and
+`GSPLAT_STAGE_SHADE_VISIBLE` (OpenGL) run between compaction and the radix, while
+the survivors are still in index order, so the SH coefficients are read in the
+order they are stored and the result is written per splat for the gather. The
+gather used to evaluate SH itself after the sort, which read the coefficient
+buffer in depth order, 180 bytes per splat scattered over about 1 GiB at Garden
+scale. On Linux with an RTX 4090 and the full Garden PLY at 1420x719, timed
+under `GSPLAT_PROFILE_GPU` as the median of 25 preparations after 5 warm-up:
+
+| View | Visible | SH in gather | SH before sort | Cull+compact | Shade | Sort | Gather |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Main | 1,654,413 | 667.8-682.6 ms | 28.71 ms | 1.10 | 1.18 | 2.34 | 24.05 |
+| Second | 1,470,244 | 590.3 ms | 25.90 ms | 1.10 | 1.08 | 2.18 | 21.20 |
+
+The SH arithmetic takes 1.1-1.2 ms of it, so nearly all of the old cost was the
+scattered reads. Both views render pixel-identical to the baseline. These are
+GPU preparation times, measured synchronously, not frame intervals. On the M3,
+synthetic Garden-sized scene, median of 7:
+
+| Stage | SH in gather | SH before sort |
+| --- | ---: | ---: |
+| Cull and compaction | 5.43 ms | 5.47 ms |
+| Shade | - | 9.58 ms |
+| Radix sort | 8.08 ms | 8.22 ms |
+| Gather (and SH) | 26.40 ms | 9.05 ms |
+| One command buffer, as shipped | 40.10 ms | 32.02 ms |
+
+The colour buffer adds 16 bytes per splat, 89 MiB at Garden scale. OpenGL
+stages are now timed with timestamp queries under `GSPLAT_PROFILE_GPU`, like
+Metal, and each binds at most seven storage blocks, within the eight OpenGL
+guarantees.
+
 Still open:
 
 - Degree-3 SH is uploaded as float32, about 1 GiB at this count. Uploads now
   reuse the buffers in place, but the precision question is undecided: half
   precision would halve it at the cost of exact agreement with the CPU colours.
-- Gather, SH and projection, 26 ms at Garden scale, is the largest stage.
-  Frame pacing is the next target: the sort could be spread over several frames
+- The gather still reads each survivor's record and colour in depth order,
+  9 ms on the M3 and 21-24 ms on the RTX 4090 at Garden scale. Projecting before
+  the sort as well, into compacted slots, would leave the gather a permutation
+  of a buffer the size of the visible set, at 48 bytes per splat of scratch.
+- The OpenGL path's depth keys differ from the CPU's on about a quarter of the
+  visible splats on the RTX 4090, by up to 6260 ulp on near-zero depths, which
+  moves splats at most four places in the order; 157 projected quads also fall
+  outside tolerance. Most likely different FMA contraction in GLSL, which the
+  `precise` qualifier would pin. OpenGL has no offline verifier yet.
+- Frame pacing is the next target: the sort could be spread over several frames
   in slices, with the gather re-projecting the last completed order every
   frame. That needs a guard band on the culling, since a stale cull would
   otherwise drop splats entering the view.
