@@ -470,30 +470,6 @@ static float3 evaluateSH(
   return max(colour, 0.0);
 }
 
-// Stage 3: the colour of every survivor, between compaction and the sort. The
-// compacted list is still in index order here, so the spherical harmonics - by
-// far the scene's largest arrays - are read in the order they are stored.
-// Evaluated after the sort, as the gather once did, the same reads land in
-// depth order, scattered over the whole coefficient buffer: on an RTX 4090 with
-// the full Garden scene that made the gather 24 times slower. Written by splat
-// index, for the gather to pick up in sorted order.
-kernel void shade_visible(
-  device const uint2 * compacted [[buffer(0)]],
-  device const SplatRecord * splats [[buffer(1)]],
-  device const float * sh_dc [[buffer(2)]],
-  device const float * sh_rest [[buffer(3)]],
-  device const PreparationState & state [[buffer(4)]],
-  device float4 * colours [[buffer(5)]],
-  constant ViewParameters & p [[buffer(6)]],
-  uint slot [[thread_position_in_grid]])
-{
-  if (slot >= state.visible) {
-    return;
-  }
-  const uint index = compacted[slot].y;
-  colours[index] = float4(evaluateSH(index, float3(splats[index].position), sh_dc, sh_rest, p), 0.0);
-}
-
 // gsplat_vp from gsplat.metal, less the corner displacement, done once per
 // splat here instead of once per quad vertex; projectSplat() in splat_view.hpp
 // is the reference it is checked against.
@@ -578,21 +554,50 @@ static ProjectedInstance projectSplat(
   return out;
 }
 
-// Stage 5: the draw stream for the sorted survivors, projected here with the
-// colour shade_visible left for each, so the vertex program only has to place
-// each quad's corners.
+// Stage 3: every survivor coloured and projected, between compaction and the
+// sort. The compacted list is still in index order here, so the splat records
+// and the spherical harmonics - by far the scene's largest arrays - are read in
+// the order they are stored. After the sort the same reads land in depth order,
+// scattered over the whole scene: on an RTX 4090 with the full Garden scene,
+// evaluating SH there made the gather 24 times slower. Each result goes to the
+// survivor's compacted slot, and the slot replaces the splat index as the
+// sort's value, so the gather only permutes a buffer the size of the visible
+// set. The sort is stable and slots follow index order, so the draw order is
+// unchanged. slot_splats keeps each slot's splat index for diagnostics.
+kernel void shade_project(
+  device uint2 * compacted [[buffer(0)]],
+  device const SplatRecord * splats [[buffer(1)]],
+  device const float * sh_dc [[buffer(2)]],
+  device const float * sh_rest [[buffer(3)]],
+  device const PreparationState & state [[buffer(4)]],
+  device ProjectedInstance * projected [[buffer(5)]],
+  constant ViewParameters & p [[buffer(6)]],
+  constant ProjectionParameters & q [[buffer(7)]],
+  device uint * slot_splats [[buffer(8)]],
+  uint slot [[thread_position_in_grid]])
+{
+  if (slot >= state.visible) {
+    return;
+  }
+  const uint index = compacted[slot].y;
+  const SplatRecord splat = splats[index];
+  const float3 colour = evaluateSH(index, float3(splat.position), sh_dc, sh_rest, p);
+  projected[slot] = projectSplat(splat, colour, q);
+  slot_splats[slot] = index;
+  compacted[slot].y = slot;
+}
+
+// Stage 5: the draw stream in depth order, a permutation of what shade_project
+// wrote, so the vertex program only has to place each quad's corners.
 kernel void gather_instances(
   device const uint2 * sorted [[buffer(0)]],
-  device const SplatRecord * splats [[buffer(1)]],
-  device const float4 * colours [[buffer(2)]],
+  device const ProjectedInstance * projected [[buffer(1)]],
   device const PreparationState & state [[buffer(4)]],
   device ProjectedInstance * instances [[buffer(5)]],
-  constant ProjectionParameters & q [[buffer(7)]],
   uint output [[thread_position_in_grid]])
 {
   if (output >= state.visible) {
     return;
   }
-  const uint index = sorted[output].y;
-  instances[output] = projectSplat(splats[index], colours[index].xyz, q);
+  instances[output] = projected[sorted[output].y];
 }

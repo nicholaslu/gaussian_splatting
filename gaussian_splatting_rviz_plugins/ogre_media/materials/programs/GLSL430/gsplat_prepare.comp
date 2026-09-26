@@ -83,10 +83,33 @@ uint orderedFloatKey(float value)
   return (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
 }
 
-vec3 transformPoint(vec4 rows[4], vec3 point)
+// The culling and depth arithmetic of prepareSplat() in splat_view.hpp, in its
+// order and unfused: `precise` stops the compiler contracting a multiply and an
+// add into an FMA, as GLSL otherwise may and a baseline x86-64 build of the CPU
+// path does not. dot() compiled to an FMA chain put a quarter of the depth keys
+// an ulp or more from the CPU's, by thousands of ulp where the depth cancels to
+// near zero, which reordered nearby splats. A CPU build that does contract, as
+// GCC does for AArch64, can still differ by the last ulp.
+
+// Vector3::dotProduct(), from zero as Ogre sums it.
+float dotProduct(vec3 a, vec3 b)
 {
-  vec4 p = vec4(point, 1.0);
-  return vec3(dot(rows[0], p), dot(rows[1], p), dot(rows[2], p));
+  precise float result = 0.0;
+  result = result + a.x * b.x;
+  result = result + a.y * b.y;
+  result = result + a.z * b.z;
+  return result;
+}
+
+// One row of an affine transform, summed left to right with the translation
+// last, as prepareSplat() writes it.
+float transformRow(vec4 row, vec3 point)
+{
+  precise float result = row.x * point.x;
+  result = result + row.y * point.y;
+  result = result + row.z * point.z;
+  result = result + row.w;
+  return result;
 }
 
 #if defined(GSPLAT_STAGE_MAKE_DEPTH_KEYS)
@@ -111,15 +134,18 @@ void main()
     min(p.sigma_radius, sqrt(2.0 * log(opacity / alpha_cutoff))) : 0.0;
   float max_sigma = max(scale.x, max(scale.y, scale.z));
   float world_radius = visible_radius * max_sigma * p.world_scale;
-  vec3 world_position = transformPoint(p.world_rows, position);
+  vec3 world_position = vec3(
+    transformRow(p.world_rows[0], position), transformRow(p.world_rows[1], position),
+    transformRow(p.world_rows[2], position));
 
   if (visible && (p.flags & 1u) != 0u) {
     for (uint plane = 0u; plane < 6u; ++plane) {
       if (plane == kFrustumPlaneFar && p.far_clip == 0.0) {
         continue;
       }
-      if (dot(p.frustum_planes[plane].xyz, world_position) +
-        p.frustum_planes[plane].w < -world_radius)
+      precise float distance =
+        dotProduct(p.frustum_planes[plane].xyz, world_position) + p.frustum_planes[plane].w;
+      if (distance < -world_radius)
       {
         visible = false;
         break;
@@ -132,7 +158,7 @@ void main()
   {
     float screen_radius = 0.0;
     if ((p.flags & 2u) != 0u) {
-      float depth = -transformPoint(p.view_rows, world_position).z;
+      float depth = -transformRow(p.view_rows[2], world_position);
       if (depth <= 0.0) {
         visible = false;
       } else {
@@ -143,13 +169,14 @@ void main()
     }
     if (visible) {
       float blur_radius = visible_radius * sqrt(max(p.eps2d, 0.0));
-      screen_radius = sqrt(screen_radius * screen_radius + blur_radius * blur_radius);
+      precise float squared = screen_radius * screen_radius + blur_radius * blur_radius;
+      screen_radius = sqrt(squared);
       visible = screen_radius >= p.min_screen_radius;
     }
   }
 
   records[i] = visible ?
-    uvec2(orderedFloatKey(dot(position, p.local_sort_direction.xyz)), i) :
+    uvec2(orderedFloatKey(dotProduct(position, p.local_sort_direction.xyz)), i) :
     uvec2(0u, kRejected);
 }
 
@@ -427,24 +454,26 @@ void main()
   }
 }
 
-#elif defined(GSPLAT_STAGE_SHADE_VISIBLE) || defined(GSPLAT_STAGE_GATHER)
-// SHADE_VISIBLE evaluates colour between compaction and the sort, while the
-// compacted list is still in index order, so the spherical harmonics - by far
-// the scene's largest arrays - are read in the order they are stored. After the
-// sort the same reads land in depth order, scattered over the whole coefficient
-// buffer: on an RTX 4090 with the full Garden scene that made the gather 24
-// times slower. GATHER then only projects, taking each colour by splat index.
-// Each stage binds seven blocks at most, within the eight OpenGL guarantees.
+#elif defined(GSPLAT_STAGE_SHADE_PROJECT)
+// Every survivor coloured and projected between compaction and the sort, while
+// the compacted list is still in index order, so the splat records and the
+// spherical harmonics - by far the scene's largest arrays - are read in the
+// order they are stored. After the sort the same reads land in depth order,
+// scattered over the whole scene: on an RTX 4090 with the full Garden scene,
+// evaluating SH there made the gather 24 times slower. Each result goes to the
+// survivor's compacted slot, and the slot replaces the splat index as the
+// sort's value, so GATHER only permutes a buffer the size of the visible set.
+// The sort is stable and slots follow index order, so the draw order is
+// unchanged. Eight storage blocks, the most OpenGL guarantees.
 layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer Records {uvec2 records[];};
+layout(std430, binding = 0) buffer Records {uvec2 records[];};
 layout(std430, binding = 1) readonly buffer Splats {SplatRecord splats[];};
-layout(std430, binding = 4) readonly buffer State {PreparationState state;};
-
-#if defined(GSPLAT_STAGE_SHADE_VISIBLE)
 layout(std430, binding = 2) readonly buffer Dc {float sh_dc[];};
 layout(std430, binding = 3) readonly buffer Rest {float sh_rest[];};
-layout(std430, binding = 5) writeonly buffer Colours {vec4 colours[];};
+layout(std430, binding = 4) readonly buffer State {PreparationState state;};
+layout(std430, binding = 5) writeonly buffer Projected {ProjectedInstance projected[];};
 layout(std430, binding = 6) readonly buffer ViewBlock {ViewParameters p;};
+layout(std430, binding = 7) readonly buffer ProjectionBlock {ProjectionParameters q;};
 
 vec3 evaluateSH(uint splat, vec3 position)
 {
@@ -486,21 +515,6 @@ vec3 evaluateSH(uint splat, vec3 position)
   }
   return max(colour, vec3(0.0));
 }
-
-void main()
-{
-  uint slot = gl_GlobalInvocationID.x;
-  if (slot >= state.visible) {
-    return;
-  }
-  uint index = records[slot].y;
-  colours[index] = vec4(evaluateSH(index, splats[index].position_opacity.xyz), 0.0);
-}
-
-#else
-layout(std430, binding = 2) readonly buffer Colours {vec4 colours[];};
-layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
-layout(std430, binding = 7) readonly buffer ProjectionBlock {ProjectionParameters q;};
 
 ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
 {
@@ -576,14 +590,32 @@ ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
 
 void main()
 {
+  uint slot = gl_GlobalInvocationID.x;
+  if (slot >= state.visible) {
+    return;
+  }
+  uint index = records[slot].y;
+  SplatRecord splat = splats[index];
+  projected[slot] = projectSplat(splat, evaluateSH(index, splat.position_opacity.xyz));
+  records[slot].y = slot;
+}
+
+#elif defined(GSPLAT_STAGE_GATHER)
+// The draw stream in depth order, a permutation of what SHADE_PROJECT wrote.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Sorted {uvec2 sorted_records[];};
+layout(std430, binding = 1) readonly buffer Projected {ProjectedInstance projected[];};
+layout(std430, binding = 4) readonly buffer State {PreparationState state;};
+layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
+
+void main()
+{
   uint output_index = gl_GlobalInvocationID.x;
   if (output_index >= state.visible) {
     return;
   }
-  uint index = records[output_index].y;
-  instances[output_index] = projectSplat(splats[index], colours[index].xyz);
+  instances[output_index] = projected[sorted_records[output_index].y];
 }
-#endif
 
 #elif defined(GSPLAT_STAGE_CLEAR_TAIL)
 // Empties instance slots in [visible, clear_end) for a renderer that draws

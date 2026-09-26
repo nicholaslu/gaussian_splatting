@@ -690,7 +690,7 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
         const GpuViewPreparation::StageTimes times = gpu_view_preparation_->lastStageTimes();
         setStatus(
           rviz_common::properties::StatusProperty::Ok, "GPU preparation",
-          QString("GPU cull+compact %1, shade %2, sort %3, gather %4 ms "
+          QString("GPU cull+compact %1, shade+project %2, sort %3, gather %4 ms "
           "(GSPLAT_PROFILE_GPU: stages run synchronously)")
           .arg(times.cull_ms, 0, 'f', 2)
           .arg(times.shade_ms, 0, 'f', 2)

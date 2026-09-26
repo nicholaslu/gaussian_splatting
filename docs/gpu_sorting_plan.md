@@ -361,25 +361,53 @@ synthetic Garden-sized scene, median of 7:
 | Gather (and SH) | 26.40 ms | 9.05 ms |
 | One command buffer, as shipped | 40.10 ms | 32.02 ms |
 
-The colour buffer adds 16 bytes per splat, 89 MiB at Garden scale. OpenGL
-stages are now timed with timestamp queries under `GSPLAT_PROFILE_GPU`, like
-Metal, and each binds at most seven storage blocks, within the eight OpenGL
-guarantees.
+Projection now happens before the sort as well. `shade_project` (Metal) and
+`GSPLAT_STAGE_SHADE_PROJECT` (OpenGL) colour and project each survivor into its
+compacted slot and make the slot the sort's value, so the gather only permutes
+a buffer the size of the visible set rather than reading records and colours
+scattered over the whole scene. The sort is stable and slots follow index
+order, so the draw order is unchanged. The projected scratch costs 48 bytes per
+splat, 267 MiB at Garden scale, in place of the 89 MiB colour buffer; it is the
+size of the instance buffer, so it adds no new storage-block limit. On Metal,
+`slotSplatBuffer()` maps slots back to splat indices for diagnostics. Same
+synthetic scene, median of 7:
+
+| Stage | M3, SH before sort | M3, projection before sort | RTX 4090, projection before sort |
+| --- | ---: | ---: | ---: |
+| Cull and compaction | 5.47 ms | 5.35 ms | 1.70 ms |
+| Shade (and project) | 9.58 ms | 10.43 ms | 1.80 ms |
+| Radix sort | 8.22 ms | 8.02 ms | 7.06 ms |
+| Gather | 9.05 ms | 4.06 ms | 1.93 ms |
+| Whole preparation | 32.02 ms | 27.83 ms | 13.00 ms |
+
+OpenGL now has the structure Metal has. `OpenGlViewPreparationCore` holds the
+programs, buffers and dispatch sequence with no Ogre in it; the display's
+adapter supplies Ogre's instance and indirect buffers, and
+`test/verify_gl_preparation.cpp` drives the core headless through EGL on the
+cases `verify_gpu_preparation.mm` runs, sharing its scenes and CPU reference
+through `test/preparation_test_scenes.hpp`. Besides exact order, keys, colours
+and quads it checks that the GPU sorted its own keys stably and, for stock Ogre,
+that instance slots past the visible count are empty. Its first run found the
+depth keys a quarter of the time an ulp or more from the CPU's, by up to 46,000
+ulp where the depth cancels to near zero: GLSL had contracted dot() into FMAs,
+which a baseline x86-64 build of the CPU path does not. The culling and key
+arithmetic now follows prepareSplat() term by term under `precise`, and every
+case agrees exactly on the RTX 4090. A CPU build that does contract, as GCC
+does for AArch64, can still differ in the last ulp. OpenGL stages are timed
+with timestamp queries under `GSPLAT_PROFILE_GPU`, like Metal, and bind at most
+eight storage blocks, the most OpenGL guarantees.
 
 Still open:
 
 - Degree-3 SH is uploaded as float32, about 1 GiB at this count. Uploads now
   reuse the buffers in place, but the precision question is undecided: half
   precision would halve it at the cost of exact agreement with the CPU colours.
-- The gather still reads each survivor's record and colour in depth order,
-  9 ms on the M3 and 21-24 ms on the RTX 4090 at Garden scale. Projecting before
-  the sort as well, into compacted slots, would leave the gather a permutation
-  of a buffer the size of the visible set, at 48 bytes per splat of scratch.
-- The OpenGL path's depth keys differ from the CPU's on about a quarter of the
-  visible splats on the RTX 4090, by up to 6260 ulp on near-zero depths, which
-  moves splats at most four places in the order; 157 projected quads also fall
-  outside tolerance. Most likely different FMA contraction in GLSL, which the
-  `precise` qualifier would pin. OpenGL has no offline verifier yet.
+- Projection before the sort is measured on synthetic scenes only; the full
+  Garden PLY in RViz has yet to be timed with it.
+- On the RTX 4090 the radix sort is now the largest stage, 7 ms of 13. GLSL
+  ranks the 32 lanes of a tile by looping over them, where Metal uses
+  simd_ballot; subgroup ballot, where the driver has it, is the next thing to
+  try there.
 - Frame pacing is the next target: the sort could be spread over several frames
   in slices, with the gather re-projecting the last completed order every
   frame. That needs a guard band on the culling, since a stale cull would

@@ -138,7 +138,9 @@ if(GSPLAT_METAL_PREPARATION)
 endif()
 
 if(GSPLAT_OPENGL_PREPARATION)
-  target_sources(${PROJECT_NAME} PRIVATE src/opengl_view_preparation.cpp)
+  target_sources(${PROJECT_NAME} PRIVATE
+    src/opengl_view_preparation.cpp
+    src/opengl_view_preparation_core.cpp)
   target_link_libraries(${PROJECT_NAME} OpenGL::GL)
   target_link_libraries(${PROJECT_NAME} ${CMAKE_DL_LIBS})
   target_link_libraries(${PROJECT_NAME} "${OGRE_GL_LIBRARY}")
@@ -235,6 +237,30 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/ogre_media/materials/programs/Metal/gsplat_prepare.metal")
     # A machine with no Metal device skips rather than fails.
     set_tests_properties(verify_gpu_preparation PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+
+  if(GSPLAT_OPENGL_PREPARATION)
+    # The same check for the OpenGL compute stages, run headless through EGL;
+    # see test/verify_gl_preparation.cpp. GLEW loads the entry points the core
+    # takes from Ogre's copy of it in the display.
+    find_package(OpenGL QUIET COMPONENTS OpenGL EGL)
+    find_package(GLEW QUIET)
+    if(TARGET OpenGL::EGL AND TARGET OpenGL::OpenGL AND TARGET GLEW::GLEW)
+      add_executable(verify_gl_preparation
+        test/verify_gl_preparation.cpp
+        src/opengl_view_preparation_core.cpp)
+      target_include_directories(verify_gl_preparation PRIVATE include src)
+      target_compile_features(verify_gl_preparation PRIVATE cxx_std_17)
+      target_link_libraries(verify_gl_preparation
+        GLEW::GLEW OpenGL::EGL OpenGL::OpenGL ${CMAKE_DL_LIBS})
+      add_test(NAME verify_gl_preparation
+        COMMAND verify_gl_preparation --quick
+          "${CMAKE_CURRENT_SOURCE_DIR}/ogre_media/materials/programs/GLSL430/gsplat_prepare.comp")
+      # A machine with no OpenGL 4.3 context through EGL skips rather than fails.
+      set_tests_properties(verify_gl_preparation PROPERTIES SKIP_RETURN_CODE 77)
+    else()
+      message(STATUS "EGL or GLEW not found; not building verify_gl_preparation")
+    endif()
   endif()
 endif()
 

@@ -274,7 +274,7 @@ private:
         });
     times.shade_ms = stage(@"Gaussian splat preparation: shade",
         [&](id<MTLComputeCommandEncoder> encoder) {
-          core_->encodeShade(encoder, parameters);
+          core_->encodeShade(encoder, parameters, projection);
           return true;
         });
     times.sort_ms = stage(@"Gaussian splat preparation: sort",
@@ -287,7 +287,7 @@ private:
           if (!sorted) {
             return false;
           }
-          core_->encodeGather(encoder, projection, sorted, instances);
+          core_->encodeGather(encoder, sorted, instances);
           return true;
         });
     if (!ok) {
@@ -325,19 +325,22 @@ private:
         q.worldviewproj_rows[r * 4 + 3]);
     }
     id<MTLBuffer> splats = core_->splatBuffer();
-    if (!sorted.contents || !instances.contents || !splats.contents) {
+    id<MTLBuffer> slots = core_->slotSplatBuffer();
+    if (!sorted.contents || !instances.contents || !splats.contents || !slots.contents) {
       std::fprintf(stderr, "[gsplat debug]   buffers are not CPU-visible (sorted %p instances %p "
-        "splats %p)\n", sorted.contents, instances.contents, splats.contents);
+        "splats %p slots %p)\n", sorted.contents, instances.contents, splats.contents,
+        slots.contents);
       return;
     }
     const auto * pairs = static_cast<const std::uint32_t *>(sorted.contents);
+    const auto * slot_splats = static_cast<const std::uint32_t *>(slots.contents);
     const auto * drawn = static_cast<const ProjectedInstance *>(instances.contents);
     const auto * records = static_cast<const SplatRecord *>(splats.contents);
     const std::uint32_t visible = state->visible;
     const std::uint32_t picks[3] = {0u, visible / 2u, visible > 0 ? visible - 1u : 0u};
     for (std::uint32_t k = 0; k < (visible > 0 ? 3u : 0u); ++k) {
       const std::uint32_t output = picks[k];
-      const std::uint32_t index = pairs[2 * output + 1];
+      const std::uint32_t index = slot_splats[pairs[2 * output + 1]];
       const SplatRecord & record = records[index];
       const float no_colour[3] = {0.0f, 0.0f, 0.0f};
       ProjectedInstance cpu;
