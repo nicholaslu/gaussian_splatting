@@ -113,7 +113,8 @@ float transformRow(vec4 row, vec3 point)
 }
 
 #if defined(GSPLAT_STAGE_COMPACT_SCAN) || defined(GSPLAT_STAGE_RADIX_SCAN_OFFSETS) || \
-  defined(GSPLAT_STAGE_RADIX_SCAN_BASES)
+  defined(GSPLAT_STAGE_RADIX_SCAN_BASES) || defined(GSPLAT_STAGE_RASTER_BIN_COUNT) || \
+  defined(GSPLAT_STAGE_RASTER_BIN_SCAN) || defined(GSPLAT_STAGE_RASTER_BIN_EMIT)
 // The scans run 256 lanes wide and walk a row 256 entries at a time. Each lane
 // looping over a whole row by itself, as these stages once did, cost 4-5 ms of
 // a 5-7 ms sort on an RTX 4090: a few hundred threads with long dependent loops
@@ -162,6 +163,60 @@ uint workgroupInclusiveScan(uint value)
       barrier(); \
     } \
   }
+#endif
+
+
+#if defined(GSPLAT_STAGE_RASTER_BIN_COUNT) || defined(GSPLAT_STAGE_RASTER_BIN_SCAN) || \
+  defined(GSPLAT_STAGE_RASTER_BIN_EMIT) || defined(GSPLAT_STAGE_RASTER_CLEAR_RANGES) || \
+  defined(GSPLAT_STAGE_RASTER_TILES)
+// Tile rasterisation, as in gsplat_prepare.metal: the draw stream GATHER wrote,
+// composited front to back by compute, 16x16 pixels per workgroup.
+const uint kRasterTile = 16u;
+const float kTransmittanceEnd = 0.0001;
+
+struct RasterParameters
+{
+  uint width;
+  uint height;
+  uint tiles_x;
+  uint tiles_y;
+  uint pair_capacity;
+  uint pair_tile_capacity;
+  uint flip_y;
+  float depth_min;
+};
+
+// The tiles holding a pixel centre the quad covers, as (x0, y0, x1, y1); see
+// tileBounds() in gsplat_prepare.metal.
+bool tileBounds(ProjectedInstance q, RasterParameters r, out uvec4 tiles)
+{
+  tiles = uvec4(0u);
+  if (q.centre_radius.w <= 0.0 || q.centre_radius.z > 1.0 || q.centre_radius.z < r.depth_min) {
+    return false;
+  }
+  vec2 size = vec2(r.width, r.height);
+  vec2 centre = (q.centre_radius.xy * 0.5 + 0.5) * size;
+  if (r.flip_y != 0u) {
+    centre.y = size.y - centre.y;
+  }
+  vec2 extent = (abs(q.axes.xy) + abs(q.axes.zw)) * 0.5 * size;
+  vec2 low = ceil(centre - extent - 0.5);
+  vec2 high = floor(centre + extent - 0.5);
+  if (!all(lessThanEqual(low, high)) || !all(greaterThanEqual(high, vec2(0.0))) ||
+    !all(lessThan(low, size)))
+  {
+    return false;
+  }
+  uvec2 first = uvec2(max(low, vec2(0.0))) / kRasterTile;
+  uvec2 last = uvec2(min(high, size - 1.0)) / kRasterTile;
+  tiles = uvec4(first, last);
+  return true;
+}
+
+uint tileCount(uvec4 tiles)
+{
+  return (tiles.z - tiles.x + 1u) * (tiles.w - tiles.y + 1u);
+}
 #endif
 
 #if defined(GSPLAT_STAGE_MAKE_DEPTH_KEYS)
@@ -730,6 +785,281 @@ void main()
   instances[slot].centre_radius = vec4(0.0, 0.0, 2.0, 0.0);
   instances[slot].axes = vec4(0.0);
   instances[slot].colour = vec4(0.0);
+}
+
+#elif defined(GSPLAT_STAGE_RASTER_BIN_COUNT)
+// Tiles per splat, summed over each workgroup of 256 splats in draw order.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Instances {ProjectedInstance instances[];};
+layout(std430, binding = 1) readonly buffer State {PreparationState state;};
+layout(std430, binding = 2) writeonly buffer BlockSums {uint block_sums[];};
+layout(std430, binding = 3) readonly buffer RasterBlock {RasterParameters r;};
+
+void main()
+{
+  uint i = gl_GlobalInvocationID.x;
+  uint count = 0u;
+  uvec4 tiles;
+  if (i < state.visible && tileBounds(instances[i], r, tiles)) {
+    count = tileCount(tiles);
+  }
+  uint inclusive = workgroupInclusiveScan(count);
+  if (gl_LocalInvocationID.x == kScanWidth - 1u) {
+    block_sums[gl_WorkGroupID.x] = inclusive;
+  }
+}
+
+#elif defined(GSPLAT_STAGE_RASTER_BIN_SCAN)
+// Where each workgroup's pairs start, the pair count, and the dispatches the
+// tile sort and the tile ranges run from.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BlockSums {uint block_sums[];};
+layout(std430, binding = 1) writeonly buffer BlockOffsets {uint block_offsets[];};
+layout(std430, binding = 2) readonly buffer State {PreparationState state;};
+layout(std430, binding = 3) writeonly buffer RasterState {PreparationState raster_state;};
+layout(std430, binding = 4) writeonly buffer SortDispatch {uint sort_dispatch[3];};
+layout(std430, binding = 5) writeonly buffer PairDispatch {uint pair_dispatch[3];};
+layout(std430, binding = 6) readonly buffer RasterBlock {RasterParameters r;};
+
+uint loadSum(uint block)
+{
+  return block_sums[block];
+}
+
+void storeOffset(uint block, uint offset)
+{
+  block_offsets[block] = offset;
+}
+
+void main()
+{
+  GSPLAT_SCAN_ROW(state.gather_groups, loadSum, storeOffset)
+  if (gl_LocalInvocationID.x != 0u) {
+    return;
+  }
+  // Pairs past the capacity are dropped; `written` keeps the full count.
+  uint pairs = min(scan_carry, r.pair_capacity);
+  uint pair_tiles = (pairs + 1023u) / 1024u;
+  uint pair_groups = (pairs + kScanWidth - 1u) / kScanWidth;
+  raster_state.visible = pairs;
+  raster_state.visible_tiles = pair_tiles;
+  raster_state.gather_groups = pair_groups;
+  raster_state.written = scan_carry;
+  raster_state.clear_end = 0u;
+  sort_dispatch[0] = max(pair_tiles, 1u);
+  sort_dispatch[1] = 1u;
+  sort_dispatch[2] = 1u;
+  pair_dispatch[0] = max(pair_groups, 1u);
+  pair_dispatch[1] = 1u;
+  pair_dispatch[2] = 1u;
+}
+
+#elif defined(GSPLAT_STAGE_RASTER_BIN_EMIT)
+// A (tile, draw position) pair per tile each splat's quad touches, in draw
+// order, so that a sort stable on the tile keeps each tile's pairs in it.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Instances {ProjectedInstance instances[];};
+layout(std430, binding = 1) readonly buffer State {PreparationState state;};
+layout(std430, binding = 2) readonly buffer BlockOffsets {uint block_offsets[];};
+layout(std430, binding = 3) readonly buffer RasterBlock {RasterParameters r;};
+layout(std430, binding = 4) writeonly buffer Pairs {uvec2 pairs[];};
+
+void main()
+{
+  uint i = gl_GlobalInvocationID.x;
+  uint count = 0u;
+  uvec4 tiles = uvec4(0u);
+  if (i < state.visible && tileBounds(instances[i], r, tiles)) {
+    count = tileCount(tiles);
+  }
+  uint inclusive = workgroupInclusiveScan(count);
+  if (count == 0u) {
+    return;
+  }
+  uint cursor = block_offsets[gl_WorkGroupID.x] + inclusive - count;
+  for (uint y = tiles.y; y <= tiles.w; ++y) {
+    for (uint x = tiles.x; x <= tiles.z; ++x) {
+      if (cursor < r.pair_capacity) {
+        pairs[cursor] = uvec2(y * r.tiles_x + x, i);
+      }
+      ++cursor;
+    }
+  }
+}
+
+#elif defined(GSPLAT_STAGE_RASTER_CLEAR_RANGES)
+// Each tile's run of pairs, as a start and an end word; see RASTER_TILE_RANGES.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) writeonly buffer Ranges {uint ranges[];};
+layout(std430, binding = 1) readonly buffer RasterBlock {RasterParameters r;};
+
+void main()
+{
+  uint word = gl_GlobalInvocationID.x;
+  if (word < 2u * r.tiles_x * r.tiles_y) {
+    ranges[word] = 0u;
+  }
+}
+
+#elif defined(GSPLAT_STAGE_RASTER_TILE_RANGES)
+// Starts and ends are separate words, since different invocations write them.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Pairs {uvec2 pairs[];};
+layout(std430, binding = 1) readonly buffer RasterState {PreparationState raster_state;};
+layout(std430, binding = 2) writeonly buffer Ranges {uint ranges[];};
+
+void main()
+{
+  uint j = gl_GlobalInvocationID.x;
+  uint count = raster_state.visible;
+  if (j >= count) {
+    return;
+  }
+  uint tile = pairs[j].x;
+  if (j == 0u || pairs[j - 1u].x != tile) {
+    ranges[2u * tile] = j;
+  }
+  if (j + 1u == count || pairs[j + 1u].x != tile) {
+    ranges[2u * tile + 1u] = j + 1u;
+  }
+}
+
+#elif defined(GSPLAT_STAGE_RASTER_TILES)
+// One workgroup per tile, one invocation per pixel, the tile's pairs staged in
+// shared memory 256 at a time and walked front to back; see raster_tiles in
+// gsplat_prepare.metal. With subgroup ballots, each 32-wide subgroup holds an
+// 8x4 block of the tile and first lists the splats of a batch that reach it.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Pairs {uvec2 pairs[];};
+layout(std430, binding = 1) readonly buffer Ranges {uint ranges[];};
+layout(std430, binding = 2) readonly buffer Instances {ProjectedInstance instances[];};
+layout(std430, binding = 3) readonly buffer RasterBlock {RasterParameters r;};
+layout(rgba8, binding = 0) writeonly uniform image2D output_image;
+
+shared vec4 batch_quad[256];    // centre, u
+shared vec4 batch_shape[256];   // v, half_radius_squared, opacity
+shared vec4 batch_colour[256];
+shared ivec4 batch_box[256];    // covered pixels, first and last, inclusive
+shared uint finished;
+#if defined(GSPLAT_SUBGROUP_BALLOT)
+shared uint block_list[8][256];
+#endif
+
+void main()
+{
+  uint lane = gl_LocalInvocationID.x;
+  uint group = lane / 32u;
+  uint group_lane = lane % 32u;
+#if defined(GSPLAT_SUBGROUP_BALLOT)
+  bool listing = gl_SubgroupSize == 32u && gl_NumSubgroups == 8u;
+  if (listing) {
+    group = gl_SubgroupID;
+    group_lane = gl_SubgroupInvocationID;
+  }
+#endif
+  uvec2 tile = gl_WorkGroupID.xy;
+  uvec2 block = tile * kRasterTile + uvec2((group & 1u) * 8u, (group >> 1u) * 4u);
+  uvec2 pixel = block + uvec2(group_lane & 7u, group_lane >> 3u);
+  bool inside = pixel.x < r.width && pixel.y < r.height;
+  vec2 position = vec2(pixel) + 0.5;
+  uint index = tile.y * r.tiles_x + tile.x;
+  uint range_start = ranges[2u * index];
+  uint range_end = ranges[2u * index + 1u];
+  float transmittance = 1.0;
+  vec3 colour = vec3(0.0);
+  bool done = !inside;
+  vec2 size = vec2(r.width, r.height);
+
+  // The pairs are in draw order, back to front; walk them from the end.
+  for (uint top = range_end; top > range_start; ) {
+    uint batch = min(256u, top - range_start);
+    if (lane == 0u) {
+      finished = 0u;
+    }
+    barrier();
+    if (lane < batch) {
+      ProjectedInstance q = instances[pairs[top - 1u - lane].y];
+      vec2 centre = (q.centre_radius.xy * 0.5 + 0.5) * size;
+      vec2 a1 = q.axes.xy * 0.5 * size;
+      vec2 a2 = q.axes.zw * 0.5 * size;
+      if (r.flip_y != 0u) {
+        centre.y = size.y - centre.y;
+        a1.y = -a1.y;
+        a2.y = -a2.y;
+      }
+      float l1 = dot(a1, a1);
+      float l2 = dot(a2, a2);
+      batch_quad[lane] = vec4(centre, l1 > 0.0 ? a1 / l1 : vec2(0.0));
+      batch_shape[lane] = vec4(l2 > 0.0 ? a2 / l2 : vec2(0.0),
+        0.5 * q.centre_radius.w * q.centre_radius.w, l1 > 0.0 && l2 > 0.0 ? q.colour.w : 0.0);
+      batch_colour[lane] = vec4(q.colour.xyz, 0.0);
+      vec2 extent = abs(a1) + abs(a2);
+      batch_box[lane] = ivec4(
+        clamp(ceil(centre - extent - 0.5), -1.0, 32767.0),
+        clamp(floor(centre + extent - 0.5), -1.0, 32767.0));
+    }
+    if (done) {
+      atomicAdd(finished, 1u);
+    }
+    memoryBarrierShared();
+    barrier();
+    if (finished == 256u) {
+      break;
+    }
+
+#if defined(GSPLAT_SUBGROUP_BALLOT)
+    uint listed = batch;
+    if (listing) {
+      // This subgroup's list, in batch order.
+      listed = 0u;
+      ivec4 mine = ivec4(ivec2(block), ivec2(block + uvec2(7u, 3u)));
+      for (uint first = 0u; first < batch; first += 32u) {
+        uint k = first + group_lane;
+        bool reaches = false;
+        if (k < batch) {
+          ivec4 box = batch_box[k];
+          reaches = box.x <= mine.z && box.z >= mine.x && box.y <= mine.w && box.w >= mine.y;
+        }
+        uint votes = subgroupBallot(reaches).x;
+        if (reaches) {
+          block_list[group][listed + bitCount(votes & ((1u << group_lane) - 1u))] = k;
+        }
+        listed += bitCount(votes);
+      }
+      subgroupMemoryBarrierShared();
+      subgroupBarrier();
+    }
+    for (uint n = 0u; n < listed && !done; ++n) {
+      uint k = listing ? block_list[group][n] : n;
+#else
+    for (uint k = 0u; k < batch && !done; ++k) {
+#endif
+      vec4 quad = batch_quad[k];
+      vec4 shape = batch_shape[k];
+      vec2 offset = position - quad.xy;
+      float cu = dot(offset, quad.zw);
+      float cv = dot(offset, shape.xy);
+      if (abs(cu) > 1.0 || abs(cv) > 1.0) {
+        continue;
+      }
+      float alpha = min(0.99, shape.w * exp(-shape.z * (cu * cu + cv * cv)));
+      if (alpha < 1.0 / 255.0) {
+        continue;
+      }
+      float next = transmittance * (1.0 - alpha);
+      if (next < kTransmittanceEnd) {
+        done = true;
+        break;
+      }
+      colour += batch_colour[k].xyz * (alpha * transmittance);
+      transmittance = next;
+    }
+    barrier();
+    top -= batch;
+  }
+  if (inside) {
+    imageStore(output_image, ivec2(pixel), vec4(colour, 1.0 - transmittance));
+  }
 }
 
 #else

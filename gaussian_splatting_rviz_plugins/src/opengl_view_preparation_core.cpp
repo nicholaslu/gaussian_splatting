@@ -264,6 +264,19 @@ OpenGlViewPreparationCore::OpenGlViewPreparationCore(
   programs_[8] = compile("GSPLAT_STAGE_GATHER");
   programs_[9] = compile("GSPLAT_STAGE_CLEAR_TAIL");
   programs_[10] = compile("GSPLAT_STAGE_SHADE_PROJECT");
+
+  // Optional: a failure here leaves preparation working and rasterReady() false.
+  if (ready()) {
+    const char * raster_stages[6] = {
+      "GSPLAT_STAGE_RASTER_BIN_COUNT", "GSPLAT_STAGE_RASTER_BIN_SCAN",
+      "GSPLAT_STAGE_RASTER_BIN_EMIT", "GSPLAT_STAGE_RASTER_CLEAR_RANGES",
+      "GSPLAT_STAGE_RASTER_TILE_RANGES", "GSPLAT_STAGE_RASTER_TILES"};
+    for (std::size_t i = 0; i < raster_programs_.size(); ++i) {
+      raster_programs_[i] = compile(raster_stages[i]);
+    }
+    raster_error_ = error_;
+    error_.clear();
+  }
 }
 
 OpenGlViewPreparationCore::~OpenGlViewPreparationCore()
@@ -271,6 +284,11 @@ OpenGlViewPreparationCore::~OpenGlViewPreparationCore()
   clear();
   setProfiling(false);
   for (GLuint program : programs_) {
+    if (program != 0u) {
+      glDeleteProgram(program);
+    }
+  }
+  for (GLuint program : raster_programs_) {
     if (program != 0u) {
       glDeleteProgram(program);
     }
@@ -394,7 +412,9 @@ void OpenGlViewPreparationCore::clear()
   for (GLuint * buffer : {&splats_, &sh_dc_, &sh_rest_, &keys_a_, &keys_b_, &tile_counts_,
       &tile_offsets_, &histograms_, &offsets_, &totals_, &digit_bases_, &state_, &tile_dispatch_,
       &gather_dispatch_, &clear_dispatch_, &projected_, &draw_arguments_, &view_parameters_,
-      &projection_parameters_})
+      &projection_parameters_, &raster_parameters_, &block_sums_, &block_offsets_,
+      &raster_state_, &raster_sort_dispatch_, &raster_pair_dispatch_, &pairs_a_, &pairs_b_,
+      &raster_histograms_, &raster_offsets_, &ranges_})
   {
     if (*buffer != 0u) {
       glDeleteBuffers(1, buffer);
@@ -405,6 +425,8 @@ void OpenGlViewPreparationCore::clear()
   tile_count_ = 0u;
   index_count_ = 0u;
   scratch_bytes_ = 0u;
+  raster_ = RasterParameters{};
+  raster_key_bits_ = 0u;
   readback_cursor_ = 0u;
   last_visible_ = -1;
 }
@@ -515,40 +537,9 @@ bool OpenGlViewPreparationCore::encode(
   mark(2);
 
   // Four passes, so the sorted pairs end in keys_a_ again; sortedBuffer().
-  GLuint input = keys_a_;
-  GLuint output = keys_b_;
-  for (std::uint32_t shift = 0; shift < 32u; shift += 8u) {
-    const std::size_t pass_mark = kMarkRadix + 4u * (shift / 8u);
-    use(programs_[4]);
-    bind(0, input); bind(1, histograms_); bind(2, state_);
-    uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
-    uniform("shift", shift);
-    dispatchIndirect(tile_dispatch_);
-    storageBarrier();
-    mark(pass_mark);
-
-    use(programs_[5]);
-    bind(0, histograms_); bind(1, offsets_); bind(2, totals_); bind(3, state_);
-    uniform("tile_count", tile_count_);
-    glDispatchCompute(kRadix, 1, 1);
-    storageBarrier();
-    mark(pass_mark + 1u);
-
-    use(programs_[6]);
-    bind(0, totals_); bind(1, digit_bases_);
-    glDispatchCompute(1, 1, 1);
-    storageBarrier();
-    mark(pass_mark + 2u);
-
-    use(programs_[7]);
-    bind(0, input); bind(1, output); bind(2, offsets_); bind(3, digit_bases_); bind(4, state_);
-    uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
-    uniform("shift", shift);
-    dispatchIndirect(tile_dispatch_);
-    storageBarrier();
-    mark(pass_mark + 3u);
-    std::swap(input, output);
-  }
+  const GLuint input = radix(
+    keys_a_, keys_b_, state_, tile_dispatch_, histograms_, offsets_, tile_count_, 32u,
+    kMarkRadix);
   mark(3);
 
   use(programs_[8]);
@@ -584,6 +575,201 @@ bool OpenGlViewPreparationCore::encode(
   return true;
 }
 
+GLuint OpenGlViewPreparationCore::radix(
+  GLuint input, GLuint output, GLuint state, GLuint dispatch, GLuint histograms,
+  GLuint offsets, std::uint32_t tile_count, std::uint32_t key_bits, std::size_t first_mark)
+{
+  for (std::uint32_t shift = 0; shift < key_bits; shift += 8u) {
+    const std::size_t pass_mark = first_mark + 4u * (shift / 8u);
+    const auto step_mark = [&](std::size_t step) {
+        if (first_mark != 0u) {
+          mark(pass_mark + step);
+        }
+      };
+    use(programs_[4]);
+    bind(0, input); bind(1, histograms); bind(2, state);
+    uniform("tile_count", tile_count); uniform("elements_per_tile", kElementsPerTile);
+    uniform("shift", shift);
+    dispatchIndirect(dispatch);
+    storageBarrier();
+    step_mark(0u);
+
+    use(programs_[5]);
+    bind(0, histograms); bind(1, offsets); bind(2, totals_); bind(3, state);
+    uniform("tile_count", tile_count);
+    glDispatchCompute(kRadix, 1, 1);
+    storageBarrier();
+    step_mark(1u);
+
+    use(programs_[6]);
+    bind(0, totals_); bind(1, digit_bases_);
+    glDispatchCompute(1, 1, 1);
+    storageBarrier();
+    step_mark(2u);
+
+    use(programs_[7]);
+    bind(0, input); bind(1, output); bind(2, offsets); bind(3, digit_bases_); bind(4, state);
+    uniform("tile_count", tile_count); uniform("elements_per_tile", kElementsPerTile);
+    uniform("shift", shift);
+    dispatchIndirect(dispatch);
+    storageBarrier();
+    step_mark(3u);
+    std::swap(input, output);
+  }
+  return input;
+}
+
+bool OpenGlViewPreparationCore::rasterReady() const
+{
+  return std::all_of(raster_programs_.begin(), raster_programs_.end(), [](GLuint program) {
+             return program != 0u;
+           });
+}
+
+bool OpenGlViewPreparationCore::configureRaster(
+  std::uint32_t width, std::uint32_t height, std::uint32_t pair_capacity)
+{
+  if (!ready() || count_ == 0u) {
+    error_ = "configure the preparation before the rasteriser";
+    return false;
+  }
+  if (!rasterReady()) {
+    error_ = raster_error_.empty() ? "the tile rasteriser did not compile" : raster_error_;
+    return false;
+  }
+  if (width == 0u || height == 0u || pair_capacity == 0u) {
+    error_ = "the tile rasteriser needs a non-empty target";
+    return false;
+  }
+  for (GLuint * buffer : {&raster_parameters_, &block_sums_, &block_offsets_, &raster_state_,
+      &raster_sort_dispatch_, &raster_pair_dispatch_, &pairs_a_, &pairs_b_,
+      &raster_histograms_, &raster_offsets_, &ranges_})
+  {
+    if (*buffer != 0u) {
+      glDeleteBuffers(1, buffer);
+      *buffer = 0u;
+    }
+  }
+  const std::uint32_t tiles_x = (width + 15u) / 16u;
+  const std::uint32_t tiles_y = (height + 15u) / 16u;
+  const std::uint32_t pair_tiles = (pair_capacity + kElementsPerTile - 1u) / kElementsPerTile;
+  raster_ = RasterParameters{width, height, tiles_x, tiles_y, pair_capacity, pair_tiles, 0u,
+    -1.0f};
+  raster_key_bits_ = 8u;
+  while (raster_key_bits_ < 32u &&
+    (std::uint64_t(1) << raster_key_bits_) < std::uint64_t(tiles_x) * tiles_y)
+  {
+    raster_key_bits_ += 8u;
+  }
+  const std::size_t blocks = groups(count_, kGatherWidth);
+  const std::size_t pair_bytes = std::size_t(pair_capacity) * sizeof(std::uint32_t) * 2u;
+  const std::size_t table_bytes = std::size_t(pair_tiles) * kRadix * sizeof(std::uint32_t);
+  if (!fitsStorageBlock(pair_bytes) || !fitsStorageBlock(table_bytes)) {
+    error_ = "the tile pairs exceed GL_MAX_SHADER_STORAGE_BLOCK_SIZE";
+    return false;
+  }
+  raster_parameters_ = newBuffer(sizeof(RasterParameters), GL_STATIC_DRAW);
+  block_sums_ = newBuffer(blocks * sizeof(std::uint32_t), GL_DYNAMIC_COPY);
+  block_offsets_ = newBuffer(blocks * sizeof(std::uint32_t), GL_DYNAMIC_COPY);
+  raster_state_ = newBuffer(sizeof(State), GL_DYNAMIC_COPY);
+  raster_sort_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
+  raster_pair_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
+  pairs_a_ = newBuffer(pair_bytes, GL_DYNAMIC_COPY);
+  pairs_b_ = newBuffer(pair_bytes, GL_DYNAMIC_COPY);
+  raster_histograms_ = newBuffer(table_bytes, GL_DYNAMIC_COPY);
+  raster_offsets_ = newBuffer(table_bytes, GL_DYNAMIC_COPY);
+  ranges_ = newBuffer(std::size_t(tiles_x) * tiles_y * sizeof(std::uint32_t) * 2u,
+      GL_DYNAMIC_COPY);
+  if (!raster_parameters_ || !block_sums_ || !block_offsets_ || !raster_state_ ||
+    !raster_sort_dispatch_ || !raster_pair_dispatch_ || !pairs_a_ || !pairs_b_ ||
+    !raster_histograms_ || !raster_offsets_ || !ranges_)
+  {
+    return false;
+  }
+  updateBuffer(raster_parameters_, &raster_, sizeof(raster_));
+  const State empty{};
+  updateBuffer(raster_state_, &empty, sizeof(empty));
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  error_.clear();
+  return true;
+}
+
+void OpenGlViewPreparationCore::encodeRasterBin(GLuint instances)
+{
+  use(raster_programs_[0]);
+  bind(0, instances); bind(1, state_); bind(2, block_sums_); bind(3, raster_parameters_);
+  dispatchIndirect(gather_dispatch_);
+  storageBarrier();
+
+  use(raster_programs_[1]);
+  bind(0, block_sums_); bind(1, block_offsets_); bind(2, state_); bind(3, raster_state_);
+  bind(4, raster_sort_dispatch_); bind(5, raster_pair_dispatch_); bind(6, raster_parameters_);
+  glDispatchCompute(1, 1, 1);
+  glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+
+  use(raster_programs_[2]);
+  bind(0, instances); bind(1, state_); bind(2, block_offsets_); bind(3, raster_parameters_);
+  bind(4, pairs_a_);
+  dispatchIndirect(gather_dispatch_);
+  storageBarrier();
+}
+
+GLuint OpenGlViewPreparationCore::encodeRasterSort()
+{
+  return radix(
+    pairs_a_, pairs_b_, raster_state_, raster_sort_dispatch_, raster_histograms_,
+    raster_offsets_, raster_.pair_tile_capacity, raster_key_bits_, 0u);
+}
+
+void OpenGlViewPreparationCore::encodeRasterTiles(
+  GLuint sorted_pairs, GLuint instances, GLuint texture)
+{
+  use(raster_programs_[3]);
+  bind(0, ranges_); bind(1, raster_parameters_);
+  glDispatchCompute(groups(2u * raster_.tiles_x * raster_.tiles_y, 256u), 1, 1);
+  storageBarrier();
+
+  use(raster_programs_[4]);
+  bind(0, sorted_pairs); bind(1, raster_state_); bind(2, ranges_);
+  dispatchIndirect(raster_pair_dispatch_);
+  storageBarrier();
+
+  use(raster_programs_[5]);
+  bind(0, sorted_pairs); bind(1, ranges_); bind(2, instances); bind(3, raster_parameters_);
+  glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+  glDispatchCompute(raster_.tiles_x, raster_.tiles_y, 1);
+  glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
+    GL_FRAMEBUFFER_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
+  glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+}
+
+bool OpenGlViewPreparationCore::encodeRaster(GLuint instances, GLuint texture)
+{
+  if (!rasterReady() || !raster_state_ || !instances || !texture) {
+    error_ = "the tile rasteriser is not configured";
+    return false;
+  }
+  GLint previous_program = 0;
+  glGetIntegerv(GL_CURRENT_PROGRAM, &previous_program);
+  encodeRasterBin(instances);
+  encodeRasterTiles(encodeRasterSort(), instances, texture);
+  for (GLuint binding = 0; binding < 8; ++binding) {
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, 0);
+  }
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+  glUseProgram(static_cast<GLuint>(previous_program));
+  const GLenum gl_error = glGetError();
+  if (gl_error != GL_NO_ERROR) {
+    std::ostringstream message;
+    message << "OpenGL tile rasterisation failed with error 0x" << std::hex << gl_error;
+    error_ = message.str();
+    return false;
+  }
+  error_.clear();
+  return true;
+}
+
 std::size_t OpenGlViewPreparationCore::scratchBytes() const
 {
   return scratch_bytes_;
@@ -596,7 +782,8 @@ GLuint OpenGlViewPreparationCore::compile(const char * stage)
   }
   const std::string stage_name(stage);
   const bool ballots = subgroup_ballot_ &&
-    (stage_name == "GSPLAT_STAGE_COMPACT_SCATTER" || stage_name == "GSPLAT_STAGE_RADIX_SCATTER");
+    (stage_name == "GSPLAT_STAGE_COMPACT_SCATTER" || stage_name == "GSPLAT_STAGE_RADIX_SCATTER" ||
+    stage_name == "GSPLAT_STAGE_RASTER_TILES");
   const std::string source = std::string("#version 430\n") +
     (ballots ?
     "#extension GL_KHR_shader_subgroup_basic : require\n"

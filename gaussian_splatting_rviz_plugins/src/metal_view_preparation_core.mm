@@ -88,6 +88,12 @@ MetalViewPreparationCore::MetalViewPreparationCore(
     scatter_pipeline_ = makePipeline(@"radix_scatter", Dispatch::kSimdRanked);
     shade_pipeline_ = makePipeline(@"shade_project", Dispatch::kLinear);
     gather_pipeline_ = makePipeline(@"gather_instances", Dispatch::kLinear);
+    bin_count_pipeline_ = makePipeline(@"raster_bin_count", Dispatch::kScan);
+    bin_scan_pipeline_ = makePipeline(@"raster_bin_scan", Dispatch::kScan);
+    bin_emit_pipeline_ = makePipeline(@"raster_bin_emit", Dispatch::kScan);
+    clear_ranges_pipeline_ = makePipeline(@"raster_clear_ranges", Dispatch::kLinear);
+    tile_ranges_pipeline_ = makePipeline(@"raster_tile_ranges", Dispatch::kLinear);
+    raster_pipeline_ = makePipeline(@"raster_tiles", Dispatch::kScan);
   }
 }
 
@@ -175,6 +181,18 @@ void MetalViewPreparationCore::clear()
   gather_dispatch_ = nil;
   projected_ = nil;
   slot_splats_ = nil;
+  raster_ = RasterParameters{};
+  raster_key_bits_ = 0;
+  block_sums_ = nil;
+  block_offsets_ = nil;
+  raster_state_ = nil;
+  raster_sort_dispatch_ = nil;
+  raster_pair_dispatch_ = nil;
+  pairs_a_ = nil;
+  pairs_b_ = nil;
+  raster_histograms_ = nil;
+  raster_offsets_ = nil;
+  ranges_ = nil;
 }
 
 bool MetalViewPreparationCore::uploadStaticData(
@@ -286,26 +304,35 @@ id<MTLBuffer> MetalViewPreparationCore::encodeSort(
     error_ = "Metal sort is not configured, or the key width is not a whole number of bytes";
     return nil;
   }
-  id<MTLBuffer> input = keys_a_;
-  id<MTLBuffer> output = keys_b_;
+  return encodeRadix(
+    encoder, keys_a_, keys_b_, state_, tile_dispatch_, histograms_, offsets_, tile_count_,
+    key_bits);
+}
+
+id<MTLBuffer> MetalViewPreparationCore::encodeRadix(
+  id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input, id<MTLBuffer> output,
+  id<MTLBuffer> state, id<MTLBuffer> dispatch, id<MTLBuffer> histograms,
+  id<MTLBuffer> offsets, std::uint32_t tile_count, std::uint32_t key_bits)
+{
   for (std::uint32_t shift = 0; shift < key_bits; shift += 8u) {
-    const TileParameters radix{count_, tile_count_, kElementsPerTile, shift};
+    // `count` only sizes the tables; the kernels bound themselves by `state`.
+    const TileParameters radix{tile_count * kElementsPerTile, tile_count, kElementsPerTile, shift};
 
     [encoder setComputePipelineState:histogram_pipeline_];
     [encoder setBuffer:input offset:0 atIndex:0];
-    [encoder setBuffer:histograms_ offset:0 atIndex:1];
+    [encoder setBuffer:histograms offset:0 atIndex:1];
     [encoder setBytes:&radix length:sizeof(radix) atIndex:2];
-    [encoder setBuffer:state_ offset:0 atIndex:3];
-    [encoder dispatchThreadgroupsWithIndirectBuffer:tile_dispatch_ indirectBufferOffset:0
+    [encoder setBuffer:state offset:0 atIndex:3];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:dispatch indirectBufferOffset:0
                               threadsPerThreadgroup:MTLSizeMake(kThreadsPerTile, 1, 1)];
     barrier(encoder);
 
     [encoder setComputePipelineState:offset_pipeline_];
-    [encoder setBuffer:histograms_ offset:0 atIndex:0];
-    [encoder setBuffer:offsets_ offset:0 atIndex:1];
+    [encoder setBuffer:histograms offset:0 atIndex:0];
+    [encoder setBuffer:offsets offset:0 atIndex:1];
     [encoder setBuffer:totals_ offset:0 atIndex:2];
     [encoder setBytes:&radix length:sizeof(radix) atIndex:3];
-    [encoder setBuffer:state_ offset:0 atIndex:4];
+    [encoder setBuffer:state offset:0 atIndex:4];
     [encoder dispatchThreadgroups:MTLSizeMake(kRadix, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
     barrier(encoder);
@@ -320,11 +347,11 @@ id<MTLBuffer> MetalViewPreparationCore::encodeSort(
     [encoder setComputePipelineState:scatter_pipeline_];
     [encoder setBuffer:input offset:0 atIndex:0];
     [encoder setBuffer:output offset:0 atIndex:1];
-    [encoder setBuffer:offsets_ offset:0 atIndex:2];
+    [encoder setBuffer:offsets offset:0 atIndex:2];
     [encoder setBuffer:digit_bases_ offset:0 atIndex:3];
     [encoder setBytes:&radix length:sizeof(radix) atIndex:4];
-    [encoder setBuffer:state_ offset:0 atIndex:5];
-    [encoder dispatchThreadgroupsWithIndirectBuffer:tile_dispatch_ indirectBufferOffset:0
+    [encoder setBuffer:state offset:0 atIndex:5];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:dispatch indirectBufferOffset:0
                               threadsPerThreadgroup:MTLSizeMake(kThreadsPerTile, 1, 1)];
     barrier(encoder);
     std::swap(input, output);
@@ -399,6 +426,152 @@ void MetalViewPreparationCore::primeSortInput(std::uint32_t visible)
   dispatch[0] = std::max<std::uint32_t>(state->visible_tiles, 1u);
   dispatch[1] = 1u;
   dispatch[2] = 1u;
+}
+
+bool MetalViewPreparationCore::configureRaster(
+  std::uint32_t width, std::uint32_t height, std::uint32_t pair_capacity, bool flip_y,
+  float depth_min)
+{
+  if (!ready() || count_ == 0) {
+    error_ = "configure the preparation before the rasteriser";
+    return false;
+  }
+  if (!bin_count_pipeline_ || !bin_scan_pipeline_ || !bin_emit_pipeline_ ||
+    !clear_ranges_pipeline_ || !tile_ranges_pipeline_ || !raster_pipeline_)
+  {
+    return false;
+  }
+  // The binning kernels scan a threadgroup of kScanWidth splats, and run from
+  // the same indirect arguments as the gather.
+  if (gather_width_ != kScanWidth || width == 0 || height == 0 || pair_capacity == 0) {
+    error_ = "the tile rasteriser needs 256-wide threadgroups and a non-empty target";
+    return false;
+  }
+  // Its SIMD groups each hold an 8x4 block of a tile.
+  if (raster_pipeline_.threadExecutionWidth != kThreadsPerTile) {
+    error_ = "the tile rasteriser needs a SIMD width of 32";
+    return false;
+  }
+  const std::uint32_t tiles_x = (width + 15u) / 16u;
+  const std::uint32_t tiles_y = (height + 15u) / 16u;
+  const std::uint32_t pair_tiles = (pair_capacity + kElementsPerTile - 1u) / kElementsPerTile;
+  raster_ = RasterParameters{width, height, tiles_x, tiles_y, pair_capacity, pair_tiles,
+    flip_y ? 1u : 0u, depth_min};
+  raster_key_bits_ = 8u;
+  while (raster_key_bits_ < 32u && (1ull << raster_key_bits_) < std::uint64_t(tiles_x) * tiles_y) {
+    raster_key_bits_ += 8u;
+  }
+
+  const NSUInteger blocks = (count_ + kScanWidth - 1u) / kScanWidth;
+  const NSUInteger pairs = static_cast<NSUInteger>(pair_capacity) * sizeof(std::uint32_t) * 2u;
+  const NSUInteger tables = static_cast<NSUInteger>(pair_tiles) * kRadix * sizeof(std::uint32_t);
+  block_sums_ = newBuffer(blocks * sizeof(std::uint32_t), "raster block sums");
+  block_offsets_ = newBuffer(blocks * sizeof(std::uint32_t), "raster block offsets");
+  raster_state_ = newBuffer(sizeof(State), "raster state");
+  raster_sort_dispatch_ = newBuffer(sizeof(std::uint32_t) * 3u, "raster sort dispatch");
+  raster_pair_dispatch_ = newBuffer(sizeof(std::uint32_t) * 3u, "raster pair dispatch");
+  pairs_a_ = newBuffer(pairs, "raster pairs");
+  pairs_b_ = newBuffer(pairs, "raster staged pairs");
+  raster_histograms_ = newBuffer(tables, "raster radix histograms");
+  raster_offsets_ = newBuffer(tables, "raster radix offsets");
+  ranges_ = newBuffer(
+    static_cast<NSUInteger>(tiles_x) * tiles_y * sizeof(std::uint32_t) * 2u, "raster ranges");
+  if (!block_sums_ || !block_offsets_ || !raster_state_ || !raster_sort_dispatch_ ||
+    !raster_pair_dispatch_ || !pairs_a_ || !pairs_b_ || !raster_histograms_ ||
+    !raster_offsets_ || !ranges_)
+  {
+    return false;
+  }
+  std::memset(raster_state_.contents, 0, sizeof(State));
+  error_.clear();
+  return true;
+}
+
+void MetalViewPreparationCore::encodeRasterBin(
+  id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> instances)
+{
+  [encoder setComputePipelineState:bin_count_pipeline_];
+  [encoder setBuffer:instances offset:0 atIndex:0];
+  [encoder setBuffer:state_ offset:0 atIndex:1];
+  [encoder setBuffer:block_sums_ offset:0 atIndex:2];
+  [encoder setBytes:&raster_ length:sizeof(raster_) atIndex:3];
+  [encoder dispatchThreadgroupsWithIndirectBuffer:gather_dispatch_ indirectBufferOffset:0
+                            threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
+  barrier(encoder);
+
+  [encoder setComputePipelineState:bin_scan_pipeline_];
+  [encoder setBuffer:block_sums_ offset:0 atIndex:0];
+  [encoder setBuffer:block_offsets_ offset:0 atIndex:1];
+  [encoder setBuffer:state_ offset:0 atIndex:2];
+  [encoder setBuffer:raster_state_ offset:0 atIndex:3];
+  [encoder setBuffer:raster_sort_dispatch_ offset:0 atIndex:4];
+  [encoder setBuffer:raster_pair_dispatch_ offset:0 atIndex:5];
+  [encoder setBytes:&raster_ length:sizeof(raster_) atIndex:6];
+  [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
+  barrier(encoder);
+
+  [encoder setComputePipelineState:bin_emit_pipeline_];
+  [encoder setBuffer:instances offset:0 atIndex:0];
+  [encoder setBuffer:state_ offset:0 atIndex:1];
+  [encoder setBuffer:block_offsets_ offset:0 atIndex:2];
+  [encoder setBytes:&raster_ length:sizeof(raster_) atIndex:3];
+  [encoder setBuffer:pairs_a_ offset:0 atIndex:4];
+  [encoder dispatchThreadgroupsWithIndirectBuffer:gather_dispatch_ indirectBufferOffset:0
+                            threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
+  barrier(encoder);
+}
+
+id<MTLBuffer> MetalViewPreparationCore::encodeRasterSort(id<MTLComputeCommandEncoder> encoder)
+{
+  return encodeRadix(
+    encoder, pairs_a_, pairs_b_, raster_state_, raster_sort_dispatch_, raster_histograms_,
+    raster_offsets_, raster_.pair_tile_capacity, raster_key_bits_);
+}
+
+void MetalViewPreparationCore::encodeRasterTiles(
+  id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> sorted_pairs, id<MTLBuffer> instances,
+  id<MTLTexture> output)
+{
+  const NSUInteger tiles = static_cast<NSUInteger>(raster_.tiles_x) * raster_.tiles_y;
+  [encoder setComputePipelineState:clear_ranges_pipeline_];
+  [encoder setBuffer:ranges_ offset:0 atIndex:0];
+  [encoder setBytes:&raster_ length:sizeof(raster_) atIndex:1];
+  [encoder dispatchThreads:MTLSizeMake(2u * tiles, 1, 1)
+     threadsPerThreadgroup:linearWidth(clear_ranges_pipeline_, 256u)];
+  barrier(encoder);
+
+  [encoder setComputePipelineState:tile_ranges_pipeline_];
+  [encoder setBuffer:sorted_pairs offset:0 atIndex:0];
+  [encoder setBuffer:raster_state_ offset:0 atIndex:1];
+  [encoder setBuffer:ranges_ offset:0 atIndex:2];
+  [encoder dispatchThreadgroupsWithIndirectBuffer:raster_pair_dispatch_ indirectBufferOffset:0
+                            threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
+  barrier(encoder);
+
+  [encoder setComputePipelineState:raster_pipeline_];
+  [encoder setBuffer:sorted_pairs offset:0 atIndex:0];
+  [encoder setBuffer:ranges_ offset:0 atIndex:1];
+  [encoder setBuffer:instances offset:0 atIndex:2];
+  [encoder setBytes:&raster_ length:sizeof(raster_) atIndex:3];
+  [encoder setTexture:output atIndex:0];
+  [encoder dispatchThreadgroups:MTLSizeMake(raster_.tiles_x, raster_.tiles_y, 1)
+          threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+}
+
+bool MetalViewPreparationCore::encodeRaster(
+  id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> instances, id<MTLTexture> output)
+{
+  if (!raster_state_ || !instances || !output || output.width < raster_.width ||
+    output.height < raster_.height)
+  {
+    error_ = "the tile rasteriser is not configured for this target";
+    return false;
+  }
+  encodeRasterBin(encoder, instances);
+  id<MTLBuffer> sorted = encodeRasterSort(encoder);
+  encodeRasterTiles(encoder, sorted, instances, output);
+  return true;
 }
 
 NSUInteger MetalViewPreparationCore::scratchBytes() const

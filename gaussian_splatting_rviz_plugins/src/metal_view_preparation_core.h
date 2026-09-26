@@ -82,6 +82,26 @@ public:
   // in keyBuffer() the sort's input, as the cull stage would have.
   void primeSortInput(std::uint32_t visible);
 
+  // Tile rasterisation of a prepared draw stream: the splats of `instances`,
+  // back to front as encode() leaves them, composited front to back into a
+  // `width` x `height` texture of premultiplied colour, 16x16 pixels per
+  // threadgroup. Each splat adds a (tile, draw position) pair per tile its quad
+  // touches; `pair_capacity` bounds them, and rasterStateBuffer() reports the
+  // full count in `reserved` so an overflow can be seen. `flip_y` puts pixel
+  // row 0 at NDC y = +1, as Metal textures have it; `depth_min` is the near end
+  // of the clip depth range.
+  bool configureRaster(
+    std::uint32_t width, std::uint32_t height, std::uint32_t pair_capacity, bool flip_y,
+    float depth_min);
+  void encodeRasterBin(id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> instances);
+  id<MTLBuffer> encodeRasterSort(id<MTLComputeCommandEncoder> encoder);
+  void encodeRasterTiles(
+    id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> sorted_pairs, id<MTLBuffer> instances,
+    id<MTLTexture> output);
+  bool encodeRaster(
+    id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> instances, id<MTLTexture> output);
+  id<MTLBuffer> rasterStateBuffer() const {return raster_state_;}
+
   std::uint32_t count() const {return count_;}
   id<MTLBuffer> stateBuffer() const {return state_;}
   id<MTLBuffer> keyBuffer() const {return keys_a_;}
@@ -91,6 +111,28 @@ public:
 
 private:
   enum class Dispatch { kLinear, kTiled, kSimdRanked, kScan };
+
+  // Mirrors RasterParameters in gsplat_prepare.metal.
+  struct RasterParameters
+  {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t tiles_x;
+    std::uint32_t tiles_y;
+    std::uint32_t pair_capacity;
+    std::uint32_t pair_tile_capacity;
+    std::uint32_t flip_y;
+    float depth_min;
+  };
+
+  // A stable LSD radix over the key/value pairs `input` holds, as many as the
+  // `state` buffer's visible count, `key_bits` low bits of the key. `dispatch`
+  // holds the threadgroups for that count and `tile_count` is the capacity the
+  // tables were sized for. Returns whichever of input and output ends sorted.
+  id<MTLBuffer> encodeRadix(
+    id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input, id<MTLBuffer> output,
+    id<MTLBuffer> state, id<MTLBuffer> dispatch, id<MTLBuffer> histograms,
+    id<MTLBuffer> offsets, std::uint32_t tile_count, std::uint32_t key_bits);
 
   id<MTLComputePipelineState> makePipeline(NSString * name, Dispatch dispatch);
   id<MTLBuffer> newBuffer(NSUInteger bytes, const char * label);
@@ -109,6 +151,12 @@ private:
   id<MTLComputePipelineState> scatter_pipeline_ = nil;
   id<MTLComputePipelineState> shade_pipeline_ = nil;
   id<MTLComputePipelineState> gather_pipeline_ = nil;
+  id<MTLComputePipelineState> bin_count_pipeline_ = nil;
+  id<MTLComputePipelineState> bin_scan_pipeline_ = nil;
+  id<MTLComputePipelineState> bin_emit_pipeline_ = nil;
+  id<MTLComputePipelineState> clear_ranges_pipeline_ = nil;
+  id<MTLComputePipelineState> tile_ranges_pipeline_ = nil;
+  id<MTLComputePipelineState> raster_pipeline_ = nil;
 
   std::uint32_t count_ = 0;
   std::uint32_t tile_count_ = 0;
@@ -133,6 +181,19 @@ private:
   // and the splat index behind each slot.
   id<MTLBuffer> projected_ = nil;
   id<MTLBuffer> slot_splats_ = nil;
+
+  RasterParameters raster_{};
+  std::uint32_t raster_key_bits_ = 0;
+  id<MTLBuffer> block_sums_ = nil;
+  id<MTLBuffer> block_offsets_ = nil;
+  id<MTLBuffer> raster_state_ = nil;
+  id<MTLBuffer> raster_sort_dispatch_ = nil;
+  id<MTLBuffer> raster_pair_dispatch_ = nil;
+  id<MTLBuffer> pairs_a_ = nil;
+  id<MTLBuffer> pairs_b_ = nil;
+  id<MTLBuffer> raster_histograms_ = nil;
+  id<MTLBuffer> raster_offsets_ = nil;
+  id<MTLBuffer> ranges_ = nil;
   std::string error_;
 };
 

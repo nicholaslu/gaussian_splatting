@@ -649,3 +649,341 @@ kernel void gather_instances(
   }
   instances[output] = projected[sorted[output].y];
 }
+
+// Tile rasterisation: the prepared splats composited front to back by compute,
+// one threadgroup per 16x16 tile of pixels, in place of drawing a quad per
+// splat. Each pixel stops once it is opaque, which blending in the render
+// pipeline cannot do, and blends in registers rather than through the render
+// target. This is the rasteriser of the 3DGS reference implementation, adapted
+// to take the draw stream gather_instances already wrote in depth order:
+//
+// raster_bin_count and raster_bin_scan count the tiles each splat's quad
+// touches and where each splat's (tile, draw position) pairs start;
+// raster_bin_emit writes the pairs in draw order; the radix, sorting on the
+// tile alone, is stable, so each tile's pairs stay in draw order;
+// raster_tile_ranges finds each tile's run; raster_tiles composites it.
+
+constant uint kRasterTile = 16;
+// A pixel stops once less than this much of what lies behind it would show,
+// as in the reference rasteriser.
+constant float kTransmittanceEnd = 0.0001;
+
+struct RasterParameters
+{
+  uint width;
+  uint height;
+  uint tiles_x;
+  uint tiles_y;
+  uint pair_capacity;
+  uint pair_tile_capacity;  // radix tiles in pair_capacity; the radix tables' stride
+  uint flip_y;              // pixel rows run downward from NDC y = +1
+  float depth_min;          // the clip volume's near depth: 0 on Metal, -1 on OpenGL
+};
+
+// A splat's quad in pixels: its centre, and each axis scaled by the inverse of
+// its squared length, so that the dot product with a pixel's offset from the
+// centre gives the quad coordinate the vertex program would have interpolated.
+struct RasterSplat
+{
+  float2 centre;
+  float2 u;
+  float2 v;
+  float half_radius_squared;  // 0.5 visible_radius^2, for the Gaussian's exponent
+  float opacity;
+  float3 colour;
+};
+
+static RasterSplat rasterSplat(ProjectedInstance q, constant RasterParameters & r)
+{
+  const float2 size = float2(r.width, r.height);
+  float2 centre = (float2(q.centre.xy) * 0.5 + 0.5) * size;
+  float2 a1 = q.axes.xy * 0.5 * size;
+  float2 a2 = q.axes.zw * 0.5 * size;
+  if (r.flip_y) {
+    centre.y = size.y - centre.y;
+    a1.y = -a1.y;
+    a2.y = -a2.y;
+  }
+  RasterSplat s;
+  s.centre = centre;
+  const float l1 = dot(a1, a1);
+  const float l2 = dot(a2, a2);
+  s.u = l1 > 0.0 ? a1 / l1 : float2(0.0);
+  s.v = l2 > 0.0 ? a2 / l2 : float2(0.0);
+  s.half_radius_squared = 0.5 * q.visible_radius * q.visible_radius;
+  s.opacity = l1 > 0.0 && l2 > 0.0 ? q.colour.w : 0.0;
+  s.colour = q.colour.xyz;
+  return s;
+}
+
+// The tiles holding a pixel centre the quad covers, as (x0, y0, x1, y1), or
+// false for a splat that draws nothing: rejected by the projection, clipped by
+// depth as the whole quad would be, or off screen.
+static bool tileBounds(ProjectedInstance q, constant RasterParameters & r, thread uint4 & tiles)
+{
+  if (q.visible_radius <= 0.0 || q.centre.z > 1.0 || q.centre.z < r.depth_min) {
+    return false;
+  }
+  const float2 size = float2(r.width, r.height);
+  float2 centre = (float2(q.centre.xy) * 0.5 + 0.5) * size;
+  if (r.flip_y) {
+    centre.y = size.y - centre.y;
+  }
+  const float2 extent = (abs(q.axes.xy) + abs(q.axes.zw)) * 0.5 * size;
+  const float2 low = ceil(centre - extent - 0.5);
+  const float2 high = floor(centre + extent - 0.5);
+  if (!all(low <= high) || !all(high >= 0.0) || !all(low < size)) {
+    return false;
+  }
+  const uint2 first = uint2(max(low, 0.0)) / kRasterTile;
+  const uint2 last = uint2(min(high, size - 1.0)) / kRasterTile;
+  tiles = uint4(first, last);
+  return true;
+}
+
+static uint tileCount(uint4 tiles)
+{
+  return (tiles.z - tiles.x + 1u) * (tiles.w - tiles.y + 1u);
+}
+
+kernel void raster_bin_count(
+  device const ProjectedInstance * instances [[buffer(0)]],
+  device const PreparationState & state [[buffer(1)]],
+  device uint * block_sums [[buffer(2)]],
+  constant RasterParameters & r [[buffer(3)]],
+  uint i [[thread_position_in_grid]],
+  uint lane [[thread_index_in_threadgroup]],
+  uint block [[threadgroup_position_in_grid]])
+{
+  threadgroup uint scratch[kScanWidth];
+  uint count = 0;
+  uint4 tiles;
+  if (i < state.visible && tileBounds(instances[i], r, tiles)) {
+    count = tileCount(tiles);
+  }
+  const uint inclusive = threadgroupInclusiveScan(count, lane, scratch);
+  if (lane == kScanWidth - 1) {
+    block_sums[block] = inclusive;
+  }
+}
+
+kernel void raster_bin_scan(
+  device const uint * block_sums [[buffer(0)]],
+  device uint * block_offsets [[buffer(1)]],
+  device const PreparationState & state [[buffer(2)]],
+  device PreparationState * raster_state [[buffer(3)]],
+  device DispatchArguments * sort_dispatch [[buffer(4)]],
+  device DispatchArguments * pair_dispatch [[buffer(5)]],
+  constant RasterParameters & r [[buffer(6)]],
+  uint lane [[thread_index_in_threadgroup]])
+{
+  threadgroup uint scratch[kScanWidth];
+  threadgroup uint carry;
+  if (lane == 0) {
+    carry = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint blocks = state.gather_groups;
+  for (uint start = 0; start < blocks; start += kScanWidth) {
+    const uint block = start + lane;
+    const uint count = block < blocks ? block_sums[block] : 0u;
+    const uint inclusive = threadgroupInclusiveScan(count, lane, scratch);
+    if (block < blocks) {
+      block_offsets[block] = carry + inclusive - count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == kScanWidth - 1) {
+      carry += inclusive;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (lane != 0) {
+    return;
+  }
+  // Pairs past the capacity are dropped; `reserved` keeps the full count so a
+  // caller can tell.
+  const uint pairs = min(carry, r.pair_capacity);
+  const uint pair_tiles = (pairs + 1023u) / 1024u;
+  const uint pair_groups = (pairs + kScanWidth - 1u) / kScanWidth;
+  raster_state->visible = pairs;
+  raster_state->visible_tiles = pair_tiles;
+  raster_state->gather_groups = pair_groups;
+  raster_state->reserved = carry;
+  sort_dispatch->threadgroups[0] = max(pair_tiles, 1u);
+  sort_dispatch->threadgroups[1] = 1u;
+  sort_dispatch->threadgroups[2] = 1u;
+  pair_dispatch->threadgroups[0] = max(pair_groups, 1u);
+  pair_dispatch->threadgroups[1] = 1u;
+  pair_dispatch->threadgroups[2] = 1u;
+}
+
+kernel void raster_bin_emit(
+  device const ProjectedInstance * instances [[buffer(0)]],
+  device const PreparationState & state [[buffer(1)]],
+  device const uint * block_offsets [[buffer(2)]],
+  constant RasterParameters & r [[buffer(3)]],
+  device uint2 * pairs [[buffer(4)]],
+  uint i [[thread_position_in_grid]],
+  uint lane [[thread_index_in_threadgroup]],
+  uint block [[threadgroup_position_in_grid]])
+{
+  threadgroup uint scratch[kScanWidth];
+  uint count = 0;
+  uint4 tiles = uint4(0);
+  if (i < state.visible && tileBounds(instances[i], r, tiles)) {
+    count = tileCount(tiles);
+  }
+  const uint inclusive = threadgroupInclusiveScan(count, lane, scratch);
+  if (count == 0) {
+    return;
+  }
+  uint cursor = block_offsets[block] + inclusive - count;
+  for (uint y = tiles.y; y <= tiles.w; ++y) {
+    for (uint x = tiles.x; x <= tiles.z; ++x) {
+      if (cursor < r.pair_capacity) {
+        pairs[cursor] = uint2(y * r.tiles_x + x, i);
+      }
+      ++cursor;
+    }
+  }
+}
+
+// Each tile's run of pairs as a start and an end, two words per tile. They are
+// written by different threads, so they are stored as separate words: a store
+// to one half of a uint2 may be a store of the whole vector.
+kernel void raster_clear_ranges(
+  device uint * ranges [[buffer(0)]],
+  constant RasterParameters & r [[buffer(1)]],
+  uint word [[thread_position_in_grid]])
+{
+  if (word < 2u * r.tiles_x * r.tiles_y) {
+    ranges[word] = 0u;
+  }
+}
+
+kernel void raster_tile_ranges(
+  device const uint2 * pairs [[buffer(0)]],
+  device const PreparationState & raster_state [[buffer(1)]],
+  device uint * ranges [[buffer(2)]],
+  uint j [[thread_position_in_grid]])
+{
+  const uint count = raster_state.visible;
+  if (j >= count) {
+    return;
+  }
+  const uint tile = pairs[j].x;
+  if (j == 0 || pairs[j - 1].x != tile) {
+    ranges[2u * tile] = j;
+  }
+  if (j + 1 == count || pairs[j + 1].x != tile) {
+    ranges[2u * tile + 1u] = j + 1;
+  }
+}
+
+// One threadgroup per tile, one thread per pixel. The tile's pairs arrive a
+// batch of 256 at a time in shared memory. Most splats cover a few pixels of
+// the 256, so each SIMD group, whose 32 threads hold an 8x4 block of the tile,
+// first lists which splats of the batch reach its block at all and evaluates
+// only those: in the full Garden scene, 13 in 14 splats in a tile's range
+// cover no given pixel.
+kernel void raster_tiles(
+  device const uint2 * pairs [[buffer(0)]],
+  device const uint * ranges [[buffer(1)]],
+  device const ProjectedInstance * instances [[buffer(2)]],
+  constant RasterParameters & r [[buffer(3)]],
+  metal::texture2d<float, metal::access::write> output [[texture(0)]],
+  uint2 tile [[threadgroup_position_in_grid]],
+  uint lane [[thread_index_in_threadgroup]],
+  uint group [[simdgroup_index_in_threadgroup]],
+  uint simd_lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float4 batch_quad[kScanWidth];    // centre, u
+  threadgroup float4 batch_shape[kScanWidth];   // v, half_radius_squared, opacity
+  threadgroup float4 batch_colour[kScanWidth];
+  threadgroup short4 batch_box[kScanWidth];     // covered pixels, first and last, inclusive
+  threadgroup ushort block_list[kScanWidth / 32][kScanWidth];
+  threadgroup atomic_uint finished;
+
+  const uint2 block = tile * kRasterTile + uint2((group & 1u) * 8u, (group >> 1u) * 4u);
+  const uint2 pixel = block + uint2(simd_lane & 7u, simd_lane >> 3u);
+  const bool inside = pixel.x < r.width && pixel.y < r.height;
+  const float2 position = float2(pixel) + 0.5;
+  const uint index = tile.y * r.tiles_x + tile.x;
+  const uint2 range = uint2(ranges[2u * index], ranges[2u * index + 1u]);
+  float transmittance = 1.0;
+  float3 colour = float3(0.0);
+  bool done = !inside;
+
+  // The pairs are in draw order, back to front; walk them from the end.
+  for (uint top = range.y; top > range.x; ) {
+    const uint batch = min(kScanWidth, top - range.x);
+    if (lane == 0) {
+      atomic_store_explicit(&finished, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < batch) {
+      const ProjectedInstance q = instances[pairs[top - 1u - lane].y];
+      const RasterSplat s = rasterSplat(q, r);
+      batch_quad[lane] = float4(s.centre, s.u);
+      batch_shape[lane] = float4(s.v, s.half_radius_squared, s.opacity);
+      batch_colour[lane] = float4(s.colour, 0.0);
+      const float2 extent = (abs(q.axes.xy) + abs(q.axes.zw)) * 0.5 * float2(r.width, r.height);
+      const float2 low = clamp(ceil(s.centre - extent - 0.5), -1.0, 32767.0);
+      const float2 high = clamp(floor(s.centre + extent - 0.5), -1.0, 32767.0);
+      batch_box[lane] = short4(short2(low), short2(high));
+    }
+    if (done) {
+      atomic_fetch_add_explicit(&finished, 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (atomic_load_explicit(&finished, memory_order_relaxed) == kScanWidth) {
+      break;
+    }
+
+    // This SIMD group's list, in batch order.
+    uint listed = 0;
+    const short4 mine = short4(short2(block), short2(block + uint2(7u, 3u)));
+    for (uint first = 0; first < batch; first += 32u) {
+      const uint k = first + simd_lane;
+      bool reaches = false;
+      if (k < batch) {
+        const short4 box = batch_box[k];
+        reaches = box.x <= mine.z && box.z >= mine.x && box.y <= mine.w && box.w >= mine.y;
+      }
+      const uint slot = listed + simd_prefix_exclusive_sum(reaches ? 1u : 0u);
+      if (reaches) {
+        block_list[group][slot] = ushort(k);
+      }
+      listed += simd_sum(reaches ? 1u : 0u);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint n = 0; n < listed && !done; ++n) {
+      const uint k = block_list[group][n];
+      const float4 quad = batch_quad[k];
+      const float4 shape = batch_shape[k];
+      const float2 offset = position - quad.xy;
+      const float cu = dot(offset, quad.zw);
+      const float cv = dot(offset, shape.xy);
+      if (abs(cu) > 1.0 || abs(cv) > 1.0) {
+        continue;
+      }
+      const float alpha = min(0.99, shape.w * exp(-shape.z * (cu * cu + cv * cv)));
+      if (alpha < 1.0 / 255.0) {
+        continue;
+      }
+      const float next = transmittance * (1.0 - alpha);
+      if (next < kTransmittanceEnd) {
+        done = true;
+        break;
+      }
+      colour += batch_colour[k].xyz * (alpha * transmittance);
+      transmittance = next;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    top -= batch;
+  }
+  if (inside) {
+    output.write(float4(colour, 1.0 - transmittance), pixel);
+  }
+}

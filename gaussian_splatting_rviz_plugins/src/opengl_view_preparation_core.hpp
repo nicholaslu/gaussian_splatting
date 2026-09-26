@@ -101,6 +101,21 @@ public:
   // until one has. Polled at each encode() without waiting.
   std::int64_t lastVisibleCount() const {return last_visible_;}
 
+  // Tile rasterisation of the draw stream encode() wrote to `instances`: the
+  // splats composited front to back into a `width` x `height` RGBA8 texture of
+  // premultiplied colour, row 0 at the bottom, 16x16 pixels per workgroup. Each
+  // splat adds a (tile, draw position) pair per tile its quad touches;
+  // `pair_capacity` bounds them, and rasterStateBuffer() reports the full count
+  // in `written` so an overflow can be seen. See raster_tiles in
+  // gsplat_prepare.metal. The three steps are public for timing.
+  bool configureRaster(std::uint32_t width, std::uint32_t height, std::uint32_t pair_capacity);
+  bool rasterReady() const;
+  void encodeRasterBin(GLuint instances);
+  GLuint encodeRasterSort();
+  void encodeRasterTiles(GLuint sorted_pairs, GLuint instances, GLuint texture);
+  bool encodeRaster(GLuint instances, GLuint texture);
+  GLuint rasterStateBuffer() const {return raster_state_;}
+
   std::uint32_t count() const {return count_;}
   GLuint stateBuffer() const {return state_;}
   // The key/slot pairs the latest preparation left sorted.
@@ -116,6 +131,13 @@ private:
   };
 
   GLuint compile(const char * stage);
+  // A stable LSD radix over the key/value pairs in `input`, as many as the
+  // `state` buffer's visible count, `key_bits` low bits of the key, sized for
+  // `tile_count` tiles; `first_mark` times its steps when profiling, or 0 not.
+  // Returns whichever of input and output ends sorted.
+  GLuint radix(
+    GLuint input, GLuint output, GLuint state, GLuint dispatch, GLuint histograms,
+    GLuint offsets, std::uint32_t tile_count, std::uint32_t key_bits, std::size_t first_mark);
   GLuint newBuffer(std::size_t bytes, GLenum usage);
   bool uploadBuffer(GLuint & buffer, const void * data, std::size_t bytes, GLenum usage);
   bool fitsStorageBlock(std::size_t bytes) const;
@@ -128,7 +150,10 @@ private:
 
   std::string shader_source_;
   std::string error_;
+  std::string raster_error_;
   std::array<GLuint, 11> programs_{};
+  // bin count, bin scan, bin emit, clear ranges, tile ranges, tiles
+  std::array<GLuint, 6> raster_programs_{};
   bool profiling_ = false;
   bool subgroup_ballot_ = false;
   // Stage boundaries 0-4, then three within culling and four per radix pass.
@@ -164,6 +189,32 @@ private:
   GLuint view_parameters_ = 0u;
   GLuint projection_parameters_ = 0u;
   std::array<Readback, 3> readbacks_{};
+
+  // Mirrors RasterParameters in gsplat_prepare.comp.
+  struct RasterParameters
+  {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t tiles_x;
+    std::uint32_t tiles_y;
+    std::uint32_t pair_capacity;
+    std::uint32_t pair_tile_capacity;
+    std::uint32_t flip_y;
+    float depth_min;
+  };
+  RasterParameters raster_{};
+  std::uint32_t raster_key_bits_ = 0u;
+  GLuint raster_parameters_ = 0u;
+  GLuint block_sums_ = 0u;
+  GLuint block_offsets_ = 0u;
+  GLuint raster_state_ = 0u;
+  GLuint raster_sort_dispatch_ = 0u;
+  GLuint raster_pair_dispatch_ = 0u;
+  GLuint pairs_a_ = 0u;
+  GLuint pairs_b_ = 0u;
+  GLuint raster_histograms_ = 0u;
+  GLuint raster_offsets_ = 0u;
+  GLuint ranges_ = 0u;
   std::size_t readback_cursor_ = 0u;
   std::int64_t last_visible_ = -1;
 };
