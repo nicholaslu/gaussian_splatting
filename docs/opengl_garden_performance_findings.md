@@ -1,139 +1,139 @@
-# Garden 全量场景下的 OpenGL 动态视角性能观察
+# OpenGL performance with a moving view on the full Garden scene
 
-## 背景与测试范围
+## Background and scope
 
-本记录汇总当前 GaussianSplatting RViz 插件在 Garden 全量数据下的性能现象，并对 Metal 与 OpenGL 4.3 GPU preparation 路径进行初步对照。
+This note collects the performance behaviour of the GaussianSplatting RViz plugin on the full Garden dataset, and makes a first comparison between the Metal and OpenGL 4.3 GPU preparation paths.
 
-本轮重点不是静态帧率，而是相机移动时的持续性能和交互延迟。测试场景约有 **5,834,784 个 splat**；常见视角下约有 **90 万至 100 万个 splat 可见**。远端 OpenGL 测试设备使用 NVIDIA RTX 4090。
+The focus of this round is not the static frame rate but sustained performance and interaction latency while the camera moves. The scene has about **5,834,784 splats**; typical views have about **900,000 to 1,000,000 splats visible**. The remote OpenGL test machine uses an NVIDIA RTX 4090.
 
-以下内容分为实测现象、已经基本排除的方向和根据代码得到的初步结论。尚未通过 GPU 分阶段计时验证的内容均标记为推断。
+What follows is split into observed behaviour, directions that have been largely ruled out, and preliminary conclusions drawn from the code. Anything not yet confirmed by per-stage GPU timing is marked as inference.
 
-## 已观察到的现象
+## Observations
 
-### 静止与移动差异明显
+### Static and moving views differ sharply
 
-- 相机静止后，RViz 可以恢复到约 60 FPS。
-- 相机持续移动时，帧率明显下降，并伴随交互响应变慢。
-- 停止发布器后，已经加载的场景在移动视角时帧率没有明显恢复。
+- Once the camera stops, RViz returns to about 60 FPS.
+- While the camera keeps moving, the frame rate drops markedly and interaction becomes sluggish.
+- After the publisher is stopped, moving the view over the already loaded scene does not noticeably recover the frame rate.
 
-这说明瓶颈不是 ROS 消息持续发布、反序列化或重复上传，而是已加载场景在视角变化时触发的逐视角 GPU 工作。
+So the bottleneck is not continuous ROS publishing, deserialisation or repeated upload, but per-view GPU work that the loaded scene triggers whenever the view changes.
 
-### OpenGL GPU preparation 已经启用
+### OpenGL GPU preparation is enabled
 
-- OpenGL 4.3 GPU preparation 路径正常启用。
-- CPU 仅需约 **0.06–0.075 ms** 将一次 preparation 提交到 GPU。
-- RViz 进程 CPU 使用率约为 **22%**，发布器在稳定状态下基本空闲。
-- 移动视角时 NVIDIA GPU 利用率持续达到 **96–100%**。
+- The OpenGL 4.3 GPU preparation path is enabled and running.
+- The CPU needs only about **0.06–0.075 ms** to submit one preparation to the GPU.
+- The RViz process uses about **22%** CPU; the publisher is essentially idle at steady state.
+- While the view moves, NVIDIA GPU utilisation stays at **96–100%**.
 
-因此，当前低帧率不是原来的 CPU 排序问题重新出现，而是 GPU preparation 或其调度方式成为了主要限制。
+The low frame rate is therefore not the old CPU sort problem coming back; GPU preparation, or the way it is scheduled, has become the main limit.
 
-### 降低输出分辨率没有消除饱和
+### Lowering the output resolution does not remove the saturation
 
-将 Offscreen Render Scale 从 `1.0` 降至 `0.25` 后，像素数量理论上减少到原来的 1/16，但移动时 GPU 仍接近 98–100% 利用率。
+Lowering the Offscreen Render Scale from `1.0` to `0.25` should cut the pixel count to 1/16, yet the GPU stays at about 98–100% utilisation while moving.
 
-这基本排除了“最终 splat 光栅化和片元填充是当前唯一主因”。填充和混合仍有成本，但无法解释分辨率大幅下降后 GPU 仍然饱和的现象。
+This largely rules out final splat rasterisation and fragment fill as the sole cause. Fill and blending still cost something, but they cannot explain a GPU that stays saturated after such a large drop in resolution.
 
-### 减少可见 splat 后仍然饱和
+### Fewer visible splats still saturate the GPU
 
-将 Minimum Screen Radius 设为 `8` 后，可见数量从约 100 万下降到 **515,174**，但移动时 GPU 仍然接近满载。
+With Minimum Screen Radius set to `8`, the visible count falls from about 1 million to **515,174**, but the GPU is still close to fully loaded while moving.
 
-该参数只会减少裁剪后的 survivor 数量，不会避免第一阶段扫描全部 5,834,784 个输入。因此这一结果指向裁剪、压缩以及围绕全量输入执行的准备阶段，而不只是 survivor 的最终绘制。
+That setting only reduces the number of survivors after culling; it does not spare the first stage from scanning all 5,834,784 inputs. The result points at culling, compaction and the other preparation stages that run over the whole input, not only at drawing the survivors.
 
-### GPU 利用率高，但功耗和显存利用率不高
+### High GPU utilisation, but low power and memory utilisation
 
-测试时观察到 GPU utilization 接近 100%，但功耗约为 95 W，显存利用率约为 0–2%。这些指标不能直接等价为某个具体 kernel 的耗时，不过它们更像是低占用率、同步/调度受限或串行指令较多的工作负载，而不像纯显存带宽或片元吞吐饱和。
+During the tests GPU utilisation was close to 100%, but power draw was about 95 W and memory utilisation about 0–2%. These figures cannot be mapped directly to the time of any particular kernel, but they look more like a workload limited by low occupancy, synchronisation or scheduling, or long serial instruction chains, than one saturating memory bandwidth or fragment throughput.
 
-## 当前 GPU preparation 流程
+## The current GPU preparation pipeline
 
-Metal 与 OpenGL 的高层算法基本一致：
+At a high level Metal and OpenGL run the same algorithm:
 
-1. 对全部 splat 做裁剪并生成深度键。
-2. 统计和扫描 survivor 数量。
-3. 将 survivor 压缩到连续的 key/index 缓冲区。
-4. 执行四轮 8-bit stable LSD radix sort。
-5. 根据排序结果做投影、SH 求值和 gather。
-6. 写入 indirect draw 参数并绘制。
+1. Cull every splat and generate its depth key.
+2. Count and scan the survivors.
+3. Compact the survivors into contiguous key/index buffers.
+4. Run four passes of an 8-bit stable LSD radix sort.
+5. Project, evaluate SH and gather according to the sorted order.
+6. Write the indirect draw arguments and draw.
 
-因此，OpenGL 变慢并不是因为它仍然走完整的 CPU 排序路径，也不是因为 Metal 使用了完全不同的高层算法。
+So OpenGL is not slower because it still takes the full CPU sort path, nor because Metal uses a different high-level algorithm.
 
-## Metal 与 OpenGL 的关键执行差异
+## Key execution differences between Metal and OpenGL
 
-### SIMD lane 排名
+### SIMD lane ranking
 
-Metal 的 compact scatter 和 radix scatter 使用原生 `simd_ballot` 计算 lane rank。
+Metal's compact scatter and radix scatter compute lane ranks with the native `simd_ballot`.
 
-当前 OpenGL 4.3 GLSL 路径没有使用 subgroup ballot，而是在一个 32-lane tile 内通过循环比较其他 lane 来计算稳定排名。这会产生更多指令和串行依赖，在 NVIDIA GPU 上很可能比原生 warp/subgroup 操作低效。
+The current OpenGL 4.3 GLSL path uses no subgroup ballot; it computes a stable rank within a 32-lane tile by looping over the other lanes and comparing. That costs more instructions and serial dependencies, and on NVIDIA GPUs is likely to be much less efficient than native warp/subgroup operations.
 
-### Dispatch 和同步
+### Dispatch and synchronisation
 
-Metal 将 preparation 的多个阶段编码到同一条 Metal command timeline 中，并使用较细粒度的 buffer barrier。
+Metal encodes the stages of a preparation on a single Metal command timeline, with fairly fine-grained buffer barriers.
 
-OpenGL 路径需要多次：
+The OpenGL path has to repeatedly:
 
-- 切换 compute program；
-- 重新绑定 SSBO；
-- 发起 compute dispatch；
-- 执行 `glMemoryBarrier`。
+- switch compute programs;
+- rebind SSBOs;
+- issue compute dispatches;
+- execute `glMemoryBarrier`.
 
-一次 preparation 包含十几次 dispatch 及其阶段同步。即使每个 kernel 本身不长，这些全局 barrier、驱动调度和 kernel 间空隙也可能形成明显开销。
+One preparation contains a dozen or more dispatches, each with its own stage synchronisation. Even if each kernel is short, the global barriers, driver scheduling and gaps between kernels can add up to significant overhead.
 
-### 视角更新的排队策略
+### Queuing policy for view updates
 
-目前 Metal 和 OpenGL 都没有明确的“上一帧 preparation 尚未完成时，只保留最新视角”的合并或节流机制。
+Neither Metal nor OpenGL currently has an explicit mechanism to coalesce or throttle view updates, keeping only the latest view while the previous preparation is still running.
 
-相机拖动会连续产生视角更新；CPU 提交一次 OpenGL preparation 只需约 0.07 ms，因此 CPU 可以远快于 GPU 地继续提交完整流水线。若中间视角的工作不能及时丢弃，就会形成 GPU 队列积压，表现为：
+Dragging the camera produces a continuous stream of view updates. Submitting one OpenGL preparation takes the CPU only about 0.07 ms, so the CPU can keep submitting the full pipeline far faster than the GPU consumes it. If intermediate views cannot be dropped in time, work piles up in the GPU queue, which shows up as:
 
-- 移动时低帧率；
-- 输入到画面的延迟逐渐增加；
-- 停止移动后需要等待队列消化。
+- a low frame rate while moving;
+- growing latency from input to screen;
+- a wait after the camera stops while the queue drains.
 
-这一项是两个后端共有的结构性风险，并非 OpenGL 独有。
+This is a structural risk shared by both backends, not specific to OpenGL.
 
-## 初步结论
+## Preliminary conclusions
 
-当前证据支持以下判断：
+The evidence so far supports the following:
 
-1. **主要瓶颈位于相机变化时触发的 GPU preparation，而不是 publisher 或 CPU 排序。**
-2. **当前问题不是单纯的片元填充瓶颈。** Render Scale 降至 0.25 后仍然饱和说明 preparation 的权重很高。
-3. **全量扫描是场景规模扩展的基础成本。** 即使只有约 51 万 survivor，第一阶段仍要处理全部约 583 万输入。
-4. **OpenGL 的实现效率很可能低于 Metal。** 最可疑的差异是手动模拟 32-lane stable rank，以及大量 dispatch/global barrier。
-5. **缺少视角更新合并可能放大了所有 GPU 成本。** 单帧 preparation 即便只是略慢于目标帧时间，连续拖动仍可能提交远多于 GPU 能消费的工作。
-6. **Metal 并没有从算法上避开全量扫描。** 它可能因为原生 SIMD primitive 和 command-buffer 模型表现更好，但在同样的 583 万规模与连续视角更新下也存在退化可能。
+1. **The main bottleneck is the GPU preparation triggered by camera changes, not the publisher or the CPU sort.**
+2. **The problem is not simply fragment fill.** The GPU staying saturated at Render Scale 0.25 shows that preparation weighs heavily.
+3. **The full scan is the base cost that grows with the scene.** Even with only about 510,000 survivors, the first stage still processes all of the roughly 5.83 million inputs.
+4. **The OpenGL implementation is probably less efficient than Metal's.** The most suspicious differences are the hand-emulated 32-lane stable rank and the large number of dispatches and global barriers.
+5. **The lack of view-update coalescing may amplify every GPU cost.** Even if a single preparation is only slightly slower than the target frame time, continuous dragging can submit far more work than the GPU can consume.
+6. **Metal does not avoid the full scan algorithmically.** It may do better thanks to native SIMD primitives and the command-buffer model, but it can degrade too at the same 5.83 million scale with continuous view updates.
 
-目前还不能仅凭总体 GPU utilization 判断 compact、radix、gather 或等待 barrier 中哪一个占比最高。对此需要加入真正的 GPU 分阶段计时。
+Overall GPU utilisation alone cannot tell whether compaction, the radix sort, the gather or waiting on barriers takes the largest share. That needs real per-stage GPU timing.
 
-## 建议的下一步验证顺序
+## Suggested order of further investigation
 
-### 1. 加入 OpenGL GPU timestamp query
+### 1. Add OpenGL GPU timestamp queries
 
-分别记录以下阶段的 GPU 时间：
+Record the GPU time of each of these stages:
 
-- cull/key generation；
-- compact count/scan/scatter；
-- 每轮 radix histogram/scan/scatter；
-- projection/SH/gather；
-- 最终 draw。
+- cull/key generation;
+- compact count/scan/scatter;
+- each radix pass's histogram/scan/scatter;
+- projection/SH/gather;
+- the final draw.
 
-同时记录从第一阶段开始到最终 draw 完成的总时间，避免只看到各 kernel 而漏掉 barrier 和 dispatch 间空隙。
+Also record the total time from the start of the first stage to the end of the final draw, so that barriers and gaps between dispatches are not missed by looking only at the kernels.
 
-### 2. 加入 latest-view 合并和 in-flight 限制
+### 2. Add latest-view coalescing and an in-flight limit
 
-GPU 正在处理视角 A 时，如果又收到 B、C、D，应允许丢弃未提交的中间视角，只在可再次提交时处理最新的 D。静止后仍应保证最终视角被精确处理。
+If views B, C and D arrive while the GPU is still processing view A, the unsubmitted intermediate views should be droppable, with only the latest, D, processed once submission is possible again. The final view must still be processed exactly once the camera stops.
 
-这是最直接的交互改善手段，也能区分“单帧 preparation 太慢”和“重复提交造成队列积压”各自的影响。
+This is the most direct way to improve interaction, and it also separates the effect of a single slow preparation from that of a queue backed up by repeated submissions.
 
-### 3. 为 OpenGL 增加原生 subgroup 路径
+### 3. Add a native subgroup path to OpenGL
 
-在运行时检测 NVIDIA/GLSL 可用的 subgroup ballot 能力，用原生 warp/subgroup rank 替换 GLSL 中的 32-lane 手动循环，并保留当前纯 OpenGL 4.3 实现作为兼容回退。
+Detect at run time whether the NVIDIA GLSL implementation offers subgroup ballots, and replace the hand-written 32-lane loop in GLSL with a native warp/subgroup rank, keeping the current plain OpenGL 4.3 implementation as the compatible fallback.
 
-重点比较 compact scatter 和 radix scatter 的分阶段时间，而不是只比较最终 FPS。
+Compare the per-stage times of the compact scatter and the radix scatter, not just the final FPS.
 
-### 4. 再评估分层裁剪和 CUDA/CUB
+### 4. Then reconsider hierarchical culling and CUDA/CUB
 
-如果 cull/key generation 的全量扫描仍占主导，应考虑层次包围结构或分块可见性，避免每个视角扫描全部 splat。
+If the full scan in cull/key generation still dominates, consider a hierarchical bounding structure or tiled visibility, so that not every view scans every splat.
 
-CUDA/CUB 可以为 NVIDIA 提供成熟的 radix primitive，但它主要改善排序阶段，不能单独解决全量裁剪和重复视角提交问题。应在 timestamp 结果确认排序占比后再决定优先级。
+CUDA/CUB can give NVIDIA a mature radix primitive, but it mainly improves the sort stage; on its own it solves neither the full-scan culling nor repeated view submission. Its priority should be decided after the timestamp results confirm the sort's share.
 
-## 与独立问题的边界
+## Boundary with an unrelated problem
 
-超过 5,592,405 个 splat 时的 OpenGL 浮点纹理索引精度问题属于 CPU-prepared GLSL 1.20 fallback。当前 OpenGL 4.3 GPU preparation 使用整数 SSBO 索引，不受该问题影响；它不是本次动态视角低帧率的原因。
+The OpenGL floating-point texture indexing precision problem above 5,592,405 splats belongs to the CPU-prepared GLSL 1.20 fallback. The current OpenGL 4.3 GPU preparation indexes integer SSBOs and is not affected; it is not the cause of the low frame rate with a moving view.
