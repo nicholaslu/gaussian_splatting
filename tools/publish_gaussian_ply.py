@@ -26,6 +26,7 @@ transform instead of touching the data:
 """
 
 import argparse
+import array
 
 import numpy as np
 import rclpy
@@ -76,13 +77,16 @@ def load_3dgs_ply(path, max_splats=None, stride=1, scale_mult=1.0):
     msg.eps2d = 0.3
     msg.sh_degree = sh_degree
 
-    # Assigned as numpy rather than through tolist(): the generated message
-    # class stores a float32 sequence as a numpy array either way, and the list
-    # is a detour through one Python float object per element. A million splats
-    # carry 52 million harmonic coefficients, which is a couple of gigabytes of
-    # boxed floats to build and throw away, and minutes spent doing it.
+    # ROS distributions differ here: Jazzy accepts a numpy float32 array, while
+    # Humble's generated setter accepts array('f') but rejects numpy scalars as
+    # Python floats. Copy the contiguous bytes straight into array('f'). This
+    # keeps both distributions happy without detouring through one boxed Python
+    # float per component (hundreds of millions for a full-size scene).
     def f32(a):
-        return np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+        contiguous = np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+        result = array.array("f")
+        result.frombytes(memoryview(contiguous).cast("B"))
+        return result
 
     msg.means = f32(means * scale_mult)
     msg.scales = f32(scales * scale_mult)
