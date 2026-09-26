@@ -138,11 +138,35 @@ indirect draw: the measured CPU cull/SH stage is still the dominant 60.93 ms.
 
 ### OpenGL
 
-Ogre's GL3Plus backend implements `_dispatchCompute()` and shader-storage
-buffers, so a GL 4.3 implementation can share the algorithm and buffer layout
-with Metal. The current macOS/legacy path uses GLSL 1.20 and cannot run compute
-shaders; it must retain the CPU implementation. GPU sorting is therefore a
-capability-selected acceleration, not a replacement for the portable path.
+Both Ogre's GL3Plus backend and a sufficiently modern compatibility context
+provide compute shaders and shader-storage buffers. RViz currently loads the
+legacy `RenderSystem_GL`, so this implementation uses its compatibility context
+directly: GLSL 1.20 remains available for RViz's raster materials while GLSL
+4.30 performs preparation. macOS stops at OpenGL 4.1 and retains the CPU
+implementation. GPU sorting is therefore a capability-selected acceleration,
+not a replacement for the portable path.
+
+The implementation now targets the modern compatibility context exposed by
+Ogre's `RenderSystem_GL` on Linux. This preserves RViz's existing
+GLSL 1.20 raster materials while running preparation from GLSL 4.30 compute:
+frustum and screen-size culling, stable compaction, four-pass 32-bit radix,
+SH evaluation, projection, gather, and a GPU-written indirect instance count.
+It uses no subgroup extension: stable ranks inside each 32-lane tile are
+formed in shared memory, so core OpenGL 4.3 is the real minimum. A three-slot
+fenced readback reports the visible count asynchronously and is not on the
+draw dependency chain. macOS does not compile this backend because its OpenGL
+implementation stops at 4.1.
+
+Windows remains on the CPU fallback for now. Ogre compiles GLEW privately into
+`RenderSystem_GL.dll`, so the plugin needs a small exported native-function
+loader bridge before the same compute adapter can link there safely.
+
+Backend selection is centralised behind `GpuViewPreparation`. In addition to
+automatic capability selection, `GSPLAT_GPU_BACKEND` accepts `metal`,
+`opengl`, `cuda`, and `cpu`. `cuda` currently reports that it is not built;
+the selection point and factory contract are reserved so a CUDA/CUB OpenGL
+interop backend can be added without changing the display or its projected
+instance format.
 
 ### CUDA
 
@@ -303,10 +327,12 @@ Against the acceptance criteria:
   view, buffer reuse under a narrower view, in-place re-upload and a splat at
   the camera. `--quick` skips the Garden-sized scene.
 - A stationary camera does no preparation: unchanged.
-- Backend selection: Metal uses the GPU path and any failure falls back to the
-  CPU path. A build without Ogre's Metal render system now warns and builds the
-  CPU path instead of failing, and non-Metal builds compile again. GL 4.3 and
-  CUDA are not started.
+- Backend selection: Metal and OpenGL 4.3 use the common GPU-preparation
+  contract, and any capability, allocation, compile, or dispatch failure falls
+  back to the CPU path. OpenGL performs culling, stable compaction, four radix
+  passes, SH, projection, gather, indirect dispatch, and indirect draw without
+  a synchronous readback. CUDA has a reserved factory and buffer contract but
+  no implementation yet.
 
 Still open:
 

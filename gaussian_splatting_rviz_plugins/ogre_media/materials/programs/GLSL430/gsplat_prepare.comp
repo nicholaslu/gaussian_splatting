@@ -1,0 +1,551 @@
+// Shared GLSL 4.30 compute source. The OpenGL adapter prepends #version 430
+// and exactly one GSPLAT_STAGE_* define before compiling each program.
+//
+// The stages mirror gsplat_prepare.metal. They use only core OpenGL 4.3
+// features: compute shaders, shader-storage buffers and indirect draw. The
+// stable radix scatter deliberately avoids subgroup extensions, so GL 4.3 is
+// the actual requirement rather than GL 4.6 or a vendor ballot extension.
+
+const uint kRadix = 256u;
+const uint kRejected = 0xffffffffu;
+const uint kFrustumPlaneFar = 1u;
+const float kSHC0 = 0.28209479177387814;
+const float kSHC1 = 0.4886025119029199;
+const float kSHC2[5] = float[5](
+  1.0925484305920792, -1.0925484305920792, 0.31539156525252005,
+  -1.0925484305920792, 0.5462742152960396);
+const float kSHC3[7] = float[7](
+  -0.5900435899266435, 2.890611442640554, -0.4570457994644658,
+  0.3731763325901154, -0.4570457994644658, 1.445305721320277,
+  -0.5900435899266435);
+
+struct SplatRecord
+{
+  vec4 position_opacity;
+  vec4 scale_pad;
+  vec4 quat;
+};
+
+struct ViewParameters
+{
+  vec4 world_rows[4];
+  vec4 view_rows[4];
+  vec4 frustum_planes[6];
+  vec4 local_camera;
+  vec4 local_sort_direction;
+  float world_scale;
+  float focal_y;
+  float near_clip;
+  float far_clip;
+  float ortho_scale;
+  float sigma_radius;
+  float min_screen_radius;
+  float eps2d;
+  uint count;
+  uint viewport_height;
+  uint sh_coefficients;
+  uint flags;
+};
+
+struct ProjectionParameters
+{
+  vec4 worldview_rows[4];
+  vec4 worldviewproj_rows[4];
+  vec4 viewport_size;
+  float fovy;
+  float eps2d;
+  float antialiased;
+  float sigma_radius;
+};
+
+struct PreparationState
+{
+  uint visible;
+  uint visible_tiles;
+  uint gather_groups;
+  uint reserved;
+};
+
+struct ProjectedInstance
+{
+  vec4 centre_radius;
+  vec4 axes;
+  vec4 colour;
+};
+
+uint orderedFloatKey(float value)
+{
+  uint bits = floatBitsToUint(value);
+  return (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+}
+
+vec3 transformPoint(vec4 rows[4], vec3 point)
+{
+  vec4 p = vec4(point, 1.0);
+  return vec3(dot(rows[0], p), dot(rows[1], p), dot(rows[2], p));
+}
+
+#if defined(GSPLAT_STAGE_MAKE_DEPTH_KEYS)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Splats {SplatRecord splats[];};
+layout(std430, binding = 1) writeonly buffer Records {uvec2 records[];};
+layout(std430, binding = 2) readonly buffer ViewBlock {ViewParameters p;};
+
+void main()
+{
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= p.count) {
+    return;
+  }
+  SplatRecord splat = splats[i];
+  vec3 position = splat.position_opacity.xyz;
+  float opacity = splat.position_opacity.w;
+  vec3 scale = splat.scale_pad.xyz;
+  const float alpha_cutoff = 1.0 / 255.0;
+  bool visible = opacity >= alpha_cutoff;
+  float visible_radius = visible ?
+    min(p.sigma_radius, sqrt(2.0 * log(opacity / alpha_cutoff))) : 0.0;
+  float max_sigma = max(scale.x, max(scale.y, scale.z));
+  float world_radius = visible_radius * max_sigma * p.world_scale;
+  vec3 world_position = transformPoint(p.world_rows, position);
+
+  if (visible && (p.flags & 1u) != 0u) {
+    for (uint plane = 0u; plane < 6u; ++plane) {
+      if (plane == kFrustumPlaneFar && p.far_clip == 0.0) {
+        continue;
+      }
+      if (dot(p.frustum_planes[plane].xyz, world_position) +
+        p.frustum_planes[plane].w < -world_radius)
+      {
+        visible = false;
+        break;
+      }
+    }
+  }
+
+  if (visible && (p.flags & 1u) != 0u && p.min_screen_radius > 0.0 &&
+    p.viewport_height > 0u)
+  {
+    float screen_radius = 0.0;
+    if ((p.flags & 2u) != 0u) {
+      float depth = -transformPoint(p.view_rows, world_position).z;
+      if (depth <= 0.0) {
+        visible = false;
+      } else {
+        screen_radius = p.focal_y * world_radius / max(depth - world_radius, p.near_clip);
+      }
+    } else {
+      screen_radius = p.ortho_scale * world_radius;
+    }
+    if (visible) {
+      float blur_radius = visible_radius * sqrt(max(p.eps2d, 0.0));
+      screen_radius = sqrt(screen_radius * screen_radius + blur_radius * blur_radius);
+      visible = screen_radius >= p.min_screen_radius;
+    }
+  }
+
+  records[i] = visible ?
+    uvec2(orderedFloatKey(dot(position, p.local_sort_direction.xyz)), i) :
+    uvec2(0u, kRejected);
+}
+
+#elif defined(GSPLAT_STAGE_COMPACT_COUNT)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Records {uvec2 records[];};
+layout(std430, binding = 1) writeonly buffer Counts {uint tile_counts[];};
+uniform uint count;
+uniform uint tile_count;
+uniform uint elements_per_tile;
+
+void main()
+{
+  uint tile = gl_GlobalInvocationID.x;
+  if (tile >= tile_count) {
+    return;
+  }
+  uint begin = tile * elements_per_tile;
+  uint end = min(begin + elements_per_tile, count);
+  uint survivors = 0u;
+  for (uint i = begin; i < end; ++i) {
+    survivors += records[i].y != kRejected ? 1u : 0u;
+  }
+  tile_counts[tile] = survivors;
+}
+
+#elif defined(GSPLAT_STAGE_COMPACT_SCAN)
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly buffer Counts {uint tile_counts[];};
+layout(std430, binding = 1) writeonly buffer Offsets {uint tile_offsets[];};
+layout(std430, binding = 2) buffer State {PreparationState state;};
+layout(std430, binding = 3) writeonly buffer TileDispatch {
+  uint tile_groups_x;
+  uint tile_groups_y;
+  uint tile_groups_z;
+};
+layout(std430, binding = 4) writeonly buffer GatherDispatch {
+  uint gather_groups_x;
+  uint gather_groups_y;
+  uint gather_groups_z;
+};
+layout(std430, binding = 5) buffer DrawArguments {
+  uint index_count_out;
+  uint instance_count_out;
+  uint index_start_out;
+  uint base_vertex_out;
+  uint base_instance_out;
+};
+uniform uint tile_count;
+uniform uint elements_per_tile;
+uniform uint gather_width;
+uniform uint index_count;
+
+void main()
+{
+  uint visible = 0u;
+  for (uint tile = 0u; tile < tile_count; ++tile) {
+    tile_offsets[tile] = visible;
+    visible += tile_counts[tile];
+  }
+  state.visible = visible;
+  state.visible_tiles = (visible + elements_per_tile - 1u) / elements_per_tile;
+  state.gather_groups = (visible + gather_width - 1u) / gather_width;
+  state.reserved = 0u;
+  // OpenGL rejects a zero-sized indirect dispatch, so launch one guarded
+  // group for an empty view just as the Metal backend does.
+  tile_groups_x = max(state.visible_tiles, 1u);
+  tile_groups_y = 1u;
+  tile_groups_z = 1u;
+  gather_groups_x = max(state.gather_groups, 1u);
+  gather_groups_y = 1u;
+  gather_groups_z = 1u;
+  index_count_out = index_count;
+  instance_count_out = visible;
+  index_start_out = 0u;
+  base_vertex_out = 0u;
+  base_instance_out = 0u;
+}
+
+#elif defined(GSPLAT_STAGE_COMPACT_SCATTER)
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) readonly buffer InputRecords {uvec2 input_records[];};
+layout(std430, binding = 1) writeonly buffer OutputRecords {uvec2 output_records[];};
+layout(std430, binding = 2) readonly buffer Offsets {uint tile_offsets[];};
+uniform uint count;
+uniform uint tile_count;
+uniform uint elements_per_tile;
+shared uint active_lanes[32];
+shared uint cursor;
+shared uint chunk_total;
+
+void main()
+{
+  uint tile = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  if (tile >= tile_count) {
+    return;
+  }
+  if (lane == 0u) {
+    cursor = tile_offsets[tile];
+  }
+  barrier();
+  uint begin = tile * elements_per_tile;
+  uint end = min(begin + elements_per_tile, count);
+  uint tile_size = end > begin ? end - begin : 0u;
+  for (uint chunk = 0u; chunk < elements_per_tile; chunk += 32u) {
+    uint local = chunk + lane;
+    uvec2 record = local < tile_size ? input_records[begin + local] : uvec2(0u, kRejected);
+    bool active = record.y != kRejected;
+    active_lanes[lane] = active ? 1u : 0u;
+    barrier();
+    uint rank = 0u;
+    for (uint other = 0u; other < lane; ++other) {
+      rank += active_lanes[other];
+    }
+    if (lane == 0u) {
+      chunk_total = 0u;
+      for (uint other = 0u; other < 32u; ++other) {
+        chunk_total += active_lanes[other];
+      }
+    }
+    barrier();
+    uint base = cursor;
+    if (active) {
+      output_records[base + rank] = record;
+    }
+    barrier();
+    if (lane == 0u) {
+      cursor += chunk_total;
+    }
+    barrier();
+  }
+}
+
+#elif defined(GSPLAT_STAGE_RADIX_HISTOGRAM)
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) readonly buffer Records {uvec2 records[];};
+layout(std430, binding = 1) writeonly buffer Histograms {uint histograms[];};
+layout(std430, binding = 2) readonly buffer State {PreparationState state;};
+uniform uint tile_count;
+uniform uint elements_per_tile;
+uniform uint shift;
+shared uint local_histogram[256];
+
+void main()
+{
+  uint tile = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  for (uint digit = lane; digit < kRadix; digit += 32u) {
+    local_histogram[digit] = 0u;
+  }
+  barrier();
+  if (tile < state.visible_tiles) {
+    uint begin = tile * elements_per_tile;
+    uint end = min(begin + elements_per_tile, state.visible);
+    for (uint i = begin + lane; i < end; i += 32u) {
+      uint digit = (records[i].x >> shift) & 0xffu;
+      atomicAdd(local_histogram[digit], 1u);
+    }
+  }
+  barrier();
+  if (tile < state.visible_tiles) {
+    for (uint digit = lane; digit < kRadix; digit += 32u) {
+      histograms[digit * tile_count + tile] = local_histogram[digit];
+    }
+  }
+}
+
+#elif defined(GSPLAT_STAGE_RADIX_SCAN_OFFSETS)
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Histograms {uint histograms[];};
+layout(std430, binding = 1) writeonly buffer Offsets {uint offsets[];};
+layout(std430, binding = 2) writeonly buffer Totals {uint totals[];};
+layout(std430, binding = 3) readonly buffer State {PreparationState state;};
+uniform uint tile_count;
+
+void main()
+{
+  uint digit = gl_GlobalInvocationID.x;
+  if (digit >= kRadix) {
+    return;
+  }
+  uint running = 0u;
+  uint base = digit * tile_count;
+  for (uint tile = 0u; tile < state.visible_tiles; ++tile) {
+    offsets[base + tile] = running;
+    running += histograms[base + tile];
+  }
+  totals[digit] = running;
+}
+
+#elif defined(GSPLAT_STAGE_RADIX_SCAN_BASES)
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly buffer Totals {uint totals[];};
+layout(std430, binding = 1) writeonly buffer Bases {uint digit_bases[];};
+
+void main()
+{
+  uint running = 0u;
+  for (uint digit = 0u; digit < kRadix; ++digit) {
+    digit_bases[digit] = running;
+    running += totals[digit];
+  }
+}
+
+#elif defined(GSPLAT_STAGE_RADIX_SCATTER)
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) readonly buffer InputRecords {uvec2 input_records[];};
+layout(std430, binding = 1) writeonly buffer OutputRecords {uvec2 output_records[];};
+layout(std430, binding = 2) readonly buffer Offsets {uint offsets[];};
+layout(std430, binding = 3) readonly buffer Bases {uint digit_bases[];};
+layout(std430, binding = 4) readonly buffer State {PreparationState state;};
+uniform uint tile_count;
+uniform uint elements_per_tile;
+uniform uint shift;
+shared uint cursor[256];
+shared uint chunk_digit[32];
+shared uint chunk_active[32];
+
+void main()
+{
+  uint tile = gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  for (uint digit = lane; digit < kRadix; digit += 32u) {
+    cursor[digit] = tile < state.visible_tiles ?
+      digit_bases[digit] + offsets[digit * tile_count + tile] : 0u;
+  }
+  barrier();
+  if (tile >= state.visible_tiles) {
+    return;
+  }
+  uint begin = tile * elements_per_tile;
+  uint end = min(begin + elements_per_tile, state.visible);
+  uint tile_size = end > begin ? end - begin : 0u;
+  for (uint chunk = 0u; chunk < elements_per_tile; chunk += 32u) {
+    uint local = chunk + lane;
+    bool active = local < tile_size;
+    uvec2 record = active ? input_records[begin + local] : uvec2(0u);
+    uint digit = active ? ((record.x >> shift) & 0xffu) : 0u;
+    chunk_digit[lane] = digit;
+    chunk_active[lane] = active ? 1u : 0u;
+    barrier();
+    uint rank = 0u;
+    uint peer_count = 0u;
+    if (active) {
+      for (uint other = 0u; other < 32u; ++other) {
+        if (chunk_active[other] != 0u && chunk_digit[other] == digit) {
+          peer_count += 1u;
+          rank += other < lane ? 1u : 0u;
+        }
+      }
+    }
+    uint base = active ? cursor[digit] : 0u;
+    if (active) {
+      output_records[base + rank] = record;
+    }
+    barrier();
+    if (active && rank == 0u) {
+      cursor[digit] += peer_count;
+    }
+    barrier();
+  }
+}
+
+#elif defined(GSPLAT_STAGE_GATHER)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Sorted {uvec2 sorted_records[];};
+layout(std430, binding = 1) readonly buffer Splats {SplatRecord splats[];};
+layout(std430, binding = 2) readonly buffer Dc {float sh_dc[];};
+layout(std430, binding = 3) readonly buffer Rest {float sh_rest[];};
+layout(std430, binding = 4) readonly buffer State {PreparationState state;};
+layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
+layout(std430, binding = 6) readonly buffer ViewBlock {ViewParameters p;};
+layout(std430, binding = 7) readonly buffer ProjectionBlock {ProjectionParameters q;};
+
+vec3 evaluateSH(uint splat, vec3 position)
+{
+  vec3 colour = kSHC0 * vec3(
+    sh_dc[splat * 3u], sh_dc[splat * 3u + 1u], sh_dc[splat * 3u + 2u]) + 0.5;
+  vec3 direction = position - p.local_camera.xyz;
+  float direction_length = length(direction);
+  if (direction_length > 0.0) {
+    direction /= direction_length;
+  }
+  float x = direction.x;
+  float y = direction.y;
+  float z = direction.z;
+  uint coefficient = splat * p.sh_coefficients * 3u;
+
+  if (p.sh_coefficients >= 3u) {
+    colour += -kSHC1 * y * vec3(sh_rest[coefficient], sh_rest[coefficient + 1u], sh_rest[coefficient + 2u]);
+    colour +=  kSHC1 * z * vec3(sh_rest[coefficient + 3u], sh_rest[coefficient + 4u], sh_rest[coefficient + 5u]);
+    colour += -kSHC1 * x * vec3(sh_rest[coefficient + 6u], sh_rest[coefficient + 7u], sh_rest[coefficient + 8u]);
+  }
+  if (p.sh_coefficients >= 8u) {
+    float xx = x * x, yy = y * y, zz = z * z;
+    float xy = x * y, yz = y * z, xz = x * z;
+    colour += kSHC2[0] * xy * vec3(sh_rest[coefficient + 9u], sh_rest[coefficient + 10u], sh_rest[coefficient + 11u]);
+    colour += kSHC2[1] * yz * vec3(sh_rest[coefficient + 12u], sh_rest[coefficient + 13u], sh_rest[coefficient + 14u]);
+    colour += kSHC2[2] * (2.0 * zz - xx - yy) * vec3(sh_rest[coefficient + 15u], sh_rest[coefficient + 16u], sh_rest[coefficient + 17u]);
+    colour += kSHC2[3] * xz * vec3(sh_rest[coefficient + 18u], sh_rest[coefficient + 19u], sh_rest[coefficient + 20u]);
+    colour += kSHC2[4] * (xx - yy) * vec3(sh_rest[coefficient + 21u], sh_rest[coefficient + 22u], sh_rest[coefficient + 23u]);
+  }
+  if (p.sh_coefficients >= 15u) {
+    float xx = x * x, yy = y * y, zz = z * z, xy = x * y;
+    colour += kSHC3[0] * y * (3.0 * xx - yy) * vec3(sh_rest[coefficient + 24u], sh_rest[coefficient + 25u], sh_rest[coefficient + 26u]);
+    colour += kSHC3[1] * xy * z * vec3(sh_rest[coefficient + 27u], sh_rest[coefficient + 28u], sh_rest[coefficient + 29u]);
+    colour += kSHC3[2] * y * (4.0 * zz - xx - yy) * vec3(sh_rest[coefficient + 30u], sh_rest[coefficient + 31u], sh_rest[coefficient + 32u]);
+    colour += kSHC3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * vec3(sh_rest[coefficient + 33u], sh_rest[coefficient + 34u], sh_rest[coefficient + 35u]);
+    colour += kSHC3[4] * x * (4.0 * zz - xx - yy) * vec3(sh_rest[coefficient + 36u], sh_rest[coefficient + 37u], sh_rest[coefficient + 38u]);
+    colour += kSHC3[5] * z * (xx - yy) * vec3(sh_rest[coefficient + 39u], sh_rest[coefficient + 40u], sh_rest[coefficient + 41u]);
+    colour += kSHC3[6] * x * (xx - 3.0 * yy) * vec3(sh_rest[coefficient + 42u], sh_rest[coefficient + 43u], sh_rest[coefficient + 44u]);
+  }
+  return max(colour, vec3(0.0));
+}
+
+ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
+{
+  ProjectedInstance result;
+  result.centre_radius = vec4(0.0, 0.0, 2.0, 0.0);
+  result.axes = vec4(0.0);
+  result.colour = vec4(0.0);
+  vec3 position = splat.position_opacity.xyz;
+  vec4 homogeneous = vec4(position, 1.0);
+  float clip_w = dot(q.worldviewproj_rows[3], homogeneous);
+  if (clip_w <= 0.0) {
+    return result;
+  }
+
+  float x = splat.quat.x, y = splat.quat.y, z = splat.quat.z, w = splat.quat.w;
+  mat3 rotation = mat3(
+    vec3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y)),
+    vec3(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x)),
+    vec3(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)));
+  vec3 scale = splat.scale_pad.xyz;
+  mat3 m = mat3(rotation[0] * scale.x, rotation[1] * scale.y, rotation[2] * scale.z);
+  mat3 sigma = m * transpose(m);
+
+  float tan_fovy = tan(q.fovy * 0.5);
+  float tan_fovx = tan_fovy * q.viewport_size.x / q.viewport_size.y;
+  float focal_y = q.viewport_size.y / (2.0 * tan_fovy);
+  float focal_x = q.viewport_size.x / (2.0 * tan_fovx);
+  vec3 t = vec3(
+    dot(q.worldview_rows[0], homogeneous), dot(q.worldview_rows[1], homogeneous),
+    dot(q.worldview_rows[2], homogeneous));
+  float limx = 1.3 * tan_fovx;
+  float limy = 1.3 * tan_fovy;
+  t.x = clamp(t.x / t.z, -limx, limx) * t.z;
+  t.y = clamp(t.y / t.z, -limy, limy) * t.z;
+  vec3 t0 = (focal_x / t.z) * q.worldview_rows[0].xyz +
+    (-(focal_x * t.x) / (t.z * t.z)) * q.worldview_rows[2].xyz;
+  vec3 t1 = (focal_y / t.z) * q.worldview_rows[1].xyz +
+    (-(focal_y * t.y) / (t.z * t.z)) * q.worldview_rows[2].xyz;
+  float a = dot(t0, sigma * t0);
+  float b = dot(t0, sigma * t1);
+  float c = dot(t1, sigma * t1);
+  float det_original = a * c - b * b;
+  a += q.eps2d;
+  c += q.eps2d;
+  float compensation = sqrt(max(det_original / (a * c - b * b), 0.0));
+  float alpha = splat.position_opacity.w * mix(1.0, compensation, q.antialiased);
+  const float alpha_cutoff = 1.0 / 255.0;
+  if (alpha < alpha_cutoff) {
+    return result;
+  }
+
+  float radius = min(q.sigma_radius, sqrt(2.0 * log(alpha / alpha_cutoff)));
+  float mid = 0.5 * (a + c);
+  float half_difference = 0.5 * (a - c);
+  float root = sqrt(half_difference * half_difference + b * b);
+  float lambda1 = max(mid + root, 0.01);
+  float lambda2 = max(mid - root, 0.01);
+  vec2 axis1 = half_difference >= 0.0 ?
+    vec2(half_difference + root, b) : vec2(b, root - half_difference);
+  float axis_length = length(axis1);
+  axis1 = axis_length > 0.0 ? axis1 / axis_length : vec2(1.0, 0.0);
+  vec2 axis2 = vec2(-axis1.y, axis1.x);
+  vec3 centre = vec3(
+    dot(q.worldviewproj_rows[0], homogeneous), dot(q.worldviewproj_rows[1], homogeneous),
+    dot(q.worldviewproj_rows[2], homogeneous)) / clip_w;
+  result.centre_radius = vec4(centre, radius);
+  result.axes = vec4(
+    axis1 * (radius * sqrt(lambda1)) * 2.0 / q.viewport_size.xy,
+    axis2 * (radius * sqrt(lambda2)) * 2.0 / q.viewport_size.xy);
+  result.colour = vec4(colour, alpha);
+  return result;
+}
+
+void main()
+{
+  uint output_index = gl_GlobalInvocationID.x;
+  if (output_index >= state.visible) {
+    return;
+  }
+  uint index = sorted_records[output_index].y;
+  SplatRecord splat = splats[index];
+  vec3 colour = evaluateSH(index, splat.position_opacity.xyz);
+  instances[output_index] = projectSplat(splat, colour);
+}
+
+#else
+#error No GSPLAT_STAGE_* was selected
+#endif

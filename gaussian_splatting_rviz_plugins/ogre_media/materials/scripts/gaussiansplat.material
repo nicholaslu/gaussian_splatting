@@ -69,3 +69,44 @@ material GaussianSplatting/RViz
     scheme Depth
   }
 }
+
+// OpenGL 4.3 compute preparation writes the same ProjectedInstance stream as
+// Metal. Keeping the raster program GLSL 1.20 lets it run in the compatibility
+// context RViz already uses while preparation itself requires GLSL 4.30.
+vertex_program GaussianSplatting/RVizProjectedVP glsl
+{
+  source gsplat_projected.vert
+}
+
+fragment_program GaussianSplatting/RVizProjectedFP glsl
+{
+  source gsplat.frag
+}
+
+material GaussianSplatting/RVizProjected
+{
+  technique
+  {
+    pass
+    {
+      lighting off
+      cull_hardware none
+      cull_software none
+      scene_blend one one_minus_src_alpha
+      depth_write off
+
+      vertex_program_ref GaussianSplatting/RVizProjectedVP {}
+      fragment_program_ref GaussianSplatting/RVizProjectedFP {}
+    }
+  }
+
+  technique pick
+  {
+    scheme Pick
+  }
+
+  technique depth
+  {
+    scheme Depth
+  }
+}

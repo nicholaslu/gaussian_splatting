@@ -52,7 +52,7 @@ struct DrawIndexedArguments
 // Takes the device, the command buffer and the output buffers from Ogre and
 // hands the work to MetalViewPreparationCore, which the offline verifier
 // drives directly.
-class MetalViewPreparationImpl final : public MetalViewPreparation
+class MetalViewPreparationImpl final : public GpuViewPreparation
 {
 public:
   MetalViewPreparationImpl(Ogre::MetalRenderSystem * render_system, const std::string & shader_path)
@@ -75,6 +75,11 @@ public:
   ~MetalViewPreparationImpl() override
   {
     clear();
+  }
+
+  const char * backendName() const override
+  {
+    return "Metal";
   }
 
   bool configure(
@@ -370,7 +375,7 @@ private:
 
 }  // namespace
 
-std::unique_ptr<MetalViewPreparation> makeMetalViewPreparation(
+std::unique_ptr<GpuViewPreparation> makeMetalViewPreparation(
   Ogre::RenderSystem * render_system, const std::string & shader_path)
 {
   if (!render_system || render_system->getName().find("Metal") == std::string::npos) {

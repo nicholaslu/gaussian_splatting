@@ -2,11 +2,14 @@
 
 ## MetalSprocketsGaussianSplats
 
-The tiled GPU radix sort in `ogre_media/materials/programs/Metal/gsplat_prepare.metal`
+The tiled GPU radix sorts in
+`ogre_media/materials/programs/Metal/gsplat_prepare.metal` and
+`ogre_media/materials/programs/GLSL430/gsplat_prepare.comp`
 (`radix_histogram`, `radix_scan_offsets`, `radix_scan_digit_bases` and
-`radix_scatter`), the lane-ranked compaction built from its scatter
-(`compact_scatter`), and the dispatch sequence that drives them in
-`src/metal_view_preparation_core.mm` are adapted from the GPU sorter in
+`radix_scatter`), the lane-ranked compaction built from their scatter
+(`compact_scatter`), and the dispatch sequences that drive them in
+`src/metal_view_preparation_core.mm` and `src/opengl_view_preparation.cpp` are
+adapted from the GPU sorter in
 [MetalSprocketsGaussianSplats](https://github.com/schwa/MetalSprocketsGaussianSplats),
 copyright (c) 2025 Jonathan Wight, licensed under the MIT License:
 

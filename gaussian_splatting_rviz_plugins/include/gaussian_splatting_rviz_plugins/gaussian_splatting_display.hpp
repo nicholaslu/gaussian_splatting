@@ -32,7 +32,7 @@ namespace gaussian_splatting_rviz_plugins
 
 class DepthSchemeResolver;
 class GaussianSplatRenderable;
-class MetalViewPreparation;
+class GpuViewPreparation;
 
 class GaussianSplattingDisplay
   : public rviz_common::MessageFilterDisplay<gaussian_splatting_msgs::msg::GaussianSplats>,
@@ -114,7 +114,7 @@ private:
 
   Ogre::SceneNode * splat_node_ = nullptr;
   std::unique_ptr<GaussianSplatRenderable> renderable_;
-  std::unique_ptr<MetalViewPreparation> metal_view_preparation_;
+  std::unique_ptr<GpuViewPreparation> gpu_view_preparation_;
   Ogre::MaterialPtr material_;
   // Draws instances GPU preparation has already projected; see allocateMesh().
   Ogre::MaterialPtr projected_material_;

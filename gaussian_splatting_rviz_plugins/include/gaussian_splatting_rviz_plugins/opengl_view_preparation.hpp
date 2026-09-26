@@ -13,7 +13,7 @@ class RenderSystem;
 namespace gaussian_splatting_rviz_plugins
 {
 
-std::unique_ptr<GpuViewPreparation> makeMetalViewPreparation(
+std::unique_ptr<GpuViewPreparation> makeOpenGlViewPreparation(
   Ogre::RenderSystem * render_system, const std::string & shader_path);
 
 }  // namespace gaussian_splatting_rviz_plugins

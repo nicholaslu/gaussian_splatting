@@ -25,16 +25,18 @@ endif()
 
 add_library(${PROJECT_NAME} ${gaussian_splatting_library_type}
   src/gaussian_splatting_display.cpp
+  src/gpu_view_preparation.cpp
   src/static_plugins.cpp
 )
+
+get_filename_component(_rviz_prefix "${rviz_ogre_vendor_DIR}/../../.." REALPATH)
+set(_ogre_prefix "${_rviz_prefix}/opt/rviz_ogre_vendor")
 
 # GPU view preparation needs Ogre's Metal render system. Without it the display
 # still builds, with CPU view preparation only.
 set(GSPLAT_METAL_PREPARATION OFF)
 if(APPLE)
   enable_language(OBJCXX)
-  get_filename_component(_rviz_prefix "${rviz_ogre_vendor_DIR}/../../.." REALPATH)
-  set(_ogre_prefix "${_rviz_prefix}/opt/rviz_ogre_vendor")
   find_path(OGRE_METAL_INCLUDE_DIR OgreMetalRenderSystem.h
     HINTS "${_ogre_prefix}/include/OGRE/RenderSystems/Metal")
   # Ogre plug-ins intentionally omit the usual lib prefix, so find_library()
@@ -60,6 +62,30 @@ if(APPLE)
   endif()
 endif()
 
+# The legacy Ogre OpenGL renderer is intentional here. On Linux it normally
+# owns a modern compatibility context, allowing RViz's GLSL 1.20 materials and
+# GLSL 4.30 compute programs to coexist. Runtime capability checks keep older
+# drivers on the CPU fallback. Apple never exposes OpenGL 4.3. Windows needs a
+# small native function-loader bridge because Ogre keeps its bundled GLEW
+# symbols private, so it remains on the CPU path rather than shipping a backend
+# that cannot link there.
+set(GSPLAT_OPENGL_PREPARATION OFF)
+if(UNIX AND NOT APPLE)
+  find_path(OGRE_GL_INCLUDE_DIR OgreGLRenderSystem.h
+    HINTS "${_ogre_prefix}/include/OGRE/RenderSystems/GL")
+  unset(OGRE_GL_LIBRARY CACHE)
+  find_file(OGRE_GL_LIBRARY RenderSystem_GL.so
+    HINTS "${_ogre_prefix}/lib/OGRE" NO_DEFAULT_PATH)
+  find_package(OpenGL QUIET)
+  if(OGRE_GL_INCLUDE_DIR AND OGRE_GL_LIBRARY AND OpenGL_FOUND)
+    set(GSPLAT_OPENGL_PREPARATION ON)
+  else()
+    message(STATUS
+      "Ogre's OpenGL render system was not found; building without the optional "
+      "OpenGL 4.3 GPU preparation backend")
+  endif()
+endif()
+
 if(GSPLAT_METAL_PREPARATION)
   set(gaussian_splatting_metal_sources
     src/metal_view_preparation.mm
@@ -81,6 +107,13 @@ if(GSPLAT_METAL_PREPARATION)
     target_link_libraries(${PROJECT_NAME} "-Wl,-weak_library,${OGRE_METAL_LIBRARY}")
   endif()
   target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_HAS_METAL_PREPARATION=1)
+endif()
+
+if(GSPLAT_OPENGL_PREPARATION)
+  target_sources(${PROJECT_NAME} PRIVATE src/opengl_view_preparation.cpp)
+  target_link_libraries(${PROJECT_NAME} OpenGL::GL)
+  target_link_libraries(${PROJECT_NAME} "${OGRE_GL_LIBRARY}")
+  target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_HAS_OPENGL_PREPARATION=1)
 endif()
 
 target_include_directories(${PROJECT_NAME} PUBLIC

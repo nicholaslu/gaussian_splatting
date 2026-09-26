@@ -1,7 +1,7 @@
 #include "gaussian_splatting_rviz_plugins/gaussian_splatting_display.hpp"
 // Unconditional: the display holds a unique_ptr to this interface, and
-// destroying one needs the complete type in every build, Metal or not.
-#include "gaussian_splatting_rviz_plugins/metal_view_preparation.hpp"
+// destroying one needs the complete type in every renderer build.
+#include "gaussian_splatting_rviz_plugins/gpu_view_preparation.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -608,29 +608,26 @@ void GaussianSplattingDisplay::onInitialize()
   rviz_common::MessageFilterDisplay<GaussianSplats>::onInitialize();
 
   registerOgreResources();
-#ifdef GSPLAT_HAS_METAL_PREPARATION
-  if (usesMetalRenderSystem() && projected_material_ &&
-    !std::getenv("GSPLAT_DISABLE_GPU_PREPARATION"))
-  {
-    const std::string shader_path =
+  if (projected_material_ && !std::getenv("GSPLAT_DISABLE_GPU_PREPARATION")) {
+    const std::string shader_root =
       ament_index_cpp::get_package_share_directory("gaussian_splatting_rviz_plugins") +
-      "/ogre_media/materials/programs/Metal/gsplat_prepare.metal";
-    metal_view_preparation_ = makeMetalViewPreparation(
-      Ogre::Root::getSingleton().getRenderSystem(), shader_path);
-    if (!metal_view_preparation_ || !metal_view_preparation_->error().empty()) {
-      const std::string error = metal_view_preparation_ ?
-        metal_view_preparation_->error() : "Metal backend factory returned no implementation";
+      "/ogre_media/materials/programs";
+    std::string fallback_reason;
+    gpu_view_preparation_ = makeGpuViewPreparation(
+      Ogre::Root::getSingleton().getRenderSystem(), shader_root, fallback_reason);
+    if (!gpu_view_preparation_ || !gpu_view_preparation_->error().empty()) {
+      const std::string error = gpu_view_preparation_ ?
+        gpu_view_preparation_->error() : fallback_reason;
       setStatus(
         rviz_common::properties::StatusProperty::Warn, "GPU preparation",
         QString::fromStdString(error + "; using CPU fallback"));
-      metal_view_preparation_.reset();
+      gpu_view_preparation_.reset();
     } else {
       setStatus(
         rviz_common::properties::StatusProperty::Ok, "GPU preparation",
-        "Metal compute pipelines loaded");
+        QString("%1 compute pipelines loaded").arg(gpu_view_preparation_->backendName()));
     }
   }
-#endif
   depth_scheme_resolver_ = std::make_unique<DepthSchemeResolver>(mesh_name_);
   Ogre::MaterialManager::getSingleton().addListener(
     depth_scheme_resolver_.get(), kDepthMaterialScheme);
@@ -668,14 +665,13 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
   // Preparation and the redraw decision run from frameStarted(); the statuses
   // below report the previous frame's, which is as current as they can be here.
   if (renderable_) {
-#ifdef GSPLAT_HAS_METAL_PREPARATION
-    if (using_gpu_preparation_ && metal_view_preparation_) {
+    if (using_gpu_preparation_ && gpu_view_preparation_) {
       // Refreshed every frame, moving or not, because the count arrives from a
       // completion handler after the frame that prepared it. The draw itself
       // takes its instance count from the GPU-written indirect arguments; this
       // keeps Ogre's statistics right, and bounds a draw that somehow missed
       // the indirect buffer by the last reported count rather than every splat.
-      const std::int64_t visible = metal_view_preparation_->lastVisibleCount();
+      const std::int64_t visible = gpu_view_preparation_->lastVisibleCount();
       visible_splat_count_ = visible > 0 ? static_cast<std::size_t>(visible) : 0u;
       renderable_->setInstanceCount(visible_splat_count_);
       setStatus(
@@ -684,8 +680,8 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
         QString("pending / %1 instances (GPU)").arg(splat_count_) :
         QString("%1 / %2 instances (GPU, as of the last finished frame)")
         .arg(visible).arg(splat_count_));
-      if (metal_view_preparation_->profiling()) {
-        const MetalViewPreparation::StageTimes times = metal_view_preparation_->lastStageTimes();
+      if (gpu_view_preparation_->profiling()) {
+        const GpuViewPreparation::StageTimes times = gpu_view_preparation_->lastStageTimes();
         setStatus(
           rviz_common::properties::StatusProperty::Ok, "GPU preparation",
           QString("GPU cull+compact %1, sort %2, gather+SH %3 ms "
@@ -696,14 +692,12 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
       } else {
         setStatus(
           rviz_common::properties::StatusProperty::Ok, "GPU preparation",
-          QString("Metal queued in %1 ms CPU time; set GSPLAT_PROFILE_GPU to time GPU stages")
-          .arg(last_sort_ms_, 0, 'f', 3));
+          QString("%1 queued in %2 ms CPU time; set GSPLAT_PROFILE_GPU to time supported backends")
+          .arg(gpu_view_preparation_->backendName()).arg(last_sort_ms_, 0, 'f', 3));
       }
       deleteStatus("CPU preparation");
       deleteStatus("CPU view stages");
-    } else
-#endif
-    {
+    } else {
       setStatus(
         rviz_common::properties::StatusProperty::Ok, "Visible splats",
         QString("%1 / %2 instances").arg(visible_splat_count_).arg(splat_count_));
@@ -913,15 +907,14 @@ void GaussianSplattingDisplay::registerOgreResources()
   material_ = base->clone(material_name_, true, kResourceGroup);
   material_->load();
 
-  // Only Metal has GPU preparation, and so only Metal needs the material that
-  // draws its projected instances.
-  if (usesMetalRenderSystem()) {
-    const Ogre::MaterialPtr projected = Ogre::MaterialManager::getSingleton().getByName(
-      kProjectedMaterialName, kResourceGroup);
-    if (projected) {
-      projected_material_ = projected->clone(material_name_ + "_Projected", true, kResourceGroup);
-      projected_material_->load();
-    }
+  // Metal and OpenGL 4.3 preparation produce the same ProjectedInstance
+  // stream. Legacy OpenGL loads this material too but continues on the CPU
+  // format when no compute backend is selected.
+  const Ogre::MaterialPtr projected = Ogre::MaterialManager::getSingleton().getByName(
+    kProjectedMaterialName, kResourceGroup);
+  if (projected) {
+    projected_material_ = projected->clone(material_name_ + "_Projected", true, kResourceGroup);
+    projected_material_->load();
   }
   setStatus(rviz_common::properties::StatusProperty::Ok, "Material", "loaded");
 
@@ -930,11 +923,9 @@ void GaussianSplattingDisplay::registerOgreResources()
 
 void GaussianSplattingDisplay::clearMesh()
 {
-#ifdef GSPLAT_HAS_METAL_PREPARATION
-  if (metal_view_preparation_) {
-    metal_view_preparation_->clear();
+  if (gpu_view_preparation_) {
+    gpu_view_preparation_->clear();
   }
-#endif
   if (renderable_) {
     if (splat_node_) {
       splat_node_->detachObject(renderable_.get());
@@ -1009,7 +1000,7 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   // GPU preparation writes each instance already projected, so its vertex
   // program only places the corners; the CPU path hands over an index and a
   // colour and leaves the projection to the vertex program, once per vertex.
-  gpu_projected_ = metal_view_preparation_ != nullptr && projected_material_;
+  gpu_projected_ = gpu_view_preparation_ != nullptr && projected_material_;
   Ogre::VertexDeclaration * declaration = vertex_data->vertexDeclaration;
   if (gpu_projected_) {
     declaration->addElement(
@@ -1071,18 +1062,16 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
   renderable_->setRenderQueueGroup(kSplatRenderQueue);
   splat_node_->attachObject(renderable_.get());
 
-#ifdef GSPLAT_HAS_METAL_PREPARATION
-  if (gpu_projected_ && !metal_view_preparation_->configure(
+  if (gpu_projected_ && !gpu_view_preparation_->configure(
       count, kIndicesPerSplat, instance_buffer_, renderable_.get()))
   {
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
-      QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+      QString::fromStdString(gpu_view_preparation_->error() + "; using CPU fallback"));
     // Built for projected instances, which only GPU preparation writes.
-    metal_view_preparation_.reset();
+    gpu_view_preparation_.reset();
     allocateMesh(count);
   }
-#endif
 }
 
 void GaussianSplattingDisplay::createSplatDataTexture(std::size_t count)
@@ -1186,16 +1175,14 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
 
   writeSplatDataTexture();
 
-#ifdef GSPLAT_HAS_METAL_PREPARATION
-  if (metal_view_preparation_ && !metal_view_preparation_->uploadStaticData(
+  if (gpu_view_preparation_ && !gpu_view_preparation_->uploadStaticData(
       records_.data(), records_.size(),
       sh_dc_, msg.sh_dc.size(), sh_rest_, msg.sh_rest.size()))
   {
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
-      QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+      QString::fromStdString(gpu_view_preparation_->error() + "; using CPU fallback"));
   }
-#endif
 
   if (renderable_) {
     renderable_->setBoundingBox(bounds);
@@ -1449,15 +1436,14 @@ void GaussianSplattingDisplay::sortIndexBuffer()
   parameters.flags =
     (culling_enabled ? kViewCulling : 0u) | (perspective ? kViewPerspective : 0u);
 
-#ifdef GSPLAT_HAS_METAL_PREPARATION
-  if (metal_view_preparation_) {
-    if (metal_view_preparation_->encode(parameters, projection)) {
+  if (gpu_view_preparation_) {
+    if (gpu_view_preparation_->encode(parameters, projection)) {
       if (!using_gpu_preparation_) {
         RCLCPP_INFO(
           rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
-          "Metal GPU view preparation enabled: %zu splats, compacted 32-bit radix, "
+          "%s GPU view preparation enabled: %zu splats, compacted stable 32-bit radix, "
           "indirect draw%s",
-          splat_count_, metal_view_preparation_->profiling() ?
+          gpu_view_preparation_->backendName(), splat_count_, gpu_view_preparation_->profiling() ?
           "; GSPLAT_PROFILE_GPU runs the stages synchronously" : "");
       }
       using_gpu_preparation_ = true;
@@ -1474,12 +1460,11 @@ void GaussianSplattingDisplay::sortIndexBuffer()
 
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
-      QString::fromStdString(metal_view_preparation_->error() + "; using CPU fallback"));
+      QString::fromStdString(gpu_view_preparation_->error() + "; using CPU fallback"));
     // The mesh holds projected instances, which only GPU preparation writes.
     fallBackToCpuPreparation();
     return;
   }
-#endif
 
   using_gpu_preparation_ = false;
 
@@ -1611,7 +1596,7 @@ void GaussianSplattingDisplay::fallBackToCpuPreparation()
 {
   // Held across clearMesh(), which drops the display's own reference.
   const GaussianSplats::ConstSharedPtr message = message_;
-  metal_view_preparation_.reset();
+  gpu_view_preparation_.reset();
   using_gpu_preparation_ = false;
   clearMesh();
   if (message) {
