@@ -90,7 +90,7 @@ public:
   NSUInteger scratchBytes() const;
 
 private:
-  enum class Dispatch { kLinear, kTiled, kSimdRanked };
+  enum class Dispatch { kLinear, kTiled, kSimdRanked, kScan };
 
   id<MTLComputePipelineState> makePipeline(NSString * name, Dispatch dispatch);
   id<MTLBuffer> newBuffer(NSUInteger bytes, const char * label);

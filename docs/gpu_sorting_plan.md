@@ -397,6 +397,24 @@ does for AArch64, can still differ in the last ulp. OpenGL stages are timed
 with timestamp queries under `GSPLAT_PROFILE_GPU`, like Metal, and bind at most
 eight storage blocks, the most OpenGL guarantees.
 
+The scans are parallel. Timestamps inside the sort on the RTX 4090 put 4.2-5.4
+ms of its 5-7 ms in the prefix sums, and 0.55 ms more in compaction's: 256
+threads each walking a whole row of per-tile counts, and single threads summing
+the digit totals and the tile counts. All three are now 256-thread workgroup
+scans (Hillis-Steele, in core OpenGL 4.3 and plain Metal), walking a row 256
+entries at a time. Same synthetic scene, median of 7, exact against the CPU on
+both:
+
+| Stage | RTX 4090 before | RTX 4090 after | M3 before | M3 after |
+| --- | ---: | ---: | ---: | ---: |
+| Cull and compaction | 1.70 ms | 1.21 ms | 5.35 ms | 4.97 ms |
+| Radix sort | 5.09-6.71 ms | 1.53 ms | 8.02 ms | 5.97 ms |
+| Whole preparation | 12.6 ms | 6.9-7.2 ms | 27.83 ms | 25.2-25.8 ms |
+
+On the RTX 4090 the sort now splits into histograms 0.28 ms, scans 0.17 ms and
+scatters 1.08 ms over the four passes; `GSPLAT_PROFILE_GPU` and the OpenGL
+verifier report that breakdown.
+
 Still open:
 
 - Degree-3 SH is uploaded as float32, about 1 GiB at this count. Uploads now
@@ -404,10 +422,13 @@ Still open:
   precision would halve it at the cost of exact agreement with the CPU colours.
 - Projection before the sort is measured on synthetic scenes only; the full
   Garden PLY in RViz has yet to be timed with it.
-- On the RTX 4090 the radix sort is now the largest stage, 7 ms of 13. GLSL
-  ranks the 32 lanes of a tile by looping over them, where Metal uses
-  simd_ballot; subgroup ballot, where the driver has it, is the next thing to
-  try there.
+- The OpenGL scatters, 1.08 ms in the radix and 0.43 ms in compaction on the
+  RTX 4090, rank the 32 lanes of a tile by looping over them, where Metal uses
+  simd_ballot. Subgroup ballot, where the driver has it, is the next thing to
+  try there, keeping the loop for drivers without it.
+- On the M3 shading and projection is now the largest stage, 10.4 ms of about
+  25, and it is bound by reading float32 SH coefficients; half precision is the
+  candidate there.
 - Frame pacing is the next target: the sort could be spread over several frames
   in slices, with the gather re-projecting the last completed order every
   frame. That needs a guard band on the culling, since a stale cull would

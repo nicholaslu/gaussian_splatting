@@ -112,6 +112,58 @@ float transformRow(vec4 row, vec3 point)
   return result;
 }
 
+#if defined(GSPLAT_STAGE_COMPACT_SCAN) || defined(GSPLAT_STAGE_RADIX_SCAN_OFFSETS) || \
+  defined(GSPLAT_STAGE_RADIX_SCAN_BASES)
+// The scans run 256 lanes wide and walk a row 256 entries at a time. Each lane
+// looping over a whole row by itself, as these stages once did, cost 4-5 ms of
+// a 5-7 ms sort on an RTX 4090: a few hundred threads with long dependent loops
+// on a GPU that wants tens of thousands.
+const uint kScanWidth = 256u;
+shared uint scan_scratch[kScanWidth];
+shared uint scan_carry;
+
+// Inclusive prefix sum of `value` across the workgroup (Hillis-Steele). Every
+// lane has to call it, the same number of times.
+uint workgroupInclusiveScan(uint value)
+{
+  uint lane = gl_LocalInvocationID.x;
+  scan_scratch[lane] = value;
+  barrier();
+  for (uint offset = 1u; offset < kScanWidth; offset <<= 1u) {
+    uint add = lane >= offset ? scan_scratch[lane - offset] : 0u;
+    barrier();
+    scan_scratch[lane] += add;
+    barrier();
+  }
+  uint result = scan_scratch[lane];
+  barrier();
+  return result;
+}
+
+// Exclusive prefix sums of `count` entries read by `load`, written by `store`,
+// carried across chunks in scan_carry, which ends as the row's total.
+#define GSPLAT_SCAN_ROW(count, load, store) \
+  { \
+    if (gl_LocalInvocationID.x == 0u) { \
+      scan_carry = 0u; \
+    } \
+    barrier(); \
+    for (uint start = 0u; start < (count); start += kScanWidth) { \
+      uint entry = start + gl_LocalInvocationID.x; \
+      uint value = entry < (count) ? load(entry) : 0u; \
+      uint inclusive = workgroupInclusiveScan(value); \
+      if (entry < (count)) { \
+        store(entry, scan_carry + inclusive - value); \
+      } \
+      barrier(); \
+      if (gl_LocalInvocationID.x == kScanWidth - 1u) { \
+        scan_carry += inclusive; \
+      } \
+      barrier(); \
+    } \
+  }
+#endif
+
 #if defined(GSPLAT_STAGE_MAKE_DEPTH_KEYS)
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Splats {SplatRecord splats[];};
@@ -204,7 +256,7 @@ void main()
 }
 
 #elif defined(GSPLAT_STAGE_COMPACT_SCAN)
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Counts {uint tile_counts[];};
 layout(std430, binding = 1) writeonly buffer Offsets {uint tile_offsets[];};
 layout(std430, binding = 2) buffer State {PreparationState state;};
@@ -235,13 +287,23 @@ uniform uint elements_per_tile;
 uniform uint gather_width;
 uniform uint index_count;
 
+uint loadTileCount(uint tile)
+{
+  return tile_counts[tile];
+}
+
+void storeTileOffset(uint tile, uint offset)
+{
+  tile_offsets[tile] = offset;
+}
+
 void main()
 {
-  uint visible = 0u;
-  for (uint tile = 0u; tile < tile_count; ++tile) {
-    tile_offsets[tile] = visible;
-    visible += tile_counts[tile];
+  GSPLAT_SCAN_ROW(tile_count, loadTileCount, storeTileOffset)
+  if (gl_LocalInvocationID.x != 0u) {
+    return;
   }
+  uint visible = scan_carry;
   uint written = state.written;
   state.visible = visible;
   state.visible_tiles = (visible + elements_per_tile - 1u) / elements_per_tile;
@@ -359,40 +421,46 @@ void main()
 }
 
 #elif defined(GSPLAT_STAGE_RADIX_SCAN_OFFSETS)
-layout(local_size_x = 64) in;
+// One workgroup per digit, scanning that digit's count in every tile.
+layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Histograms {uint histograms[];};
 layout(std430, binding = 1) writeonly buffer Offsets {uint offsets[];};
 layout(std430, binding = 2) writeonly buffer Totals {uint totals[];};
 layout(std430, binding = 3) readonly buffer State {PreparationState state;};
 uniform uint tile_count;
 
+uint row_base = 0u;
+
+uint loadCount(uint tile)
+{
+  return histograms[row_base + tile];
+}
+
+void storeOffset(uint tile, uint offset)
+{
+  offsets[row_base + tile] = offset;
+}
+
 void main()
 {
-  uint digit = gl_GlobalInvocationID.x;
-  if (digit >= kRadix) {
-    return;
+  uint digit = gl_WorkGroupID.x;
+  row_base = digit * tile_count;
+  GSPLAT_SCAN_ROW(state.visible_tiles, loadCount, storeOffset)
+  if (gl_LocalInvocationID.x == 0u) {
+    totals[digit] = scan_carry;
   }
-  uint running = 0u;
-  uint base = digit * tile_count;
-  for (uint tile = 0u; tile < state.visible_tiles; ++tile) {
-    offsets[base + tile] = running;
-    running += histograms[base + tile];
-  }
-  totals[digit] = running;
 }
 
 #elif defined(GSPLAT_STAGE_RADIX_SCAN_BASES)
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Totals {uint totals[];};
 layout(std430, binding = 1) writeonly buffer Bases {uint digit_bases[];};
 
 void main()
 {
-  uint running = 0u;
-  for (uint digit = 0u; digit < kRadix; ++digit) {
-    digit_bases[digit] = running;
-    running += totals[digit];
-  }
+  uint digit = gl_LocalInvocationID.x;
+  uint total = totals[digit];
+  digit_bases[digit] = workgroupInclusiveScan(total) - total;
 }
 
 #elif defined(GSPLAT_STAGE_RADIX_SCATTER)

@@ -22,6 +22,8 @@ namespace
 constexpr std::uint32_t kThreadsPerTile = 32;
 constexpr std::uint32_t kElementsPerTile = 1024;
 constexpr std::uint32_t kRadix = 256;
+// Threads in each scan threadgroup; kScanWidth in gsplat_prepare.metal.
+constexpr std::uint32_t kScanWidth = 256;
 
 // Mirror the structs of the same names in gsplat_prepare.metal.
 struct TileParameters
@@ -78,11 +80,11 @@ MetalViewPreparationCore::MetalViewPreparationCore(
     }
     keys_pipeline_ = makePipeline(@"make_depth_keys", Dispatch::kLinear);
     compact_count_pipeline_ = makePipeline(@"compact_count", Dispatch::kLinear);
-    compact_scan_pipeline_ = makePipeline(@"compact_scan", Dispatch::kLinear);
+    compact_scan_pipeline_ = makePipeline(@"compact_scan", Dispatch::kScan);
     compact_scatter_pipeline_ = makePipeline(@"compact_scatter", Dispatch::kSimdRanked);
     histogram_pipeline_ = makePipeline(@"radix_histogram", Dispatch::kTiled);
-    offset_pipeline_ = makePipeline(@"radix_scan_offsets", Dispatch::kLinear);
-    base_pipeline_ = makePipeline(@"radix_scan_digit_bases", Dispatch::kLinear);
+    offset_pipeline_ = makePipeline(@"radix_scan_offsets", Dispatch::kScan);
+    base_pipeline_ = makePipeline(@"radix_scan_digit_bases", Dispatch::kScan);
     scatter_pipeline_ = makePipeline(@"radix_scatter", Dispatch::kSimdRanked);
     shade_pipeline_ = makePipeline(@"shade_project", Dispatch::kLinear);
     gather_pipeline_ = makePipeline(@"gather_instances", Dispatch::kLinear);
@@ -262,7 +264,8 @@ bool MetalViewPreparationCore::encodeCull(
   [encoder setBuffer:gather_dispatch_ offset:0 atIndex:4];
   [encoder setBuffer:draw_arguments offset:0 atIndex:5];
   [encoder setBytes:&scan length:sizeof(scan) atIndex:6];
-  [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
   barrier(encoder);
 
   [encoder setComputePipelineState:compact_scatter_pipeline_];
@@ -303,14 +306,15 @@ id<MTLBuffer> MetalViewPreparationCore::encodeSort(
     [encoder setBuffer:totals_ offset:0 atIndex:2];
     [encoder setBytes:&radix length:sizeof(radix) atIndex:3];
     [encoder setBuffer:state_ offset:0 atIndex:4];
-    [encoder dispatchThreads:MTLSizeMake(kRadix, 1, 1)
-       threadsPerThreadgroup:linearWidth(offset_pipeline_, 64u)];
+    [encoder dispatchThreadgroups:MTLSizeMake(kRadix, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
     barrier(encoder);
 
     [encoder setComputePipelineState:base_pipeline_];
     [encoder setBuffer:totals_ offset:0 atIndex:0];
     [encoder setBuffer:digit_bases_ offset:0 atIndex:1];
-    [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
     barrier(encoder);
 
     [encoder setComputePipelineState:scatter_pipeline_];
@@ -433,6 +437,13 @@ id<MTLComputePipelineState> MetalViewPreparationCore::makePipeline(
       error_ = std::string(name.UTF8String) +
         " needs 32 threads per threadgroup; this GPU allows " +
         std::to_string(pipeline.maxTotalThreadsPerThreadgroup);
+    }
+    return nil;
+  }
+  if (dispatch == Dispatch::kScan && pipeline.maxTotalThreadsPerThreadgroup < kScanWidth) {
+    if (error_.empty()) {
+      error_ = std::string(name.UTF8String) + " scans with 256 threads per threadgroup; this GPU "
+        "allows " + std::to_string(pipeline.maxTotalThreadsPerThreadgroup);
     }
     return nil;
   }

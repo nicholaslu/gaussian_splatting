@@ -291,6 +291,8 @@ void timeStages(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection)
 {
   std::vector<double> whole, cull, shade, sort, gather;
+  std::vector<double> keys, compact_count, compact_scan, compact_scatter;
+  std::vector<double> histogram, radix_scan, radix_scatter;
   for (int rep = 0; rep < 2; ++rep) {
     prepare(context, view, projection);
   }
@@ -307,6 +309,13 @@ void timeStages(
     shade.push_back(timings.shade_ms);
     sort.push_back(timings.sort_ms);
     gather.push_back(timings.gather_ms);
+    keys.push_back(timings.keys_ms);
+    compact_count.push_back(timings.compact_count_ms);
+    compact_scan.push_back(timings.compact_scan_ms);
+    compact_scatter.push_back(timings.compact_scatter_ms);
+    histogram.push_back(timings.radix_histogram_ms);
+    radix_scan.push_back(timings.radix_scan_ms);
+    radix_scatter.push_back(timings.radix_scatter_ms);
   }
   context.core->setProfiling(false);
   const auto state =
@@ -316,6 +325,12 @@ void timeStages(
   std::printf(
     "  GPU by stage: cull+compact %.2f | shade+project %.2f | sort %.2f | gather %.2f ms\n",
     median(cull), median(shade), median(sort), median(gather));
+  std::printf(
+    "    cull: keys %.2f | compact count %.2f | compact scan %.2f | compact scatter %.2f ms\n",
+    median(keys), median(compact_count), median(compact_scan), median(compact_scatter));
+  std::printf(
+    "    sort, four passes: histogram %.2f | scan %.2f | scatter %.2f ms\n",
+    median(histogram), median(radix_scan), median(radix_scatter));
   std::printf("  preparation scratch buffers %.0f MiB\n\n",
     double(context.core->scratchBytes()) / (1024.0 * 1024.0));
 }

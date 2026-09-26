@@ -15,6 +15,28 @@
 using namespace metal;
 
 constant uint kRadix = 256;
+
+// The scans run 256 threads wide and walk a row 256 entries at a time. Each
+// thread looping over a whole row by itself, as these kernels once did, cost
+// 4-5 ms of a 5-7 ms sort in the OpenGL equivalent on an RTX 4090.
+constant uint kScanWidth = 256;
+
+// Inclusive prefix sum of `value` across a threadgroup of kScanWidth threads
+// (Hillis-Steele). Every thread has to call it, the same number of times.
+static uint threadgroupInclusiveScan(uint value, uint lane, threadgroup uint * scratch)
+{
+  scratch[lane] = value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint offset = 1; offset < kScanWidth; offset <<= 1) {
+    const uint add = lane >= offset ? scratch[lane - offset] : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    scratch[lane] += add;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const uint result = scratch[lane];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return result;
+}
 // Marks a rejected splat in the index half of its record. Keys stay exact, and
 // no splat index can reach this value.
 constant uint kRejected = 0xffffffffu;
@@ -224,16 +246,31 @@ kernel void compact_scan(
   device DispatchArguments * gather_dispatch [[buffer(4)]],
   device DrawIndexedArguments * draw [[buffer(5)]],
   constant ScanParameters & parameters [[buffer(6)]],
-  uint id [[thread_position_in_grid]])
+  uint lane [[thread_index_in_threadgroup]])
 {
-  if (id != 0) {
+  threadgroup uint scratch[kScanWidth];
+  threadgroup uint carry;
+  if (lane == 0) {
+    carry = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint start = 0; start < parameters.tile_count; start += kScanWidth) {
+    const uint tile = start + lane;
+    const uint count = tile < parameters.tile_count ? tile_counts[tile] : 0u;
+    const uint inclusive = threadgroupInclusiveScan(count, lane, scratch);
+    if (tile < parameters.tile_count) {
+      tile_offsets[tile] = carry + inclusive - count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == kScanWidth - 1) {
+      carry += inclusive;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (lane != 0) {
     return;
   }
-  uint visible = 0;
-  for (uint tile = 0; tile < parameters.tile_count; ++tile) {
-    tile_offsets[tile] = visible;
-    visible += tile_counts[tile];
-  }
+  const uint visible = carry;
   const uint visible_tiles =
     (visible + parameters.elements_per_tile - 1u) / parameters.elements_per_tile;
   const uint gather_groups = (visible + parameters.gather_width - 1u) / parameters.gather_width;
@@ -338,33 +375,44 @@ kernel void radix_scan_offsets(
   device uint * totals [[buffer(2)]],
   constant TileParameters & parameters [[buffer(3)]],
   device const PreparationState & state [[buffer(4)]],
-  uint digit [[thread_position_in_grid]])
+  uint digit [[threadgroup_position_in_grid]],
+  uint lane [[thread_index_in_threadgroup]])
 {
-  if (digit >= kRadix) {
-    return;
+  // One threadgroup per digit, scanning that digit's count in every tile.
+  threadgroup uint scratch[kScanWidth];
+  threadgroup uint carry;
+  if (lane == 0) {
+    carry = 0;
   }
-  uint running = 0;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint base = digit * parameters.tile_count;
-  for (uint tile = 0; tile < state.visible_tiles; ++tile) {
-    offsets[base + tile] = running;
-    running += histograms[base + tile];
+  const uint tiles = state.visible_tiles;
+  for (uint start = 0; start < tiles; start += kScanWidth) {
+    const uint tile = start + lane;
+    const uint count = tile < tiles ? histograms[base + tile] : 0u;
+    const uint inclusive = threadgroupInclusiveScan(count, lane, scratch);
+    if (tile < tiles) {
+      offsets[base + tile] = carry + inclusive - count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == kScanWidth - 1) {
+      carry += inclusive;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  totals[digit] = running;
+  if (lane == 0) {
+    totals[digit] = carry;
+  }
 }
 
 kernel void radix_scan_digit_bases(
   device const uint * totals [[buffer(0)]],
   device uint * digit_bases [[buffer(1)]],
-  uint id [[thread_position_in_grid]])
+  uint digit [[thread_index_in_threadgroup]])
 {
-  if (id != 0) {
-    return;
-  }
-  uint running = 0;
-  for (uint digit = 0; digit < kRadix; ++digit) {
-    digit_bases[digit] = running;
-    running += totals[digit];
-  }
+  threadgroup uint scratch[kScanWidth];
+  const uint total = totals[digit];
+  digit_bases[digit] = threadgroupInclusiveScan(total, digit, scratch) - total;
 }
 
 kernel void radix_scatter(

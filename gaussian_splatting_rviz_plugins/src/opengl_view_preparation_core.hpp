@@ -40,13 +40,22 @@ public:
     std::uint32_t clear_end;
   };
 
-  // GPU time between the stage boundaries of the latest preparation.
+  // GPU time between the stage boundaries of the latest preparation, and
+  // within culling and the sort; the radix steps are summed over the passes.
   struct Timings
   {
     double cull_ms = 0.0;
     double shade_ms = 0.0;
     double sort_ms = 0.0;
     double gather_ms = 0.0;
+
+    double keys_ms = 0.0;
+    double compact_count_ms = 0.0;
+    double compact_scan_ms = 0.0;
+    double compact_scatter_ms = 0.0;
+    double radix_histogram_ms = 0.0;
+    double radix_scan_ms = 0.0;
+    double radix_scatter_ms = 0.0;
   };
 
   explicit OpenGlViewPreparationCore(const std::string & shader_source);
@@ -115,7 +124,8 @@ private:
   std::string error_;
   std::array<GLuint, 11> programs_{};
   bool profiling_ = false;
-  std::array<GLuint, 5> queries_{};
+  // Stage boundaries 0-4, then three within culling and four per radix pass.
+  std::array<GLuint, 24> queries_{};
   Timings timings_;
   GLuint current_program_ = 0u;
   GLint64 max_storage_block_bytes_ = 0;

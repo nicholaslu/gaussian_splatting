@@ -15,6 +15,14 @@ constexpr std::uint32_t kElementsPerTile = 1024u;
 constexpr std::uint32_t kGatherWidth = 256u;
 constexpr std::uint32_t kRadix = 256u;
 
+// Timestamp slots: the stage boundaries, then the steps inside culling and
+// inside each of the four radix passes.
+constexpr std::size_t kMarkAfterKeys = 5u;
+constexpr std::size_t kMarkAfterCompactCount = 6u;
+constexpr std::size_t kMarkAfterCompactScan = 7u;
+// + 4 * pass + {histogram, offsets, bases, scatter}, each marking its end.
+constexpr std::size_t kMarkRadix = 8u;
+
 // Ogre's GL render system carries its own GLEW and exports its function
 // pointers, but that GLEW stops short of OpenGL 4.3: nothing provides
 // __glewDispatchCompute, __glewDispatchComputeIndirect or __GLEW_VERSION_4_3,
@@ -424,6 +432,7 @@ bool OpenGlViewPreparationCore::encode(
   bind(0, splats_); bind(1, keys_b_); bind(2, view_parameters_);
   glDispatchCompute(groups(count_, 256u), 1, 1);
   storageBarrier();
+  mark(kMarkAfterKeys);
 
   use(programs_[1]);
   bind(0, keys_b_); bind(1, tile_counts_);
@@ -431,6 +440,7 @@ bool OpenGlViewPreparationCore::encode(
   uniform("elements_per_tile", kElementsPerTile);
   glDispatchCompute(groups(tile_count_, 256u), 1, 1);
   storageBarrier();
+  mark(kMarkAfterCompactCount);
 
   use(programs_[2]);
   bind(0, tile_counts_); bind(1, tile_offsets_); bind(2, state_);
@@ -440,6 +450,7 @@ bool OpenGlViewPreparationCore::encode(
   uniform("gather_width", kGatherWidth); uniform("index_count", index_count_);
   glDispatchCompute(1, 1, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+  mark(kMarkAfterCompactScan);
 
   use(programs_[3]);
   bind(0, keys_b_); bind(1, keys_a_); bind(2, tile_offsets_);
@@ -466,23 +477,27 @@ bool OpenGlViewPreparationCore::encode(
   GLuint input = keys_a_;
   GLuint output = keys_b_;
   for (std::uint32_t shift = 0; shift < 32u; shift += 8u) {
+    const std::size_t pass_mark = kMarkRadix + 4u * (shift / 8u);
     use(programs_[4]);
     bind(0, input); bind(1, histograms_); bind(2, state_);
     uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
     uniform("shift", shift);
     dispatchIndirect(tile_dispatch_);
     storageBarrier();
+    mark(pass_mark);
 
     use(programs_[5]);
     bind(0, histograms_); bind(1, offsets_); bind(2, totals_); bind(3, state_);
     uniform("tile_count", tile_count_);
-    glDispatchCompute(kRadix / 64u, 1, 1);
+    glDispatchCompute(kRadix, 1, 1);
     storageBarrier();
+    mark(pass_mark + 1u);
 
     use(programs_[6]);
     bind(0, totals_); bind(1, digit_bases_);
     glDispatchCompute(1, 1, 1);
     storageBarrier();
+    mark(pass_mark + 2u);
 
     use(programs_[7]);
     bind(0, input); bind(1, output); bind(2, offsets_); bind(3, digit_bases_); bind(4, state_);
@@ -490,6 +505,7 @@ bool OpenGlViewPreparationCore::encode(
     uniform("shift", shift);
     dispatchIndirect(tile_dispatch_);
     storageBarrier();
+    mark(pass_mark + 3u);
     std::swap(input, output);
   }
   mark(3);
@@ -627,7 +643,7 @@ void OpenGlViewPreparationCore::readTimings()
   if (!profiling_) {
     return;
   }
-  std::array<GLuint64, 5> ticks{};
+  std::array<GLuint64, 24> ticks{};
   for (std::size_t i = 0; i < ticks.size(); ++i) {
     timerFunctions().get_query_result(queries_[i], GL_QUERY_RESULT, &ticks[i]);
   }
@@ -638,6 +654,21 @@ void OpenGlViewPreparationCore::readTimings()
   timings_.shade_ms = ms(1, 2);
   timings_.sort_ms = ms(2, 3);
   timings_.gather_ms = ms(3, 4);
+
+  timings_.keys_ms = ms(0, kMarkAfterKeys);
+  timings_.compact_count_ms = ms(kMarkAfterKeys, kMarkAfterCompactCount);
+  timings_.compact_scan_ms = ms(kMarkAfterCompactCount, kMarkAfterCompactScan);
+  timings_.compact_scatter_ms = ms(kMarkAfterCompactScan, 1);
+  timings_.radix_histogram_ms = 0.0;
+  timings_.radix_scan_ms = 0.0;
+  timings_.radix_scatter_ms = 0.0;
+  for (std::size_t pass = 0; pass < 4u; ++pass) {
+    const std::size_t base = kMarkRadix + 4u * pass;
+    const std::size_t start = pass == 0 ? 2u : base - 1u;  // the previous scatter's end
+    timings_.radix_histogram_ms += ms(start, base);
+    timings_.radix_scan_ms += ms(base, base + 2u);
+    timings_.radix_scatter_ms += ms(base + 2u, base + 3u);
+  }
 }
 
 void OpenGlViewPreparationCore::pollReadbacks()
