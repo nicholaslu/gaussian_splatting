@@ -20,6 +20,7 @@
 #include "gaussian_splatting_rviz_plugins/splat_view.hpp"
 #include "rviz_common/message_filter_display.hpp"
 #include "rviz_common/properties/bool_property.hpp"
+#include "rviz_common/properties/enum_property.hpp"
 #include "rviz_common/properties/float_property.hpp"
 
 namespace Ogre
@@ -110,6 +111,7 @@ private:
   rviz_common::properties::FloatProperty * min_screen_radius_property_ = nullptr;
   rviz_common::properties::BoolProperty * offscreen_property_ = nullptr;
   rviz_common::properties::FloatProperty * render_scale_property_ = nullptr;
+  rviz_common::properties::EnumProperty * antialiasing_property_ = nullptr;
   rviz_common::properties::FloatProperty * static_refresh_property_ = nullptr;
 
   Ogre::SceneNode * splat_node_ = nullptr;
@@ -131,6 +133,9 @@ private:
   std::unique_ptr<DepthSchemeResolver> depth_scheme_resolver_;
   unsigned int rtt_width_ = 0;
   unsigned int rtt_height_ = 0;
+  // Samples asked of the offscreen target, and the samples it has.
+  unsigned int rtt_requested_samples_ = 0;
+  unsigned int rtt_samples_ = 0;
 
   // Offscreen image reuse. The image is redrawn when anything it depends on
   // changes, and otherwise only every Static Refresh Interval, which is what

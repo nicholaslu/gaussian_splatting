@@ -137,6 +137,27 @@ if(GSPLAT_METAL_PREPARATION)
   target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_HAS_METAL_PREPARATION=1)
 endif()
 
+# Offscreen antialiasing samples a multisampled render texture. Ogre 1.12's
+# Metal render system binds the multisampled texture itself for that, which a
+# texture2d cannot read; the patched rviz_ogre_vendor binds the resolved one
+# and says so in OgreMetalTexture.h. Without it, Metal draws with no MSAA.
+if(APPLE)
+  find_file(OGRE_METAL_TEXTURE_HEADER OgreMetalTexture.h
+    HINTS "${_ogre_prefix}/include/OGRE/RenderSystems/Metal" NO_DEFAULT_PATH)
+  set(_ogre_metal_msaa_sampling "")
+  if(OGRE_METAL_TEXTURE_HEADER)
+    file(STRINGS "${OGRE_METAL_TEXTURE_HEADER}" _ogre_metal_msaa_sampling
+      REGEX "OGRE_METAL_SAMPLES_RESOLVED_FSAA")
+  endif()
+  if(_ogre_metal_msaa_sampling)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_OGRE_METAL_MSAA_SAMPLING=1)
+  else()
+    message(STATUS
+      "Ogre's Metal render system cannot sample a multisampled render texture; "
+      "offscreen antialiasing will be unavailable on Metal")
+  endif()
+endif()
+
 if(GSPLAT_OPENGL_PREPARATION)
   target_sources(${PROJECT_NAME} PRIVATE
     src/opengl_view_preparation.cpp

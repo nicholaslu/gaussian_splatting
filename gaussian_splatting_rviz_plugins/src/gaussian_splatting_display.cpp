@@ -52,6 +52,7 @@
 #include "rviz_common/view_controller.hpp"
 #include "rviz_common/render_panel.hpp"
 #include "rviz_common/properties/bool_property.hpp"
+#include "rviz_common/properties/enum_property.hpp"
 #include "rviz_common/view_manager.hpp"
 #include "rviz_rendering/render_window.hpp"
 
@@ -525,14 +526,17 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
     "the scene, instead of drawing them straight into the window.\n\n"
     "This is worth switching on even at full resolution: RViz configures the "
     "window for 4x MSAA, which costs four samples per fragment and does "
-    "nothing for alpha blended splats, since they have no geometric edges to "
-    "antialias. The offscreen target has no MSAA, which measured roughly 3x "
-    "faster with no visible difference.\n\n"
+    "nothing for the splats themselves, since a Gaussian has no geometric edge "
+    "to antialias. Without MSAA the offscreen target measured roughly 3x "
+    "faster. Every other display is still drawn into the window with its "
+    "MSAA; see Antialiasing for the one place the splats can use it.\n\n"
     "The scene is drawn into the target once beforehand to lay down depth, so "
     "the splats are occluded by other displays exactly as they are when drawn "
     "straight into the window. At Render Scale below 1.0 that depth is lower "
     "resolution, so the occlusion boundary gets correspondingly coarser.",
     this);
+  // Render Scale and Antialiasing only configure the offscreen target.
+  offscreen_property_->setDisableChildrenIfFalse(true);
 
   render_scale_property_ = new rviz_common::properties::FloatProperty(
     "Render Scale", 1.0f,
@@ -544,6 +548,19 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
     offscreen_property_);
   render_scale_property_->setMin(0.25f);
   render_scale_property_->setMax(1.0f);
+
+  antialiasing_property_ = new rviz_common::properties::EnumProperty(
+    "Antialiasing", "Off",
+    "Multisampling for the offscreen target. It changes nothing inside or at the "
+    "soft edge of a splat, which has no geometric edge; what it smooths is the "
+    "boundary where another display - a robot model, a marker, the grid - "
+    "occludes the splats, which is otherwise as jagged as the target's pixels. "
+    "It multiplies the splats' fill cost by about the sample count, so leave it "
+    "Off unless that boundary matters.",
+    offscreen_property_);
+  antialiasing_property_->addOption("Off", 1);
+  antialiasing_property_->addOption("2x MSAA", 2);
+  antialiasing_property_->addOption("4x MSAA", 4);
 
   static_refresh_property_ = new rviz_common::properties::FloatProperty(
     "Static Refresh Interval", 0.5f,
@@ -651,8 +668,10 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
   if (splat_texture_) {
     setStatus(
       rviz_common::properties::StatusProperty::Ok, "Offscreen",
-      QString("splats rasterised at %1x%2, redrawn %3 times in the last second")
-      .arg(rtt_width_).arg(rtt_height_).arg(recent_offscreen_draws_.size()));
+      QString("splats rasterised at %1x%2%3, redrawn %4 times in the last second")
+      .arg(rtt_width_).arg(rtt_height_)
+      .arg(rtt_samples_ > 1 ? QString(" with %1x MSAA").arg(rtt_samples_) : QString())
+      .arg(recent_offscreen_draws_.size()));
     if (depth_scheme_resolver_) {
       const auto stats = depth_scheme_resolver_->stats();
       setStatus(
@@ -1776,6 +1795,8 @@ void GaussianSplattingDisplay::destroyRenderTarget()
   depth_viewport_ = nullptr;
   rtt_width_ = 0;
   rtt_height_ = 0;
+  rtt_requested_samples_ = 0;
+  rtt_samples_ = 0;
 
   // Back to drawing straight into the scene.
   if (composite_rect_) {
@@ -1789,6 +1810,22 @@ void GaussianSplattingDisplay::destroyRenderTarget()
 void GaussianSplattingDisplay::updateRenderTarget()
 {
   const float scale = render_scale_property_->getFloat();
+  auto samples =
+    static_cast<unsigned int>(std::max(1, antialiasing_property_->getOptionInt()));
+#ifndef GSPLAT_OGRE_METAL_MSAA_SAMPLING
+  // This Ogre's Metal render system binds a multisampled render texture's
+  // samples, not its resolved image, when the composite samples it, and Metal
+  // validation aborts the draw. See CMakeLists.txt.
+  if (samples > 1 && usesMetalRenderSystem()) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, "Antialiasing",
+      "this build of Ogre's Metal render system cannot sample a multisampled "
+      "target; drawing without MSAA");
+    samples = 1;
+  } else {
+    deleteStatus("Antialiasing");
+  }
+#endif
   Ogre::Viewport * main_viewport = mainViewport();
 
   if (!offscreen_property_->getBool() || !main_viewport) {
@@ -1810,7 +1847,7 @@ void GaussianSplattingDisplay::updateRenderTarget()
   // Switching view controller swaps in a different camera, which the offscreen
   // viewport has to follow or it renders from a stale one.
   if (splat_texture_ && width == rtt_width_ && height == rtt_height_ &&
-    rtt_viewport_ && rtt_viewport_->getCamera() == camera)
+    samples == rtt_requested_samples_ && rtt_viewport_ && rtt_viewport_->getCamera() == camera)
   {
     return;
   }
@@ -1831,11 +1868,17 @@ void GaussianSplattingDisplay::updateRenderTarget()
     composite_material_ = base->clone(material_name_ + "_Composite", true, kResourceGroup);
   }
 
+  // With multisampling, both passes below draw into multisampled colour and
+  // depth, which Ogre resolves into the texture the composite samples: Metal
+  // at the end of each pass, OpenGL by a blit when the target finishes.
   splat_texture_ = Ogre::TextureManager::getSingleton().createManual(
     mesh_name_ + "_RTT", kResourceGroup, Ogre::TEX_TYPE_2D, width, height, 0,
-    Ogre::PF_A8R8G8B8, Ogre::TU_RENDERTARGET);
+    Ogre::PF_A8R8G8B8, Ogre::TU_RENDERTARGET, nullptr, false, samples > 1 ? samples : 0);
 
   Ogre::RenderTexture * target = splat_texture_->getBuffer()->getRenderTarget();
+  // What the device granted, which can be fewer samples than asked for.
+  rtt_requested_samples_ = samples;
+  rtt_samples_ = std::max(1u, target->getFSAA());
 
   // Two passes over the same target. The first draws the rest of the scene
   // purely to lay down depth; the second clears only the colour, so that depth
