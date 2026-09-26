@@ -58,13 +58,19 @@ public:
     double radix_scatter_ms = 0.0;
   };
 
-  explicit OpenGlViewPreparationCore(const std::string & shader_source);
+  // With `allow_subgroups`, the scatters rank lanes with subgroup ballots where
+  // the driver supports them; see subgroupBallot().
+  explicit OpenGlViewPreparationCore(
+    const std::string & shader_source, bool allow_subgroups = true);
   ~OpenGlViewPreparationCore();
   OpenGlViewPreparationCore(const OpenGlViewPreparationCore &) = delete;
   OpenGlViewPreparationCore & operator=(const OpenGlViewPreparationCore &) = delete;
 
   bool ready() const;
   const std::string & error() const;
+  // Whether the scatter stages were compiled to rank lanes with subgroup
+  // ballots rather than through shared memory.
+  bool subgroupBallot() const {return subgroup_ballot_;}
 
   // Sizes the scratch buffers for `count` splats, drawn with `index_count`
   // indices each. Drops any scene data.
@@ -124,6 +130,7 @@ private:
   std::string error_;
   std::array<GLuint, 11> programs_{};
   bool profiling_ = false;
+  bool subgroup_ballot_ = false;
   // Stage boundaries 0-4, then three within culling and four per radix pass.
   std::array<GLuint, 24> queries_{};
   Timings timings_;

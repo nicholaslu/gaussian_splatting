@@ -348,16 +348,20 @@ std::string readFile(const char * path)
 int main(int argc, char ** argv)
 {
   bool quick = false;
+  bool subgroups = true;
   const char * shader = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--quick") == 0) {
       quick = true;
+    } else if (std::strcmp(argv[i], "--no-subgroups") == 0) {
+      subgroups = false;
     } else {
       shader = argv[i];
     }
   }
   if (!shader) {
-    std::fprintf(stderr, "usage: %s [--quick] path/to/gsplat_prepare.comp\n", argv[0]);
+    std::fprintf(
+      stderr, "usage: %s [--quick] [--no-subgroups] path/to/gsplat_prepare.comp\n", argv[0]);
     return 2;
   }
   const std::string source = readFile(shader);
@@ -371,15 +375,16 @@ int main(int argc, char ** argv)
   }
 
   Context context;
-  OpenGlViewPreparationCore core(source);
+  OpenGlViewPreparationCore core(source, subgroups);
   if (!core.ready()) {
     std::fprintf(stderr, "OpenGL preparation core failed: %s\n", core.error().c_str());
     return 1;
   }
   context.core = &core;
   std::printf(
-    "%s | %s%s\n\n", reinterpret_cast<const char *>(glGetString(GL_RENDERER)),
-    reinterpret_cast<const char *>(glGetString(GL_VERSION)), quick ? " (quick)" : "");
+    "%s | %s%s, lanes ranked %s\n\n", reinterpret_cast<const char *>(glGetString(GL_RENDERER)),
+    reinterpret_cast<const char *>(glGetString(GL_VERSION)), quick ? " (quick)" : "",
+    core.subgroupBallot() ? "by subgroup ballot" : "in shared memory");
 
   const std::vector<Case> cases = standardCases();
   int failures = 0;

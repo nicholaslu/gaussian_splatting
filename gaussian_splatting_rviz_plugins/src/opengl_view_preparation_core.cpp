@@ -151,6 +151,45 @@ std::string shaderLog(GLuint object, bool program)
   return log;
 }
 
+// GL_KHR_shader_subgroup, which older GLEW headers lack.
+constexpr GLenum kSubgroupSize = 0x9532;
+constexpr GLenum kSubgroupSupportedStages = 0x9533;
+constexpr GLenum kSubgroupSupportedFeatures = 0x9534;
+constexpr GLint kSubgroupFeatureBallot = 0x8;
+constexpr GLint kComputeShaderStage = 0x20;
+
+bool hasExtension(const char * name)
+{
+  GLint count = 0;
+  glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+  for (GLint i = 0; i < count; ++i) {
+    const GLubyte * extension = glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
+    if (extension && std::string(reinterpret_cast<const char *>(extension)) == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Subgroup ballots can stand in for the shared-memory lane ranking when the
+// driver offers them in compute shaders with 32-lane subgroups, the width of a
+// scatter workgroup. The shader still checks the subgroup it actually gets.
+bool subgroupBallotUsable()
+{
+  if (!hasExtension("GL_KHR_shader_subgroup")) {
+    return false;
+  }
+  GLint size = 0;
+  GLint stages = 0;
+  GLint features = 0;
+  glGetIntegerv(kSubgroupSize, &size);
+  glGetIntegerv(kSubgroupSupportedStages, &stages);
+  glGetIntegerv(kSubgroupSupportedFeatures, &features);
+  glGetError();
+  return size == 32 && (stages & kComputeShaderStage) != 0 &&
+         (features & kSubgroupFeatureBallot) != 0;
+}
+
 GLuint groups(std::uint32_t count, std::uint32_t width)
 {
   return (count + width - 1u) / width;
@@ -180,7 +219,8 @@ void dispatchIndirect(GLuint buffer)
 
 }  // namespace
 
-OpenGlViewPreparationCore::OpenGlViewPreparationCore(const std::string & shader_source)
+OpenGlViewPreparationCore::OpenGlViewPreparationCore(
+  const std::string & shader_source, bool allow_subgroups)
 : shader_source_(shader_source)
 {
   GLint major = 0;
@@ -212,6 +252,7 @@ OpenGlViewPreparationCore::OpenGlViewPreparationCore(const std::string & shader_
     return;
   }
 
+  subgroup_ballot_ = allow_subgroups && subgroupBallotUsable();
   programs_[0] = compile("GSPLAT_STAGE_MAKE_DEPTH_KEYS");
   programs_[1] = compile("GSPLAT_STAGE_COMPACT_COUNT");
   programs_[2] = compile("GSPLAT_STAGE_COMPACT_SCAN");
@@ -553,8 +594,15 @@ GLuint OpenGlViewPreparationCore::compile(const char * stage)
   if (!error_.empty()) {
     return 0u;
   }
-  const std::string source = std::string("#version 430\n#define ") + stage + " 1\n" +
-    shader_source_;
+  const std::string stage_name(stage);
+  const bool ballots = subgroup_ballot_ &&
+    (stage_name == "GSPLAT_STAGE_COMPACT_SCATTER" || stage_name == "GSPLAT_STAGE_RADIX_SCATTER");
+  const std::string source = std::string("#version 430\n") +
+    (ballots ?
+    "#extension GL_KHR_shader_subgroup_basic : require\n"
+    "#extension GL_KHR_shader_subgroup_ballot : require\n"
+    "#define GSPLAT_SUBGROUP_BALLOT 1\n" : "") +
+    "#define " + stage_name + " 1\n" + shader_source_;
   const char * data = source.c_str();
   const GLint length = static_cast<GLint>(source.size());
   GLuint shader = glCreateShader(GL_COMPUTE_SHADER);

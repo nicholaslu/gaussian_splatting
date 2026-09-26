@@ -332,6 +332,11 @@ void main()
 }
 
 #elif defined(GSPLAT_STAGE_COMPACT_SCATTER)
+// Both scatters rank each lane among the 32 of a chunk. Where the driver has
+// GL_KHR_shader_subgroup_ballot and the workgroup is one subgroup of 32, that
+// takes a few ballots, as on Metal; otherwise each lane counts through shared
+// memory, which is core OpenGL 4.3. The host defines GSPLAT_SUBGROUP_BALLOT
+// only for a driver that reports the extension and a subgroup size of 32.
 layout(local_size_x = 32) in;
 layout(std430, binding = 0) readonly buffer InputRecords {uvec2 input_records[];};
 layout(std430, binding = 1) writeonly buffer OutputRecords {uvec2 output_records[];};
@@ -341,7 +346,6 @@ uniform uint tile_count;
 uniform uint elements_per_tile;
 shared uint active_lanes[32];
 shared uint cursor;
-shared uint chunk_total;
 
 void main()
 {
@@ -354,6 +358,9 @@ void main()
     cursor = tile_offsets[tile];
   }
   barrier();
+#if defined(GSPLAT_SUBGROUP_BALLOT)
+  bool ballot_ranks = gl_SubgroupSize == 32u && gl_NumSubgroups == 1u;
+#endif
   uint begin = tile * elements_per_tile;
   uint end = min(begin + elements_per_tile, count);
   uint tile_size = end > begin ? end - begin : 0u;
@@ -364,16 +371,20 @@ void main()
     active_lanes[lane] = live ? 1u : 0u;
     barrier();
     uint rank = 0u;
-    for (uint other = 0u; other < lane; ++other) {
-      rank += active_lanes[other];
-    }
-    if (lane == 0u) {
-      chunk_total = 0u;
+    uint chunk_total = 0u;
+#if defined(GSPLAT_SUBGROUP_BALLOT)
+    if (ballot_ranks) {
+      uint voters = subgroupBallot(live).x;
+      rank = bitCount(voters & ((1u << lane) - 1u));
+      chunk_total = bitCount(voters);
+    } else
+#endif
+    {
       for (uint other = 0u; other < 32u; ++other) {
+        rank += other < lane ? active_lanes[other] : 0u;
         chunk_total += active_lanes[other];
       }
     }
-    barrier();
     uint base = cursor;
     if (live) {
       output_records[base + rank] = record;
@@ -489,6 +500,9 @@ void main()
   if (tile >= state.visible_tiles) {
     return;
   }
+#if defined(GSPLAT_SUBGROUP_BALLOT)
+  bool ballot_ranks = gl_SubgroupSize == 32u && gl_NumSubgroups == 1u;
+#endif
   uint begin = tile * elements_per_tile;
   uint end = min(begin + elements_per_tile, state.visible);
   uint tile_size = end > begin ? end - begin : 0u;
@@ -502,6 +516,20 @@ void main()
     barrier();
     uint rank = 0u;
     uint peer_count = 0u;
+#if defined(GSPLAT_SUBGROUP_BALLOT)
+    if (ballot_ranks) {
+      // The lanes sharing this digit, from one vote on liveness and one on
+      // each of the digit's eight bits, as radix_scatter does on Metal.
+      uint peers = subgroupBallot(live).x;
+      for (uint bit_index = 0u; bit_index < 8u; ++bit_index) {
+        bool bit = ((digit >> bit_index) & 1u) != 0u;
+        uint votes = subgroupBallot(bit).x;
+        peers &= bit ? votes : ~votes;
+      }
+      rank = bitCount(peers & ((1u << lane) - 1u));
+      peer_count = bitCount(peers);
+    } else
+#endif
     if (live) {
       for (uint other = 0u; other < 32u; ++other) {
         if (chunk_active[other] != 0u && chunk_digit[other] == digit) {

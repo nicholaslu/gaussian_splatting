@@ -72,7 +72,10 @@ public:
       error_ = "could not read OpenGL preparation shader " + shader_path;
       return;
     }
-    core_ = std::make_unique<OpenGlViewPreparationCore>(source);
+    // GSPLAT_GL_NO_SUBGROUPS keeps the core OpenGL 4.3 lane ranking, to rule
+    // the subgroup path out on a driver that misbehaves with it.
+    core_ = std::make_unique<OpenGlViewPreparationCore>(
+      source, !environmentFlag("GSPLAT_GL_NO_SUBGROUPS"));
     if (!core_->ready()) {
       error_ = core_->error();
       return;

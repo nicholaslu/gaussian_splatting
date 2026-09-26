@@ -422,10 +422,15 @@ Still open:
   precision would halve it at the cost of exact agreement with the CPU colours.
 - Projection before the sort is measured on synthetic scenes only; the full
   Garden PLY in RViz has yet to be timed with it.
-- The OpenGL scatters, 1.08 ms in the radix and 0.43 ms in compaction on the
-  RTX 4090, rank the 32 lanes of a tile by looping over them, where Metal uses
-  simd_ballot. Subgroup ballot, where the driver has it, is the next thing to
-  try there, keeping the loop for drivers without it.
+- The OpenGL scatters rank the 32 lanes of a chunk with subgroup ballots, as
+  Metal does with simd_ballot, where the driver has GL_KHR_shader_subgroup
+  with 32-lane subgroups; the shader checks the subgroup it gets and otherwise
+  counts through shared memory, and `GSPLAT_GL_NO_SUBGROUPS` forces that. On
+  the RTX 4090, median of four alternating runs: compaction's scatter 0.28 ms to
+  0.05 ms, the radix scatters 1.08 ms to 0.95 ms, the whole preparation 6.67 ms
+  to 5.89 ms. The radix scatter is latency-bound rather than ranking-bound: one
+  32-lane workgroup per 1024-element tile loads and writes 32 chunks in turn.
+  Loading each tile into shared memory first is the next thing to try.
 - On the M3 shading and projection is now the largest stage, 10.4 ms of about
   25, and it is bound by reading float32 SH coefficients; half precision is the
   candidate there.
