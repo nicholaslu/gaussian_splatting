@@ -63,7 +63,11 @@ struct PreparationState
   uint visible;
   uint visible_tiles;
   uint gather_groups;
-  uint reserved;
+  // Leading instance slots an earlier frame may have filled, and the end of
+  // the stale range clear_tail empties this frame. Only a renderer that draws
+  // every instance needs them, but they are kept either way.
+  uint written;
+  uint clear_end;
 };
 
 struct ProjectedInstance
@@ -194,6 +198,11 @@ layout(std430, binding = 5) buffer DrawArguments {
   uint base_vertex_out;
   uint base_instance_out;
 };
+layout(std430, binding = 6) writeonly buffer ClearDispatch {
+  uint clear_groups_x;
+  uint clear_groups_y;
+  uint clear_groups_z;
+};
 uniform uint tile_count;
 uniform uint elements_per_tile;
 uniform uint gather_width;
@@ -206,10 +215,18 @@ void main()
     tile_offsets[tile] = visible;
     visible += tile_counts[tile];
   }
+  uint written = state.written;
   state.visible = visible;
   state.visible_tiles = (visible + elements_per_tile - 1u) / elements_per_tile;
   state.gather_groups = (visible + gather_width - 1u) / gather_width;
-  state.reserved = 0u;
+  // The gather fills [0, visible); what an earlier, larger frame left past
+  // that is emptied by clear_tail, so only the shrink costs anything.
+  state.clear_end = written;
+  state.written = visible;
+  uint stale = written > visible ? written - visible : 0u;
+  clear_groups_x = max((stale + gather_width - 1u) / gather_width, 1u);
+  clear_groups_y = 1u;
+  clear_groups_z = 1u;
   // OpenGL rejects a zero-sized indirect dispatch, so launch one guarded
   // group for an empty view just as the Metal backend does.
   tile_groups_x = max(state.visible_tiles, 1u);
@@ -254,8 +271,8 @@ void main()
   for (uint chunk = 0u; chunk < elements_per_tile; chunk += 32u) {
     uint local = chunk + lane;
     uvec2 record = local < tile_size ? input_records[begin + local] : uvec2(0u, kRejected);
-    bool active = record.y != kRejected;
-    active_lanes[lane] = active ? 1u : 0u;
+    bool live = record.y != kRejected;
+    active_lanes[lane] = live ? 1u : 0u;
     barrier();
     uint rank = 0u;
     for (uint other = 0u; other < lane; ++other) {
@@ -269,7 +286,7 @@ void main()
     }
     barrier();
     uint base = cursor;
-    if (active) {
+    if (live) {
       output_records[base + rank] = record;
     }
     barrier();
@@ -382,15 +399,15 @@ void main()
   uint tile_size = end > begin ? end - begin : 0u;
   for (uint chunk = 0u; chunk < elements_per_tile; chunk += 32u) {
     uint local = chunk + lane;
-    bool active = local < tile_size;
-    uvec2 record = active ? input_records[begin + local] : uvec2(0u);
-    uint digit = active ? ((record.x >> shift) & 0xffu) : 0u;
+    bool live = local < tile_size;
+    uvec2 record = live ? input_records[begin + local] : uvec2(0u);
+    uint digit = live ? ((record.x >> shift) & 0xffu) : 0u;
     chunk_digit[lane] = digit;
-    chunk_active[lane] = active ? 1u : 0u;
+    chunk_active[lane] = live ? 1u : 0u;
     barrier();
     uint rank = 0u;
     uint peer_count = 0u;
-    if (active) {
+    if (live) {
       for (uint other = 0u; other < 32u; ++other) {
         if (chunk_active[other] != 0u && chunk_digit[other] == digit) {
           peer_count += 1u;
@@ -398,12 +415,12 @@ void main()
         }
       }
     }
-    uint base = active ? cursor[digit] : 0u;
-    if (active) {
+    uint base = live ? cursor[digit] : 0u;
+    if (live) {
       output_records[base + rank] = record;
     }
     barrier();
-    if (active && rank == 0u) {
+    if (live && rank == 0u) {
       cursor[digit] += peer_count;
     }
     barrier();
@@ -544,6 +561,25 @@ void main()
   SplatRecord splat = splats[index];
   vec3 colour = evaluateSH(index, splat.position_opacity.xyz);
   instances[output_index] = projectSplat(splat, colour);
+}
+
+#elif defined(GSPLAT_STAGE_CLEAR_TAIL)
+// Empties instance slots in [visible, clear_end) for a renderer that draws
+// every instance. An empty quad sits outside the clip volume with no extent,
+// as projectSplat() leaves a rejected splat.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer State {PreparationState state;};
+layout(std430, binding = 1) writeonly buffer Instances {ProjectedInstance instances[];};
+
+void main()
+{
+  uint slot = state.visible + gl_GlobalInvocationID.x;
+  if (slot >= state.clear_end) {
+    return;
+  }
+  instances[slot].centre_radius = vec4(0.0, 0.0, 2.0, 0.0);
+  instances[slot].axes = vec4(0.0);
+  instances[slot].colour = vec4(0.0);
 }
 
 #else

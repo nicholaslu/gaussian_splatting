@@ -6,6 +6,10 @@ attribute vec4 uv1;    // two scaled ellipse axes in NDC
 attribute vec4 colour; // RGB and compensated opacity
 attribute vec2 uv2;    // quad corner in [-1, 1]
 
+// -1 while drawing into a render texture Ogre flips, as OpenGL render textures
+// are. Preparation projects without the flip, so the whole quad is mirrored.
+uniform float render_target_flipping;
+
 varying vec4 splat_colour;
 varying vec2 splat_local_coord;
 
@@ -14,6 +18,7 @@ void main()
   gl_Position = vec4(
     uv0.xy + uv2.x * uv1.xy + uv2.y * uv1.zw,
     uv0.z, 1.0);
+  gl_Position.y *= render_target_flipping;
   splat_colour = colour;
   splat_local_coord = uv2 * uv0.w;
 }

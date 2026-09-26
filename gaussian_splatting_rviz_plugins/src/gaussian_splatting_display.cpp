@@ -621,6 +621,9 @@ void GaussianSplattingDisplay::onInitialize()
       setStatus(
         rviz_common::properties::StatusProperty::Warn, "GPU preparation",
         QString::fromStdString(error + "; using CPU fallback"));
+      RCLCPP_WARN(
+        rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
+        "GPU view preparation unavailable: %s; using CPU fallback", error.c_str());
       gpu_view_preparation_.reset();
     } else {
       setStatus(
@@ -673,7 +676,10 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
       // the indirect buffer by the last reported count rather than every splat.
       const std::int64_t visible = gpu_view_preparation_->lastVisibleCount();
       visible_splat_count_ = visible > 0 ? static_cast<std::size_t>(visible) : 0u;
-      renderable_->setInstanceCount(visible_splat_count_);
+      // Without GPU-driven counts the backend keeps every slot valid instead,
+      // and a count from frames ago would cut off splats that became visible.
+      renderable_->setInstanceCount(
+        gpu_view_preparation_->drawsEveryInstance() ? splat_count_ : visible_splat_count_);
       setStatus(
         rviz_common::properties::StatusProperty::Ok, "Visible splats",
         visible < 0 ?
@@ -1068,6 +1074,10 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
       QString::fromStdString(gpu_view_preparation_->error() + "; using CPU fallback"));
+    RCLCPP_WARN(
+      rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
+      "GPU view preparation could not be configured: %s; using CPU fallback",
+      gpu_view_preparation_->error().c_str());
     // Built for projected instances, which only GPU preparation writes.
     gpu_view_preparation_.reset();
     allocateMesh(count);
@@ -1182,6 +1192,9 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
       QString::fromStdString(gpu_view_preparation_->error() + "; using CPU fallback"));
+    RCLCPP_WARN(
+      rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
+      "GPU view preparation upload failed: %s", gpu_view_preparation_->error().c_str());
   }
 
   if (renderable_) {
@@ -1461,6 +1474,10 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
       QString::fromStdString(gpu_view_preparation_->error() + "; using CPU fallback"));
+    RCLCPP_WARN(
+      rclcpp::get_logger("gaussian_splatting_rviz_plugins"),
+      "GPU view preparation failed: %s; using CPU fallback",
+      gpu_view_preparation_->error().c_str());
     // The mesh holds projected instances, which only GPU preparation writes.
     fallBackToCpuPreparation();
     return;

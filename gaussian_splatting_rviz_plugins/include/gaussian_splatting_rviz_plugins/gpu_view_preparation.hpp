@@ -52,6 +52,12 @@ public:
   // that no completed preparation has reported a count yet.
   virtual std::int64_t lastVisibleCount() const = 0;
 
+  // True when the renderer cannot take the instance count from the GPU-written
+  // draw arguments, so every instance is drawn and those past the visible count
+  // are written as empty quads. The display then draws all of them rather than
+  // the visible count, which arrives frames late.
+  virtual bool drawsEveryInstance() const {return false;}
+
   virtual bool profiling() const = 0;
   virtual StageTimes lastStageTimes() const = 0;
 

@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include <dlfcn.h>
+
 #include <RenderSystems/GL/OgreGLHardwareVertexBuffer.h>
 #include <RenderSystems/GL/OgreGLRenderSystem.h>
 #include <OgreHardwareBufferManager.h>
@@ -25,6 +27,56 @@ constexpr std::uint32_t kThreadsPerTile = 32u;
 constexpr std::uint32_t kElementsPerTile = 1024u;
 constexpr std::uint32_t kGatherWidth = 256u;
 constexpr std::uint32_t kRadix = 256u;
+
+#ifdef GSPLAT_OGRE_GL_INDIRECT_DRAW
+constexpr bool kOgreIndirectDraw = true;
+#else
+// Upstream Ogre draws a renderable with the instance count the CPU gives it, so
+// every instance is drawn and those past the visible count are left empty.
+constexpr bool kOgreIndirectDraw = false;
+#endif
+
+// Ogre's GL render system carries its own GLEW and exports its function
+// pointers, but that GLEW stops short of OpenGL 4.3: nothing provides
+// __glewDispatchCompute, __glewDispatchComputeIndirect or __GLEW_VERSION_4_3,
+// so a plug-in reaching them through GLEW's macros fails to load. Linking a
+// second GLEW would not help, since its glewInit would resolve to Ogre's and
+// leave those pointers null. The two entry points come from the GL library
+// instead, which dispatches to the current context just as GLEW does.
+struct ComputeFunctions
+{
+  void (*dispatch)(GLuint, GLuint, GLuint) = nullptr;
+  void (*dispatch_indirect)(GLintptr) = nullptr;
+};
+
+const ComputeFunctions & computeFunctions()
+{
+  static const ComputeFunctions functions = [] {
+      ComputeFunctions resolved;
+      for (const char * name : {"libGL.so.1", "libOpenGL.so.0"}) {
+        // Already loaded by Ogre; this only takes a reference to look into.
+        void * library = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (!library) {
+          continue;
+        }
+        resolved.dispatch = reinterpret_cast<void (*)(GLuint, GLuint, GLuint)>(
+          dlsym(library, "glDispatchCompute"));
+        resolved.dispatch_indirect = reinterpret_cast<void (*)(GLintptr)>(
+          dlsym(library, "glDispatchComputeIndirect"));
+        if (resolved.dispatch && resolved.dispatch_indirect) {
+          break;
+        }
+        resolved = ComputeFunctions{};
+      }
+      return resolved;
+    }();
+  return functions;
+}
+
+#undef glDispatchCompute
+#define glDispatchCompute computeFunctions().dispatch
+#undef glDispatchComputeIndirect
+#define glDispatchComputeIndirect computeFunctions().dispatch_indirect
 
 struct DrawIndexedArguments
 {
@@ -49,9 +101,10 @@ struct PreparationState
   std::uint32_t visible;
   std::uint32_t visible_tiles;
   std::uint32_t gather_groups;
-  std::uint32_t reserved;
+  std::uint32_t written;
+  std::uint32_t clear_end;
 };
-static_assert(sizeof(PreparationState) == 16, "OpenGL preparation state layout");
+static_assert(sizeof(PreparationState) == 20, "OpenGL preparation state layout");
 
 std::string readFile(const std::string & path)
 {
@@ -96,10 +149,18 @@ public:
       error_ = "Ogre OpenGL render system is unavailable";
       return;
     }
-    if (!GLEW_VERSION_4_3) {
+    GLint major = 0;
+    GLint minor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &major);
+    glGetIntegerv(GL_MINOR_VERSION, &minor);
+    if (major < 4 || (major == 4 && minor < 3)) {
       const GLubyte * version = glGetString(GL_VERSION);
       error_ = "OpenGL 4.3 compute is required; active context is " +
         std::string(version ? reinterpret_cast<const char *>(version) : "unknown");
+      return;
+    }
+    if (!computeFunctions().dispatch || !computeFunctions().dispatch_indirect) {
+      error_ = "could not resolve glDispatchCompute from libGL.so.1 or libOpenGL.so.0";
       return;
     }
     GLint local_size = 0;
@@ -126,6 +187,7 @@ public:
     programs_[6] = compile("GSPLAT_STAGE_RADIX_SCAN_BASES");
     programs_[7] = compile("GSPLAT_STAGE_RADIX_SCATTER");
     programs_[8] = compile("GSPLAT_STAGE_GATHER");
+    programs_[9] = compile("GSPLAT_STAGE_CLEAR_TAIL");
   }
 
   ~OpenGlViewPreparation() override
@@ -140,7 +202,7 @@ public:
 
   const char * backendName() const override
   {
-    return "OpenGL 4.3";
+    return kOgreIndirectDraw ? "OpenGL 4.3" : "OpenGL 4.3 (every instance drawn)";
   }
 
   bool configure(
@@ -189,6 +251,7 @@ public:
     state_ = newBuffer(sizeof(PreparationState), GL_DYNAMIC_COPY);
     tile_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
     gather_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
+    clear_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
     view_parameters_ = newBuffer(sizeof(ViewParameters), GL_STREAM_DRAW);
     projection_parameters_ = newBuffer(sizeof(ProjectionParameters), GL_STREAM_DRAW);
     for (Readback & readback : readbacks_) {
@@ -196,7 +259,7 @@ public:
     }
     if (!keys_a_ || !keys_b_ || !tile_counts_ || !tile_offsets_ || !histograms_ ||
       !offsets_ || !totals_ || !digit_bases_ || !state_ || !tile_dispatch_ ||
-      !gather_dispatch_ || !view_parameters_ || !projection_parameters_ ||
+      !gather_dispatch_ || !clear_dispatch_ || !view_parameters_ || !projection_parameters_ ||
       !readbacks_[0].buffer || !readbacks_[1].buffer || !readbacks_[2].buffer)
     {
       const std::string failure = error_.empty() ? "allocating OpenGL preparation buffers" : error_;
@@ -205,18 +268,36 @@ public:
       return false;
     }
 
-    auto & manager = Ogre::HardwareBufferManager::getSingleton();
-    indirect_buffer_ = manager.createVertexBuffer(
-      sizeof(DrawIndexedArguments), 1u, Ogre::HardwareBuffer::HBU_DYNAMIC_WRITE_ONLY);
+    // Every slot counts as written, so the first preparation empties whatever
+    // the new instance buffer was allocated holding before anything draws it.
+    const PreparationState initial{0u, 0u, 0u, count_, 0u};
+    updateBuffer(state_, &initial, sizeof(initial));
+
     const DrawIndexedArguments empty{index_count_, 0u, 0u, 0u, 0u};
-    indirect_buffer_->writeData(0, sizeof(empty), &empty, true);
     instance_buffer_ = instance_buffer;
     instance_gl_ =
       static_cast<Ogre::GLHardwareVertexBuffer *>(instance_buffer_.get())->getGLBufferId();
+    renderable_ = renderable;
+#ifdef GSPLAT_OGRE_GL_INDIRECT_DRAW
+    auto & manager = Ogre::HardwareBufferManager::getSingleton();
+    indirect_buffer_ = manager.createVertexBuffer(
+      sizeof(DrawIndexedArguments), 1u, Ogre::HardwareBuffer::HBU_DYNAMIC_WRITE_ONLY);
+    indirect_buffer_->writeData(0, sizeof(empty), &empty, true);
     indirect_gl_ =
       static_cast<Ogre::GLHardwareVertexBuffer *>(indirect_buffer_.get())->getGLBufferId();
-    renderable_ = renderable;
     render_system_->setIndirectDrawBuffer(renderable_, indirect_buffer_);
+#else
+    // compact_scan still writes draw arguments; nothing reads them.
+    draw_arguments_ = newBuffer(sizeof(DrawIndexedArguments), GL_DYNAMIC_COPY);
+    if (!draw_arguments_) {
+      const std::string failure = error_;
+      clear();
+      error_ = failure;
+      return false;
+    }
+    updateBuffer(draw_arguments_, &empty, sizeof(empty));
+    indirect_gl_ = draw_arguments_;
+#endif
     last_visible_ = -1;
     error_.clear();
     return true;
@@ -293,6 +374,7 @@ public:
     use(programs_[2]);
     bind(0, tile_counts_); bind(1, tile_offsets_); bind(2, state_);
     bind(3, tile_dispatch_); bind(4, gather_dispatch_); bind(5, indirect_gl_);
+    bind(6, clear_dispatch_);
     uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
     uniform("gather_width", kGatherWidth); uniform("index_count", index_count_);
     glDispatchCompute(1, 1, 1);
@@ -342,6 +424,12 @@ public:
     bind(4, state_); bind(5, instance_gl_); bind(6, view_parameters_);
     bind(7, projection_parameters_);
     dispatchIndirect(gather_dispatch_);
+    if (!kOgreIndirectDraw) {
+      storageBarrier();
+      use(programs_[9]);
+      bind(0, state_); bind(1, instance_gl_);
+      dispatchIndirect(clear_dispatch_);
+    }
     glMemoryBarrier(
       GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT |
       GL_COMMAND_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -369,6 +457,11 @@ public:
     return last_visible_;
   }
 
+  bool drawsEveryInstance() const override
+  {
+    return !kOgreIndirectDraw;
+  }
+
   bool profiling() const override
   {
     return false;
@@ -381,10 +474,12 @@ public:
 
   void clear() override
   {
+#ifdef GSPLAT_OGRE_GL_INDIRECT_DRAW
     if (render_system_ && renderable_) {
       Ogre::HardwareVertexBufferSharedPtr none;
       render_system_->setIndirectDrawBuffer(renderable_, none);
     }
+#endif
     renderable_ = nullptr;
     instance_buffer_.reset();
     indirect_buffer_.reset();
@@ -396,10 +491,11 @@ public:
         readback.fence = nullptr;
       }
     }
-    std::array<GLuint *, 17> buffers = {
+    std::array<GLuint *, 19> buffers = {
       &splats_, &sh_dc_, &sh_rest_, &keys_a_, &keys_b_, &tile_counts_, &tile_offsets_,
       &histograms_, &offsets_, &totals_, &digit_bases_, &state_, &tile_dispatch_,
-      &gather_dispatch_, &view_parameters_, &projection_parameters_, &readbacks_[0].buffer};
+      &gather_dispatch_, &clear_dispatch_, &draw_arguments_, &view_parameters_,
+      &projection_parameters_, &readbacks_[0].buffer};
     // The first readback is included above; delete the other two separately.
     for (GLuint * buffer : buffers) {
       if (*buffer != 0u) {
@@ -589,7 +685,7 @@ private:
   Ogre::HardwareVertexBufferSharedPtr indirect_buffer_;
   std::string shader_source_;
   std::string error_;
-  std::array<GLuint, 9> programs_{};
+  std::array<GLuint, 10> programs_{};
   GLuint current_program_ = 0u;
   GLint64 max_storage_block_bytes_ = 0;
   std::uint32_t count_ = 0u;
@@ -611,6 +707,9 @@ private:
   GLuint state_ = 0u;
   GLuint tile_dispatch_ = 0u;
   GLuint gather_dispatch_ = 0u;
+  GLuint clear_dispatch_ = 0u;
+  // The draw arguments when Ogre cannot use them; otherwise Ogre owns them.
+  GLuint draw_arguments_ = 0u;
   GLuint view_parameters_ = 0u;
   GLuint projection_parameters_ = 0u;
   std::array<Readback, 3> readbacks_{};

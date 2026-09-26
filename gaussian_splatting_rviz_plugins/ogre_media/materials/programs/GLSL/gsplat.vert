@@ -13,6 +13,10 @@ uniform float fovy;
 uniform vec4 vpsize;
 uniform float eps2d;
 uniform float antialiased;
+// -1 while drawing into a render texture Ogre flips, as OpenGL render textures
+// are: projmatrix then arrives with y negated, but viewmatrix, from which the
+// ellipse is built, does not.
+uniform float render_target_flipping;
 
 // Per-splat records, four consecutive RGBA32F texels each. splat_data_size is
 // (width, height, 1/width, 1/height): GLSL 120 has no integer texel fetch, so
@@ -168,6 +172,9 @@ void main()
     uv2.x * axis1 * (visible_radius * sqrt(lambda1)) +
     uv2.y * axis2 * (visible_radius * sqrt(lambda2));
   vec2 ndc_offset = pixel_offset * 2.0 / vpsize.xy;
+  // Mirrored with the centre, or a tilted ellipse leans the wrong way and
+  // splats seen obliquely smear into needles.
+  ndc_offset.y *= render_target_flipping;
 
   splat_local_coord = uv2 * visible_radius;
   gl_Position = vec4(p_proj.xy + ndc_offset, p_proj.z, 1.0);

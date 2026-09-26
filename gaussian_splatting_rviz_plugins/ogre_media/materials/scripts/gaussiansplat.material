@@ -8,6 +8,7 @@ vertex_program GaussianSplatting/RVizVP glsl
     param_named_auto viewmatrix worldview_matrix
     param_named_auto vpsize viewport_size
     param_named_auto fovy fov
+    param_named_auto render_target_flipping render_target_flipping
     param_named eps2d float 0.3
     param_named antialiased float 0.0
     param_named sigma_radius float 3.0
@@ -76,6 +77,11 @@ material GaussianSplatting/RViz
 vertex_program GaussianSplatting/RVizProjectedVP glsl
 {
   source gsplat_projected.vert
+
+  default_params
+  {
+    param_named_auto render_target_flipping render_target_flipping
+  }
 }
 
 fragment_program GaussianSplatting/RVizProjectedFP glsl

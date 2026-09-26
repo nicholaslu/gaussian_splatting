@@ -26,8 +26,22 @@ endif()
 add_library(${PROJECT_NAME} ${gaussian_splatting_library_type}
   src/gaussian_splatting_display.cpp
   src/gpu_view_preparation.cpp
-  src/static_plugins.cpp
 )
+
+# Linking the display into an application registers it through rviz_common's
+# static plug-in registry, which only the rviz_common used for iOS provides. A
+# plug-in that RViz loads does not need it, so stock RViz builds go without.
+get_target_property(_rviz_common_includes rviz_common::rviz_common INTERFACE_INCLUDE_DIRECTORIES)
+find_file(RVIZ_COMMON_STATIC_PLUGIN_REGISTRY rviz_common/factory/static_plugin_registry.hpp
+  HINTS ${_rviz_common_includes} NO_DEFAULT_PATH)
+if(RVIZ_COMMON_STATIC_PLUGIN_REGISTRY)
+  target_sources(${PROJECT_NAME} PRIVATE src/static_plugins.cpp)
+elseif(gaussian_splatting_library_type STREQUAL "STATIC")
+  message(FATAL_ERROR
+    "A static build registers the display through "
+    "rviz_common/factory/static_plugin_registry.hpp, which this rviz_common "
+    "does not provide")
+endif()
 
 get_filename_component(_rviz_prefix "${rviz_ogre_vendor_DIR}/../../.." REALPATH)
 set(_ogre_prefix "${_rviz_prefix}/opt/rviz_ogre_vendor")
@@ -77,12 +91,26 @@ if(UNIX AND NOT APPLE)
   find_file(OGRE_GL_LIBRARY RenderSystem_GL.so
     HINTS "${_ogre_prefix}/lib/OGRE" NO_DEFAULT_PATH)
   find_package(OpenGL QUIET)
-  if(OGRE_GL_INCLUDE_DIR AND OGRE_GL_LIBRARY AND OpenGL_FOUND)
-    set(GSPLAT_OPENGL_PREPARATION ON)
-  else()
+  # Upstream Ogre 1.12 cannot take an instance count from the GPU; that comes
+  # from the patched rviz_ogre_vendor. Without it the backend draws every
+  # instance and leaves the ones past the visible count empty.
+  set(_ogre_gl_indirect_draw "")
+  if(OGRE_GL_INCLUDE_DIR)
+    file(STRINGS "${OGRE_GL_INCLUDE_DIR}/OgreGLRenderSystem.h" _ogre_gl_indirect_draw
+      REGEX "setIndirectDrawBuffer")
+  endif()
+  if(NOT (OGRE_GL_INCLUDE_DIR AND OGRE_GL_LIBRARY AND OpenGL_FOUND))
     message(STATUS
       "Ogre's OpenGL render system was not found; building without the optional "
       "OpenGL 4.3 GPU preparation backend")
+  else()
+    set(GSPLAT_OPENGL_PREPARATION ON)
+    if(NOT _ogre_gl_indirect_draw)
+      message(STATUS
+        "Ogre's OpenGL render system has no GLRenderSystem::setIndirectDrawBuffer, "
+        "which only the patched rviz_ogre_vendor adds; OpenGL GPU preparation will "
+        "draw every instance and leave the ones past the visible count empty")
+    endif()
   endif()
 endif()
 
@@ -112,8 +140,12 @@ endif()
 if(GSPLAT_OPENGL_PREPARATION)
   target_sources(${PROJECT_NAME} PRIVATE src/opengl_view_preparation.cpp)
   target_link_libraries(${PROJECT_NAME} OpenGL::GL)
+  target_link_libraries(${PROJECT_NAME} ${CMAKE_DL_LIBS})
   target_link_libraries(${PROJECT_NAME} "${OGRE_GL_LIBRARY}")
   target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_HAS_OPENGL_PREPARATION=1)
+  if(_ogre_gl_indirect_draw)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GSPLAT_OGRE_GL_INDIRECT_DRAW=1)
+  endif()
 endif()
 
 target_include_directories(${PROJECT_NAME} PUBLIC
