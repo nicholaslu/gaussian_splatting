@@ -112,6 +112,7 @@ private:
   rviz_common::properties::BoolProperty * offscreen_property_ = nullptr;
   rviz_common::properties::FloatProperty * render_scale_property_ = nullptr;
   rviz_common::properties::EnumProperty * antialiasing_property_ = nullptr;
+  rviz_common::properties::EnumProperty * precision_property_ = nullptr;
   rviz_common::properties::FloatProperty * static_refresh_property_ = nullptr;
 
   Ogre::SceneNode * splat_node_ = nullptr;
@@ -136,6 +137,9 @@ private:
   // Samples asked of the offscreen target, and the samples it has.
   unsigned int rtt_requested_samples_ = 0;
   unsigned int rtt_samples_ = 0;
+  // Whether a half float target was asked for, and whether the target is one.
+  bool rtt_requested_half_ = false;
+  bool rtt_half_ = false;
 
   // Offscreen image reuse. The image is redrawn when anything it depends on
   // changes, and otherwise only every Static Refresh Interval, which is what

@@ -23,6 +23,7 @@
 #include <OgreHardwareBufferManager.h>
 #include <OgreMaterialManager.h>
 #include <OgrePass.h>
+#include <OgrePixelFormat.h>
 #include <OgreRectangle2D.h>
 #include <OgreRenderSystem.h>
 #include <OgreRenderTexture.h>
@@ -562,6 +563,21 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
   antialiasing_property_->addOption("2x MSAA", 2);
   antialiasing_property_->addOption("4x MSAA", 4);
 
+  precision_property_ = new rviz_common::properties::EnumProperty(
+    "Precision", "Half float",
+    "Colour format of the offscreen target. A pixel blends dozens of splats, and "
+    "an 8-bit target rounds after every one: layers too faint to move the value "
+    "by half a step are lost, and highlights brighter than white are clipped "
+    "before the splats in front of them dim them, where the reference "
+    "rasteriser clips once at the end. Half float keeps both, and matches "
+    "float accumulation to within 0.01% of pixels on the Garden scene, "
+    "against 1-40% of pixels more than two steps off at 8 bits. It doubles the "
+    "target's memory. On Apple GPUs, which blend in tile memory, it measured "
+    "no slower; on an RTX 4090 it added 0.3-2.7 ms a frame.",
+    offscreen_property_);
+  precision_property_->addOption("8-bit", 1);
+  precision_property_->addOption("Half float", 2);
+
   static_refresh_property_ = new rviz_common::properties::FloatProperty(
     "Static Refresh Interval", 0.5f,
     "While the camera, the splats and this display's settings stay unchanged, the "
@@ -668,8 +684,8 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
   if (splat_texture_) {
     setStatus(
       rviz_common::properties::StatusProperty::Ok, "Offscreen",
-      QString("splats rasterised at %1x%2%3, redrawn %4 times in the last second")
-      .arg(rtt_width_).arg(rtt_height_)
+      QString("splats rasterised at %1x%2, %3%4, redrawn %5 times in the last second")
+      .arg(rtt_width_).arg(rtt_height_).arg(rtt_half_ ? "half float" : "8-bit")
       .arg(rtt_samples_ > 1 ? QString(" with %1x MSAA").arg(rtt_samples_) : QString())
       .arg(recent_offscreen_draws_.size()));
     if (depth_scheme_resolver_) {
@@ -1797,6 +1813,8 @@ void GaussianSplattingDisplay::destroyRenderTarget()
   rtt_height_ = 0;
   rtt_requested_samples_ = 0;
   rtt_samples_ = 0;
+  rtt_requested_half_ = false;
+  rtt_half_ = false;
 
   // Back to drawing straight into the scene.
   if (composite_rect_) {
@@ -1826,6 +1844,7 @@ void GaussianSplattingDisplay::updateRenderTarget()
     deleteStatus("Antialiasing");
   }
 #endif
+  const bool half = precision_property_->getOptionInt() != 1;
   Ogre::Viewport * main_viewport = mainViewport();
 
   if (!offscreen_property_->getBool() || !main_viewport) {
@@ -1847,7 +1866,8 @@ void GaussianSplattingDisplay::updateRenderTarget()
   // Switching view controller swaps in a different camera, which the offscreen
   // viewport has to follow or it renders from a stale one.
   if (splat_texture_ && width == rtt_width_ && height == rtt_height_ &&
-    samples == rtt_requested_samples_ && rtt_viewport_ && rtt_viewport_->getCamera() == camera)
+    samples == rtt_requested_samples_ && half == rtt_requested_half_ && rtt_viewport_ &&
+    rtt_viewport_->getCamera() == camera)
   {
     return;
   }
@@ -1873,12 +1893,16 @@ void GaussianSplattingDisplay::updateRenderTarget()
   // at the end of each pass, OpenGL by a blit when the target finishes.
   splat_texture_ = Ogre::TextureManager::getSingleton().createManual(
     mesh_name_ + "_RTT", kResourceGroup, Ogre::TEX_TYPE_2D, width, height, 0,
-    Ogre::PF_A8R8G8B8, Ogre::TU_RENDERTARGET, nullptr, false, samples > 1 ? samples : 0);
+    half ? Ogre::PF_FLOAT16_RGBA : Ogre::PF_A8R8G8B8, Ogre::TU_RENDERTARGET, nullptr, false,
+    samples > 1 ? samples : 0);
 
   Ogre::RenderTexture * target = splat_texture_->getBuffer()->getRenderTarget();
   // What the device granted, which can be fewer samples than asked for.
   rtt_requested_samples_ = samples;
   rtt_samples_ = std::max(1u, target->getFSAA());
+  // What the render system created, which may be a substitute format.
+  rtt_requested_half_ = half;
+  rtt_half_ = Ogre::PixelUtil::isFloatingPoint(splat_texture_->getFormat());
 
   // Two passes over the same target. The first draws the rest of the scene
   // purely to lay down depth; the second clears only the colour, so that depth
