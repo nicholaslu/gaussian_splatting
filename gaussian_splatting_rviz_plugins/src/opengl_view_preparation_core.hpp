@@ -25,9 +25,10 @@ namespace gaussian_splatting_rviz_plugins
 // pack the survivors in index order and count them; SHADE_SLOTS colours them
 // and copies their records while they are still in index order, and makes each
 // one's compacted slot the sort's value; the radix sorts only those survivors;
-// FINISH_ORDER lays the survivors out in draw order. Drawing: PUBLISH writes
-// the draw arguments, REPROJECT_GATHER projects the survivors in sequence for
-// the frame's camera with the colours the order was built with, and CLEAR_TAIL
+// FINISH_ORDER lays the survivors and their colours out in draw order.
+// Drawing: PUBLISH writes the draw arguments, RECOLOUR_ORDER can evaluate the
+// colours again for the frame's camera, REPROJECT_GATHER projects the
+// survivors in sequence for the frame's camera, and CLEAR_TAIL
 // empties stale instance slots for a renderer that draws every instance.
 // Nothing is read back on the CPU but the visible count, and that without
 // waiting.
@@ -107,10 +108,17 @@ public:
     GLuint instances, GLuint draw_arguments, bool clear_tail);
   // One of five steps of building an order - started for `parameters` if
   // none is under way - then the draw stream from the newest complete order,
-  // projected with `projection`. With no complete order yet, it is encode().
+  // projected with `projection`, and with its colours evaluated again for
+  // `parameters` as setColourRefresh() asks. With no complete order yet, it is
+  // encode().
   bool encodeIncremental(
     const ViewParameters & parameters, const ProjectionParameters & projection,
     GLuint instances, GLuint draw_arguments, bool clear_tail);
+  // How incremental preparation refreshes colours: 0 not at all, so they lag
+  // with the order; 1 every colour every frame; 2 half of them a frame in
+  // turn. Orders completed while it is 0 cannot be refreshed, which saves
+  // their completion some writes.
+  void setColourRefresh(std::uint32_t parts) {colour_parts_ = parts;}
   bool hasOrder() const {return current_ >= 0;}
   bool building() const {return building_ >= 0;}
 
@@ -178,8 +186,9 @@ private:
   std::string shader_source_;
   std::string error_;
   // keys, compact count, compact scan, compact scatter, radix histogram,
-  // offsets, bases, scatter, shade, finish, publish, reproject, clear tail
-  std::array<GLuint, 13> programs_{};
+  // offsets, bases, scatter, shade, finish, publish, reproject, clear tail,
+  // recolour
+  std::array<GLuint, 14> programs_{};
   bool profiling_ = false;
   bool subgroup_ballot_ = false;
   // Stage boundaries 0-4, then three within culling and four per radix pass.
@@ -210,14 +219,24 @@ private:
   GLuint pairs_ = 0u;
   GLuint slots_ = 0u;
   GLuint drawn_ = 0u;
+  // The newest complete order's colours in draw order, and for each slot its
+  // splat and draw position, by which RECOLOUR_ORDER refreshes them.
+  GLuint colours_ = 0u;
+  GLuint slot_draws_ = 0u;
+  std::uint32_t colour_parts_ = 0u;
+  std::uint32_t colour_frame_ = 0u;
+  // Whether the newest complete order kept what RECOLOUR_ORDER needs.
+  bool refreshable_ = false;
   // The instance buffer's visible count, filled high-water mark and the end of
   // the range CLEAR_TAIL empties; written by PUBLISH.
   GLuint instance_state_ = 0u;
   GLuint clear_dispatch_ = 0u;
   // Draw arguments for a caller that has no buffer of its own for them.
   GLuint draw_arguments_ = 0u;
-  // The view the order under way is built for, and the frame's projection.
+  // The view the order under way is built for, the frame's view, and the
+  // frame's projection.
   GLuint view_parameters_ = 0u;
+  GLuint frame_view_parameters_ = 0u;
   GLuint projection_parameters_ = 0u;
 
   std::array<Order, 2> orders_{};

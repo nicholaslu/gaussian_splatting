@@ -155,12 +155,13 @@ public:
 
   bool encode(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    bool incremental) override
+    bool incremental, std::uint32_t colour_parts) override
   {
     if (!core_ || !instance_gl_) {
       error_ = "OpenGL view preparation is not fully configured";
       return false;
     }
+    core_->setColourRefresh(colour_parts);
     const bool encoded = incremental ?
       core_->encodeIncremental(
       parameters, projection, instance_gl_, indirect_gl_, !kOgreIndirectDraw) :

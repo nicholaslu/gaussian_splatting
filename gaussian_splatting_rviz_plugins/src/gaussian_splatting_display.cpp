@@ -517,13 +517,29 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
     "While the camera moves, draw every frame from the last complete draw order, "
     "projected for the current camera, and build the next order over five "
     "frames: culling, each half of the colour, and each half of the depth sort. "
-    "The draw order and the view-dependent colour lag the camera by up to five "
-    "frames, and splats just beyond the view's edge are kept so that turning "
-    "does not uncover gaps; the first frame the camera stands still is prepared "
-    "exactly. With the full Garden scene, preparation fell from 27-29 ms to at "
-    "most 10 ms a frame on an Apple M3, and from 5.9 ms to at most 2.5 ms on an "
-    "RTX 4090. GPU preparation only.",
+    "The draw order lags the camera by four to eight frames, and splats just "
+    "beyond the view's edge are kept so that turning does not uncover gaps; the "
+    "first frame the camera stands still is prepared exactly. With the full "
+    "Garden scene, preparation fell from 27-29 ms to at most 10 ms a frame on an "
+    "Apple M3, and from 5.9 ms to at most 2.5 ms on an RTX 4090, without Colour "
+    "Refresh. GPU preparation only.",
     this);
+  incremental_property_->setDisableChildrenIfFalse(true);
+
+  colour_refresh_property_ = new rviz_common::properties::EnumProperty(
+    "Colour Refresh", "Half per frame",
+    "How the view-dependent colour of the splats follows a moving camera during "
+    "incremental preparation. Off keeps the colours an order was built with, so "
+    "they lag with the order and change in a step, most visibly on specular "
+    "highlights, each time a new order takes over. Every frame evaluates every "
+    "visible splat's spherical harmonics again for the current camera; half per "
+    "frame does half of them in turn, so a colour is at most a frame old, for "
+    "half the cost. On an Apple M3 with the full Garden scene, refreshing every "
+    "colour costs about as much as the colour step of a build.",
+    incremental_property_);
+  colour_refresh_property_->addOption("Off", 0);
+  colour_refresh_property_->addOption("Half per frame", 2);
+  colour_refresh_property_->addOption("Every frame", 1);
 
   min_screen_radius_property_ = new rviz_common::properties::FloatProperty(
     "Minimum Screen Radius", 0.0f,
@@ -1538,7 +1554,9 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     (culling_enabled ? kViewCulling : 0u) | (perspective ? kViewPerspective : 0u);
 
   if (gpu_view_preparation_) {
-    if (gpu_view_preparation_->encode(parameters, projection, incremental)) {
+    const auto colour_parts =
+      static_cast<std::uint32_t>(std::max(0, colour_refresh_property_->getOptionInt()));
+    if (gpu_view_preparation_->encode(parameters, projection, incremental, colour_parts)) {
       order_exact_ = !incremental;
       if (!using_gpu_preparation_) {
         RCLCPP_INFO(

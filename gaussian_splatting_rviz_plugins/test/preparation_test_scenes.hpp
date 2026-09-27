@@ -211,6 +211,29 @@ inline Reference cpuReference(const Scene & scene, const ViewParameters & view)
   return reference;
 }
 
+// Splat `i`'s colour seen from `view`'s camera, whether or not the view keeps
+// it: the colour arithmetic of prepareSplat(), for checking colours evaluated
+// for one camera on survivors culled for another.
+inline void splatColour(
+  const Scene & scene, const ViewParameters & view, std::uint32_t i, float * colour)
+{
+  const SplatRecord & record = scene.records[i];
+  float direction[3] = {record.position[0] - view.local_camera[0],
+    record.position[1] - view.local_camera[1], record.position[2] - view.local_camera[2]};
+  const float length = std::sqrt(dotProduct(
+      direction[0], direction[1], direction[2], direction[0], direction[1], direction[2]));
+  if (length > 0.0f) {
+    const float inverse = 1.0f / length;
+    direction[0] *= inverse;
+    direction[1] *= inverse;
+    direction[2] *= inverse;
+  }
+  const std::size_t stride = std::size_t(scene.coefficients) * 3;
+  evaluateColour(
+    &scene.dc[std::size_t(i) * 3], stride > 0 ? &scene.rest[i * stride] : nullptr,
+    scene.coefficients, direction, colour);
+}
+
 // How far two projected quads disagree, in units of what float rounding can
 // explain: above 1 is a real difference. Centres are measured in pixels, and
 // the ellipses through a1 a1^T + a2 a2^T in square pixels, which does not care

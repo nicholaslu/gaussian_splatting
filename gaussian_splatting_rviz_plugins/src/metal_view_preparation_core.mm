@@ -91,6 +91,7 @@ MetalViewPreparationCore::MetalViewPreparationCore(
     shade_pipeline_ = makePipeline(@"shade_slots", Dispatch::kLinear);
     gather_pipeline_ = makePipeline(@"reproject_gather", Dispatch::kLinear);
     finish_pipeline_ = makePipeline(@"finish_order", Dispatch::kLinear);
+    recolour_pipeline_ = makePipeline(@"recolour_order", Dispatch::kLinear);
   }
 }
 
@@ -99,7 +100,7 @@ bool MetalViewPreparationCore::ready() const
   return keys_pipeline_ && compact_count_pipeline_ && compact_scan_pipeline_ &&
          compact_scatter_pipeline_ && histogram_pipeline_ && offset_pipeline_ &&
          base_pipeline_ && scatter_pipeline_ && shade_pipeline_ && gather_pipeline_ &&
-         finish_pipeline_;
+         finish_pipeline_ && recolour_pipeline_;
 }
 
 const std::string & MetalViewPreparationCore::error() const
@@ -140,8 +141,11 @@ bool MetalViewPreparationCore::configure(std::uint32_t count, std::uint32_t inde
   pairs_ = newBuffer(pairs, "key/slot pairs");
   slots_ = newBuffer(survivors, "survivors by slot");
   drawn_ = newBuffer(survivors, "survivors in draw order");
+  colours_ = newBuffer(static_cast<NSUInteger>(count) * sizeof(float) * 4u, "drawn colours");
+  slot_draws_ = newBuffer(
+    static_cast<NSUInteger>(count) * sizeof(std::uint32_t) * 2u, "slot splats and positions");
   bool allocated = staged_ && tile_counts_ && tile_offsets_ && histograms_ && offsets_ &&
-    totals_ && digit_bases_ && pairs_ && slots_ && drawn_;
+    totals_ && digit_bases_ && pairs_ && slots_ && drawn_ && colours_ && slot_draws_;
   for (Order & order : orders_) {
     order.state = newBuffer(sizeof(State), "order state");
     order.tile_dispatch = newBuffer(sizeof(std::uint32_t) * 3u, "order tile dispatch");
@@ -180,6 +184,10 @@ void MetalViewPreparationCore::clear()
   pairs_ = nil;
   slots_ = nil;
   drawn_ = nil;
+  colours_ = nil;
+  slot_draws_ = nil;
+  colour_frame_ = 0;
+  refreshable_ = false;
   for (Order & order : orders_) {
     order = Order{};
   }
@@ -405,7 +413,10 @@ bool MetalViewPreparationCore::encodeGather(
   const Order & order = orders_[current_];
   [encoder setComputePipelineState:gather_pipeline_];
   [encoder setBuffer:drawn_ offset:0 atIndex:0];
+  [encoder setBuffer:colours_ offset:0 atIndex:1];
   [encoder setBuffer:order.state offset:0 atIndex:4];
+  const std::uint32_t refreshed = refreshable_ && colour_parts_ > 0 ? 1u : 0u;
+  [encoder setBytes:&refreshed length:sizeof(refreshed) atIndex:9];
   [encoder setBuffer:instances offset:0 atIndex:5];
   [encoder setBytes:&projection length:sizeof(projection) atIndex:6];
   [encoder setBuffer:draw_arguments offset:0 atIndex:7];
@@ -441,13 +452,41 @@ bool MetalViewPreparationCore::encodeIncremental(
   if (current_ < 0) {
     return encode(encoder, parameters, projection, instances, draw_arguments);
   }
-  if (encodeBuildStep(encoder, parameters) == BuildStep::kFailed ||
-    !encodeGather(encoder, projection, instances, draw_arguments))
-  {
+  if (encodeBuildStep(encoder, parameters) == BuildStep::kFailed) {
+    return false;
+  }
+  if (colour_parts_ > 0 && refreshable_) {
+    encodeRecolour(encoder, parameters, colour_frame_++ % colour_parts_, colour_parts_);
+  }
+  if (!encodeGather(encoder, projection, instances, draw_arguments)) {
     return false;
   }
   error_.clear();
   return true;
+}
+
+void MetalViewPreparationCore::encodeRecolour(
+  id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
+  std::uint32_t index, std::uint32_t count)
+{
+  if (current_ < 0 || !refreshable_ || count == 0 || index >= count) {
+    return;
+  }
+  const Order & order = orders_[current_];
+  [encoder setComputePipelineState:recolour_pipeline_];
+  [encoder setBuffer:slot_draws_ offset:0 atIndex:0];
+  [encoder setBuffer:splats_ offset:0 atIndex:2];
+  [encoder setBuffer:sh_dc_ offset:0 atIndex:3];
+  [encoder setBuffer:sh_rest_ offset:0 atIndex:4];
+  [encoder setBuffer:order.state offset:0 atIndex:5];
+  [encoder setBuffer:colours_ offset:0 atIndex:6];
+  [encoder setBytes:&parameters length:sizeof(parameters) atIndex:7];
+  const std::uint32_t part[2] = {index, count};
+  [encoder setBytes:part length:sizeof(part) atIndex:8];
+  // Sized for every survivor; threads past the part return at once.
+  [encoder dispatchThreadgroupsWithIndirectBuffer:order.gather_dispatch indirectBufferOffset:0
+                            threadsPerThreadgroup:MTLSizeMake(gather_width_, 1, 1)];
+  barrier(encoder);
 }
 
 MetalViewPreparationCore::BuildStep MetalViewPreparationCore::encodeBuildStep(
@@ -478,8 +517,12 @@ void MetalViewPreparationCore::completeBuild(id<MTLComputeCommandEncoder> encode
   [encoder setComputePipelineState:finish_pipeline_];
   [encoder setBuffer:pairs_ offset:0 atIndex:0];
   [encoder setBuffer:slots_ offset:0 atIndex:1];
+  [encoder setBuffer:slot_draws_ offset:0 atIndex:2];
   [encoder setBuffer:order.state offset:0 atIndex:4];
   [encoder setBuffer:drawn_ offset:0 atIndex:5];
+  [encoder setBuffer:colours_ offset:0 atIndex:7];
+  const std::uint32_t refreshable = colour_parts_ > 0 ? 1u : 0u;
+  [encoder setBytes:&refreshable length:sizeof(refreshable) atIndex:8];
   // The passes write disjoint positions, so they need no barrier between them.
   for (std::uint32_t first = 0; first < count_; first += kFinishSlotsPerPass) {
     const std::uint32_t range[2] = {first, first + std::min(kFinishSlotsPerPass, count_ - first)};
@@ -488,6 +531,7 @@ void MetalViewPreparationCore::completeBuild(id<MTLComputeCommandEncoder> encode
                               threadsPerThreadgroup:MTLSizeMake(gather_width_, 1, 1)];
   }
   barrier(encoder);
+  refreshable_ = refreshable != 0u;
   current_ = building_;
   building_ = -1;
   build_step_ = 0;
@@ -517,8 +561,8 @@ id<MTLBuffer> MetalViewPreparationCore::stateBuffer() const
 NSUInteger MetalViewPreparationCore::scratchBytes() const
 {
   NSUInteger total = 0;
-  for (id<MTLBuffer> buffer : {staged_, pairs_, slots_, drawn_, tile_counts_, tile_offsets_,
-      histograms_, offsets_, totals_, digit_bases_})
+  for (id<MTLBuffer> buffer : {staged_, pairs_, slots_, drawn_, colours_, slot_draws_,
+      tile_counts_, tile_offsets_, histograms_, offsets_, totals_, digit_bases_})
   {
     total += buffer ? buffer.length : 0u;
   }

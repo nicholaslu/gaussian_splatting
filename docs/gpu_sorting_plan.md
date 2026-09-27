@@ -255,9 +255,10 @@ precision, or shared with the ROS message without another full-size copy. SH
 should be read only during the post-sort gather, for visible splats. This memory
 decision must be measured for both macOS and iPadOS.
 
-As built, preparation keeps the two key/index buffers, the per-tile tables, and
+As built, preparation keeps the two key/index buffers, the per-tile tables,
 two buffers of 64-byte `DrawnSplat`s - the survivors by compacted slot and in
-draw order - sized for every splat: about 810 MiB for Garden, beside the 48-byte
+draw order - and, for Colour Refresh, a colour and a slot's splat and draw
+position per splat, all sized for every splat: about 950 MiB for Garden, beside the 48-byte
 projected instance buffer the draw reads (267 MiB) and the scene itself
 (records 267 MiB, SH 1.1 GiB). Before draw orders were kept, preparation took
 about 400 MiB. The offscreen target is 8 bytes a pixel in half float.
@@ -447,9 +448,10 @@ stream as before.
 While the camera moves, the display prepares incrementally: every frame draws
 the newest complete order reprojected, and the next order is built one step a
 frame, five steps of comparable cost (culling, each half of the colour, each
-half of the sort). The order and the view-dependent colour lag by up to five
-frames; building culls against a frustum 15% wider, so turning uncovers no gaps;
-the first frame the camera stands still is prepared exactly. Only the orders'
+half of the sort). An order built for the camera of one frame is drawn from
+four to eight frames later; building culls against a frustum 15% wider, so
+turning uncovers no gaps; the first frame the camera stands still is prepared
+exactly. Only the orders'
 counts are kept twice: the survivors in draw order are replaced as a build
 completes, by which point nothing reads the old ones. The Incremental
 Preparation property turns it off. Both verifiers check that frames drawing an
@@ -474,6 +476,27 @@ GPU time per frame, median (largest) of the incremental frames:
 
 In RViz on the M3, with the camera moving every frame over the real Garden
 scene at 2940x1905, the frame rate went from 10-13 fps to 15-18 fps.
+
+Colours computed when an order is built lag with it, and change in a step
+when the next order takes over, which shows on specular highlights. Colour
+Refresh, under Incremental Preparation, evaluates the spherical harmonics of
+the order being drawn again for the current camera: every frame, or half the
+survivors a frame in turn (the default), so no colour is more than a frame
+old. `recolour_order` walks the survivors by slot, in index order, so the
+coefficients are read as stored, and writes each colour to its draw position,
+at random but within a buffer the size of the visible set; `finish_order`
+keeps each slot's splat and draw position for it. Keeping those costs the
+completing frame a few milliseconds on the M3, so an order completed with the
+refresh off skips them, and the refresh starts with the next order when it is
+switched on mid-motion. Both verifiers check refreshed colours against the CPU
+colour for the new camera on the old order, and fail with the refresh
+disabled. GPU time per incremental frame, median (largest):
+
+| Scene | Off | Half per frame | Every frame |
+| --- | ---: | ---: | ---: |
+| M3, real Garden, training camera 0, 2940x1905 | 7.8 (9.9) ms | 12.9 (18.3) ms | 17.6 (23.5) ms |
+| M3, real Garden, training camera 0, close | 4.3 (6.4) ms | 7.0 (9.3) ms | 9.7 (11.9) ms |
+| RTX 4090, synthetic Garden-sized | 1.2 (1.5) ms | 2.1 (2.6) ms | 3.0 (3.5) ms |
 
 ### Offscreen precision
 

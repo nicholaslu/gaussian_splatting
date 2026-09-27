@@ -146,7 +146,7 @@ public:
 
   bool encode(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    bool incremental) override
+    bool incremental, std::uint32_t colour_parts) override
   {
     if (!core_ || !instance_buffer_ || !indirect_buffer_) {
       error_ = "Metal view preparation is not fully configured";
@@ -162,8 +162,10 @@ public:
       error_ = "Ogre did not expose the Metal output buffers";
       return false;
     }
-    return profiling_ ? encodeProfiled(parameters, projection, instances, draw, incremental) :
-           encodeInFrame(parameters, projection, instances, draw, incremental);
+    core_->setColourRefresh(colour_parts);
+    return profiling_ ?
+           encodeProfiled(parameters, projection, instances, draw, incremental, colour_parts) :
+           encodeInFrame(parameters, projection, instances, draw, incremental, colour_parts);
   }
 
   std::int64_t lastVisibleCount() const override
@@ -207,7 +209,7 @@ public:
 private:
   bool encodeInFrame(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental)
+    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental, std::uint32_t colour_parts)
   {
     id<MTLComputeCommandEncoder> encoder = device_->getComputeEncoder();
     id<MTLCommandBuffer> command_buffer = device_->mCurrentCommandBuffer;
@@ -247,7 +249,7 @@ private:
 
   bool encodeProfiled(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental)
+    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental, std::uint32_t colour_parts)
   {
     id<MTLCommandQueue> queue = device_->mMainCommandQueue;
     if (!queue) {
@@ -282,6 +284,15 @@ private:
           });
       (step == Step::kCull ? times.cull_ms : step == Step::kShade ? times.shade_ms :
       times.sort_ms) = ms;
+      if (colour_parts > 0 && core_->hasOrder()) {
+        // Timed as colour; a no-op for an order that kept nothing to refresh.
+        times.shade_ms += stage(@"Gaussian splat preparation: recolour",
+            [&](id<MTLComputeCommandEncoder> encoder) {
+              core_->encodeRecolour(
+                encoder, parameters, recolour_frame_++ % colour_parts, colour_parts);
+              return true;
+            });
+      }
     } else {
       times.cull_ms = stage(@"Gaussian splat preparation: cull and compact",
           [&](id<MTLComputeCommandEncoder> encoder) {
@@ -375,6 +386,7 @@ private:
   bool profiling_ = false;
   bool debug_projection_ = false;
   std::uint64_t debug_frame_ = 0;
+  std::uint32_t recolour_frame_ = 0;
   std::unique_ptr<MetalViewPreparationCore> core_;
   const Ogre::Renderable * renderable_ = nullptr;
   Ogre::HardwareVertexBufferSharedPtr instance_buffer_;

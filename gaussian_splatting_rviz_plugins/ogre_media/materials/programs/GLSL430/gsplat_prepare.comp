@@ -619,16 +619,20 @@ void main()
 }
 
 #elif defined(GSPLAT_STAGE_FINISH_ORDER)
-// Completing an order: the survivors in draw order, so that drawing from the
-// order reads them in sequence. The one permutation per order, in passes over
+// Completing an order: the survivors in draw order and, when the order may be
+// recoloured, their colours in draw order and each slot's splat and draw
+// position for RECOLOUR_ORDER. The one permutation per order, in passes over
 // ranges of slots; see finish_order in gsplat_prepare.metal for why.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Sorted {uvec2 sorted_records[];};
 layout(std430, binding = 1) readonly buffer Slots {DrawnSplat slots[];};
+layout(std430, binding = 2) writeonly buffer SlotDraws {uvec2 slot_draws[];};
 layout(std430, binding = 4) readonly buffer State {PreparationState state;};
 layout(std430, binding = 5) writeonly buffer Drawn {DrawnSplat drawn[];};
+layout(std430, binding = 6) writeonly buffer Colours {vec4 colours[];};
 uniform uint first_slot;
 uniform uint end_slot;
+uniform uint refreshable;
 
 void main()
 {
@@ -638,8 +642,84 @@ void main()
   }
   uint slot = sorted_records[output_index].y;
   if (slot >= first_slot && slot < end_slot) {
-    drawn[output_index] = slots[slot];
+    DrawnSplat d = slots[slot];
+    drawn[output_index] = d;
+    if (refreshable != 0u) {
+      colours[output_index] = vec4(d.scale_red.w, d.green_blue, 0.0);
+      slot_draws[slot] = uvec2(d.splat, output_index);
+    }
   }
+}
+
+#elif defined(GSPLAT_STAGE_RECOLOUR_ORDER)
+// The colours of the order being drawn, evaluated again for this frame's
+// camera, walking the survivors by slot so the SH coefficients are read in
+// the order they are stored; see recolour_order in gsplat_prepare.metal.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer SlotDraws {uvec2 slot_draws[];};
+layout(std430, binding = 2) readonly buffer Splats {SplatRecord splats[];};
+layout(std430, binding = 3) readonly buffer Dc {float sh_dc[];};
+layout(std430, binding = 4) readonly buffer Rest {float sh_rest[];};
+layout(std430, binding = 5) readonly buffer State {PreparationState state;};
+layout(std430, binding = 6) writeonly buffer Colours {vec4 colours[];};
+layout(std430, binding = 7) readonly buffer ViewBlock {ViewParameters p;};
+// Which part, of how many, of the survivors to refresh.
+uniform uint part_index;
+uniform uint part_count;
+
+vec3 evaluateSH(uint splat, vec3 position)
+{
+  vec3 colour = kSHC0 * vec3(
+    sh_dc[splat * 3u], sh_dc[splat * 3u + 1u], sh_dc[splat * 3u + 2u]) + 0.5;
+  vec3 direction = position - p.local_camera.xyz;
+  float direction_length = length(direction);
+  if (direction_length > 0.0) {
+    direction /= direction_length;
+  }
+  float x = direction.x;
+  float y = direction.y;
+  float z = direction.z;
+  uint coefficient = splat * p.sh_coefficients * 3u;
+
+  if (p.sh_coefficients >= 3u) {
+    colour += -kSHC1 * y * vec3(sh_rest[coefficient], sh_rest[coefficient + 1u], sh_rest[coefficient + 2u]);
+    colour +=  kSHC1 * z * vec3(sh_rest[coefficient + 3u], sh_rest[coefficient + 4u], sh_rest[coefficient + 5u]);
+    colour += -kSHC1 * x * vec3(sh_rest[coefficient + 6u], sh_rest[coefficient + 7u], sh_rest[coefficient + 8u]);
+  }
+  if (p.sh_coefficients >= 8u) {
+    float xx = x * x, yy = y * y, zz = z * z;
+    float xy = x * y, yz = y * z, xz = x * z;
+    colour += kSHC2[0] * xy * vec3(sh_rest[coefficient + 9u], sh_rest[coefficient + 10u], sh_rest[coefficient + 11u]);
+    colour += kSHC2[1] * yz * vec3(sh_rest[coefficient + 12u], sh_rest[coefficient + 13u], sh_rest[coefficient + 14u]);
+    colour += kSHC2[2] * (2.0 * zz - xx - yy) * vec3(sh_rest[coefficient + 15u], sh_rest[coefficient + 16u], sh_rest[coefficient + 17u]);
+    colour += kSHC2[3] * xz * vec3(sh_rest[coefficient + 18u], sh_rest[coefficient + 19u], sh_rest[coefficient + 20u]);
+    colour += kSHC2[4] * (xx - yy) * vec3(sh_rest[coefficient + 21u], sh_rest[coefficient + 22u], sh_rest[coefficient + 23u]);
+  }
+  if (p.sh_coefficients >= 15u) {
+    float xx = x * x, yy = y * y, zz = z * z, xy = x * y;
+    colour += kSHC3[0] * y * (3.0 * xx - yy) * vec3(sh_rest[coefficient + 24u], sh_rest[coefficient + 25u], sh_rest[coefficient + 26u]);
+    colour += kSHC3[1] * xy * z * vec3(sh_rest[coefficient + 27u], sh_rest[coefficient + 28u], sh_rest[coefficient + 29u]);
+    colour += kSHC3[2] * y * (4.0 * zz - xx - yy) * vec3(sh_rest[coefficient + 30u], sh_rest[coefficient + 31u], sh_rest[coefficient + 32u]);
+    colour += kSHC3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * vec3(sh_rest[coefficient + 33u], sh_rest[coefficient + 34u], sh_rest[coefficient + 35u]);
+    colour += kSHC3[4] * x * (4.0 * zz - xx - yy) * vec3(sh_rest[coefficient + 36u], sh_rest[coefficient + 37u], sh_rest[coefficient + 38u]);
+    colour += kSHC3[5] * z * (xx - yy) * vec3(sh_rest[coefficient + 39u], sh_rest[coefficient + 40u], sh_rest[coefficient + 41u]);
+    colour += kSHC3[6] * x * (xx - 3.0 * yy) * vec3(sh_rest[coefficient + 42u], sh_rest[coefficient + 43u], sh_rest[coefficient + 44u]);
+  }
+  return max(colour, vec3(0.0));
+}
+
+void main()
+{
+  uint share = state.visible / part_count;
+  uint spare = state.visible % part_count;
+  uint begin = part_index * share + min(part_index, spare);
+  uint end = begin + share + (part_index < spare ? 1u : 0u);
+  uint slot = begin + gl_GlobalInvocationID.x;
+  if (slot >= end) {
+    return;
+  }
+  uvec2 draw = slot_draws[slot];
+  colours[draw.y] = vec4(evaluateSH(draw.x, splats[draw.x].position_opacity.xyz), 0.0);
 }
 
 #elif defined(GSPLAT_STAGE_PUBLISH)
@@ -688,13 +768,16 @@ void main()
 
 #elif defined(GSPLAT_STAGE_REPROJECT_GATHER)
 // The draw stream, each survivor of an order projected for this frame's camera
-// with the colour the order was built with, read and written in sequence; see
+// with its colour - the order's own, or with `refreshed` the one
+// RECOLOUR_ORDER last wrote - read and written in sequence; see
 // reproject_gather in gsplat_prepare.metal.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Drawn {DrawnSplat drawn[];};
+layout(std430, binding = 1) readonly buffer Colours {vec4 colours[];};
 layout(std430, binding = 4) readonly buffer State {PreparationState state;};
 layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
 layout(std430, binding = 6) readonly buffer ProjectionBlock {ProjectionParameters q;};
+uniform uint refreshed;
 
 ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
 {
@@ -776,7 +859,8 @@ void main()
   }
   DrawnSplat d = drawn[output_index];
   SplatRecord splat = SplatRecord(d.position_opacity, vec4(d.scale_red.xyz, 0.0), d.quat);
-  instances[output_index] = projectSplat(splat, vec3(d.scale_red.w, d.green_blue));
+  vec3 colour = refreshed != 0u ? colours[output_index].xyz : vec3(d.scale_red.w, d.green_blue);
+  instances[output_index] = projectSplat(splat, colour);
 }
 
 #elif defined(GSPLAT_STAGE_CLEAR_TAIL)

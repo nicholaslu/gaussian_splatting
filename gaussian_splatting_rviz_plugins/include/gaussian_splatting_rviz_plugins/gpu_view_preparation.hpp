@@ -50,11 +50,13 @@ public:
   // draws from it. An incremental one takes one step of building the next
   // order, started for `parameters` if none is under way, and draws the newest
   // complete order projected with `projection`: much cheaper per frame, while
-  // the order and the colours lag the camera by a few frames. The first
-  // preparation after configure() or an upload is always full.
+  // the order lags the camera by a few frames. Its colours lag with it unless
+  // `colour_parts` is 1, which evaluates them all again for `parameters`
+  // first, or 2, which does half of them in turn. The first preparation after
+  // configure() or an upload is always full.
   virtual bool encode(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    bool incremental) = 0;
+    bool incremental, std::uint32_t colour_parts) = 0;
 
   // Implementations may update this asynchronously. A negative value means
   // that no completed preparation has reported a count yet.

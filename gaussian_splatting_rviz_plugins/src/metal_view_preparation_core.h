@@ -25,9 +25,10 @@ namespace gaussian_splatting_rviz_plugins
 // order and count them; shade_slots colours them and copies their records
 // while they are still in index order, and makes each one's compacted slot the
 // sort's value; the radix sorts only those survivors; finish_order lays the
-// survivors out in draw order. Drawing: reproject_gather projects them in
-// sequence for the frame's camera, with the colours the order was built with,
-// and writes the indirect draw arguments. Nothing is read back on the CPU.
+// survivors and their colours out in draw order. Drawing: reproject_gather
+// projects them in sequence for the frame's camera, and writes the indirect
+// draw arguments; recolour_order can first evaluate their colours again for
+// the frame's camera. Nothing is read back on the CPU.
 //
 // The next order can be built while the last is drawn from: encode() builds
 // one for its view and draws from it in the same frame, encodeIncremental()
@@ -77,11 +78,18 @@ public:
     id<MTLBuffer> draw_arguments);
   // One of five steps of building an order - started for `parameters` if
   // none is under way - then the draw stream from the newest complete order,
-  // projected with `projection`. With no complete order yet, it is encode().
+  // projected with `projection`, and with its colours evaluated again for
+  // `parameters` as setColourRefresh() asks. With no complete order yet, it is
+  // encode().
   bool encodeIncremental(
     id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
     const ProjectionParameters & projection, id<MTLBuffer> instances,
     id<MTLBuffer> draw_arguments);
+  // How incremental preparation refreshes colours: 0 not at all, so they lag
+  // with the order; 1 every colour every frame; 2 half of them a frame in
+  // turn. Orders completed while it is 0 cannot be refreshed, which saves
+  // their completion some writes.
+  void setColourRefresh(std::uint32_t parts) {colour_parts_ = parts;}
   // The build step encodeIncremental() takes, without the draw: the step it
   // ran, or kFailed. Needs a complete order to draw from meanwhile.
   enum class BuildStep { kFailed, kCull, kShade, kSortLow, kSortHigh };
@@ -101,6 +109,11 @@ public:
   bool encodeGather(
     id<MTLComputeCommandEncoder> encoder, const ProjectionParameters & projection,
     id<MTLBuffer> instances, id<MTLBuffer> draw_arguments);
+  // The newest complete order's colours evaluated again for `parameters`:
+  // all of them, or part `index` of `count` equal parts.
+  void encodeRecolour(
+    id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
+    std::uint32_t index = 0, std::uint32_t count = 1);
 
   // For benchmarking the sort alone: makes the first `visible` pairs already
   // in keyBuffer() the input of a build that encodeSort() completes.
@@ -154,6 +167,7 @@ private:
   id<MTLComputePipelineState> shade_pipeline_ = nil;
   id<MTLComputePipelineState> gather_pipeline_ = nil;
   id<MTLComputePipelineState> finish_pipeline_ = nil;
+  id<MTLComputePipelineState> recolour_pipeline_ = nil;
 
   std::uint32_t count_ = 0;
   std::uint32_t tile_count_ = 0;
@@ -172,6 +186,14 @@ private:
   // order's in draw order.
   id<MTLBuffer> slots_ = nil;
   id<MTLBuffer> drawn_ = nil;
+  // The newest complete order's colours in draw order, and for each slot its
+  // splat and draw position, by which recolour_order refreshes them.
+  id<MTLBuffer> colours_ = nil;
+  id<MTLBuffer> slot_draws_ = nil;
+  std::uint32_t colour_parts_ = 0;
+  std::uint32_t colour_frame_ = 0;
+  // Whether the newest complete order kept what recolour_order needs.
+  bool refreshable_ = false;
   id<MTLBuffer> tile_counts_ = nil;
   id<MTLBuffer> tile_offsets_ = nil;
   id<MTLBuffer> histograms_ = nil;

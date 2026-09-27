@@ -140,9 +140,10 @@ bool load(Context & context, const Scene & scene)
 // incremental preparation.
 bool prepare(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection,
-  double * gpu_ms = nullptr, bool incremental = false)
+  double * gpu_ms = nullptr, bool incremental = false, std::uint32_t colour_parts = 0)
 {
   const auto start = std::chrono::steady_clock::now();
+  context.core->setColourRefresh(colour_parts);
   const bool encoded = incremental ?
     context.core->encodeIncremental(view, projection, context.instances, 0u, true) :
     context.core->encode(view, projection, context.instances, 0u, true);
@@ -161,18 +162,22 @@ bool emptyInstance(const ProjectedInstance & q)
          q.colour[2] == 0.0f && q.colour[3] == 0.0f;
 }
 
-// Prepares for `prepared`, fully or as one incremental frame, and checks the
-// draw stream against the CPU path for `view`: its order and colours,
-// projected with `projection`. The two views differ only while an incremental
-// build is under way.
+// Prepares for `prepared`, fully or as one incremental frame refreshing
+// `colour_parts` of the colours, and checks the draw stream against the CPU
+// path for `view`: its order and colours, projected with `projection`; or,
+// given `colour_view`, the colours seen from that camera instead. The views
+// differ only while an incremental build is under way.
 bool verify(
   const char * name, Context & context, const Scene & scene, const ViewParameters & view,
   const ProjectionParameters & projection, const ViewParameters * prepared = nullptr,
-  bool incremental = false)
+  bool incremental = false, std::uint32_t colour_parts = 0,
+  const ViewParameters * colour_view = nullptr)
 {
   const Reference reference = cpuReference(scene, view);
   double gpu_ms = 0.0;
-  if (!prepare(context, prepared ? *prepared : view, projection, &gpu_ms, incremental)) {
+  if (!prepare(
+      context, prepared ? *prepared : view, projection, &gpu_ms, incremental, colour_parts))
+  {
     std::printf("%-34s FAIL: %s\n", name, context.core->error().c_str());
     return false;
   }
@@ -225,9 +230,14 @@ bool verify(
     }
     max_shift = std::max(max_shift, i > rank[splat] ? i - rank[splat] : rank[splat] - i);
 
+    float colour[3];
+    if (colour_view) {
+      splatColour(scene, *colour_view, splat, colour);
+    } else {
+      std::memcpy(colour, &reference.colours[std::size_t(splat) * 3], sizeof(colour));
+    }
     ProjectedInstance expected;
-    projectSplat(
-      projection, scene.records[splat], &reference.colours[std::size_t(splat) * 3], expected);
+    projectSplat(projection, scene.records[splat], colour, expected);
     const double quad = quadDifference(drawn[i], expected, projection);
     if (!std::isfinite(quad)) {
       ++nonfinite;
@@ -301,6 +311,25 @@ int verifyIncremental(
     failures += !verify(name, context, scene, from, projection, &to, true);
   }
   failures += !verify("  incremental: new order", context, scene, to, projection, &to, true);
+
+  // Colours refreshed for the camera every frame, then half of them a frame:
+  // once both halves have been refreshed at the same camera, all of them are
+  // its colours, on the old order and on the new.
+  for (std::uint32_t parts : {1u, 2u}) {
+    failures += !verify("  recolour: starting order", context, scene, from, projection,
+      nullptr, false, parts);
+    for (int frame = 1; frame <= 4; ++frame) {
+      if (frame < int(parts)) {
+        prepare(context, to, projection, nullptr, true, parts);
+        continue;
+      }
+      failures += !verify(parts == 1 ? "  recolour every frame, old order" :
+        "  recolour half a frame, old order", context, scene, from, projection, &to, true,
+        parts, &to);
+    }
+    failures += !verify(parts == 1 ? "  recolour every frame, new order" :
+      "  recolour half a frame, new order", context, scene, to, projection, &to, true, parts);
+  }
   return failures;
 }
 
@@ -334,11 +363,17 @@ void timeStages(
     radix_scan.push_back(timings.radix_scan_ms);
     radix_scatter.push_back(timings.radix_scatter_ms);
   }
-  std::vector<double> frames;
-  for (int frame = 0; frame < 30; ++frame) {
-    prepare(context, view, projection, nullptr, true);
-    const OpenGlViewPreparationCore::Timings & timings = context.core->lastTimings();
-    frames.push_back(timings.cull_ms + timings.shade_ms + timings.sort_ms + timings.gather_ms);
+  // Incremental frames: every step of a build, in turn, and the draw, with
+  // colours refreshed not at all, half a frame, and every frame.
+  std::vector<double> frames[3];
+  for (std::uint32_t parts : {0u, 2u, 1u}) {
+    prepare(context, view, projection, nullptr, false, parts);
+    for (int frame = 0; frame < 30; ++frame) {
+      prepare(context, view, projection, nullptr, true, parts);
+      const OpenGlViewPreparationCore::Timings & timings = context.core->lastTimings();
+      frames[parts].push_back(
+        timings.cull_ms + timings.shade_ms + timings.sort_ms + timings.gather_ms);
+    }
   }
   context.core->setProfiling(false);
   const auto state =
@@ -348,8 +383,12 @@ void timeStages(
   std::printf(
     "  GPU by stage: cull+compact %.2f | shade %.2f | sort %.2f | project+gather %.2f ms\n",
     median(cull), median(shade), median(sort), median(gather));
-  std::printf("  GPU per incremental frame: median %.2f, largest %.2f ms\n", median(frames),
-    *std::max_element(frames.begin(), frames.end()));
+  const char * refresh[3] = {"no colour refresh", "every colour", "half the colours"};
+  for (std::uint32_t parts : {0u, 2u, 1u}) {
+    std::printf("  GPU per incremental frame, %s: median %.2f, largest %.2f ms\n",
+      refresh[parts], median(frames[parts]),
+      *std::max_element(frames[parts].begin(), frames[parts].end()));
+  }
   std::printf(
     "    cull: keys %.2f | compact count %.2f | compact scan %.2f | compact scatter %.2f ms\n",
     median(keys), median(compact_count), median(compact_scan), median(compact_scatter));
@@ -459,8 +498,12 @@ int main(int argc, char ** argv)
       moved.viewport_size[2] = 1.0f / 1600.0f;
       moved.viewport_size[3] = 1.0f / 900.0f;
       moved.fovy = 0.8f;
-      failures += verifyIncremental(context, scene, view,
-        makeView(scene, c.flags, c.far_clip, c.dx + 0.3f, c.dy, c.dz, 2.0f), moved);
+      // The camera moves too, so the new view's colours differ from the old.
+      ViewParameters to = makeView(scene, c.flags, c.far_clip, c.dx + 0.3f, c.dy, c.dz, 2.0f);
+      to.local_camera[0] = 0.6f;
+      to.local_camera[1] = -0.4f;
+      to.local_camera[2] = 0.3f;
+      failures += verifyIncremental(context, scene, view, to, moved);
     }
     if (!quick && c.count == kGardenCount) {
       timeStages(context, view, projection);

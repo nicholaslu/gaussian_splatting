@@ -89,12 +89,13 @@ struct Run
 // incremental preparation.
 Run prepare(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection,
-  bool incremental = false)
+  bool incremental = false, std::uint32_t colour_parts = 0)
 {
   Run run;
   run.command_buffer = [context.queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [run.command_buffer computeCommandEncoder];
   const auto start = std::chrono::steady_clock::now();
+  context.core->setColourRefresh(colour_parts);
   run.encoded = incremental ?
     context.core->encodeIncremental(encoder, view, projection, context.instances, context.draw) :
     context.core->encode(encoder, view, projection, context.instances, context.draw);
@@ -107,10 +108,12 @@ Run prepare(
 }
 
 // Checks the draw stream `run` left against the CPU path for `view`: its order
-// and colours, projected with `projection`.
+// and colours, projected with `projection`; or, given `colour_view`, the
+// colours seen from that camera instead.
 bool check(
   const char * name, Context & context, const Scene & scene, const ViewParameters & view,
-  const ProjectionParameters & projection, const Run & run)
+  const ProjectionParameters & projection, const Run & run,
+  const ViewParameters * colour_view = nullptr)
 {
   const Reference reference = cpuReference(scene, view);
   if (!run.encoded || run.command_buffer.status != MTLCommandBufferStatusCompleted) {
@@ -143,10 +146,14 @@ bool check(
       }
     }
     key_bad += order[i].key != want_key;
+    float colour[3];
+    if (colour_view) {
+      splatColour(scene, *colour_view, want_splat, colour);
+    } else {
+      std::memcpy(colour, &reference.colours[std::size_t(want_splat) * 3], sizeof(colour));
+    }
     ProjectedInstance expected;
-    projectSplat(
-      projection, scene.records[want_splat], &reference.colours[std::size_t(want_splat) * 3],
-      expected);
+    projectSplat(projection, scene.records[want_splat], colour, expected);
     const double quad = quadDifference(drawn[i], expected, projection);
     if (!std::isfinite(quad)) {
       ++nonfinite;
@@ -227,22 +234,45 @@ int verifyIncremental(
   }
   failures += !check("  incremental: new order", context, scene, to, projection,
     prepare(context, to, projection, true));
+
+  // Colours refreshed for the camera every frame, then half of them a frame:
+  // once both halves have been refreshed at the same camera, all of them are
+  // its colours, on the old order and on the new.
+  for (std::uint32_t parts : {1u, 2u}) {
+    failures += !check("  recolour: starting order", context, scene, from, projection,
+      prepare(context, from, projection, false, parts));
+    for (int frame = 1; frame <= 4; ++frame) {
+      const Run run = prepare(context, to, projection, true, parts);
+      if (frame >= int(parts)) {
+        failures += !check(parts == 1 ? "  recolour every frame, old order" :
+          "  recolour half a frame, old order", context, scene, from, projection, run, &to);
+      }
+    }
+    failures += !check(parts == 1 ? "  recolour every frame, new order" :
+      "  recolour half a frame, new order", context, scene, to, projection,
+      prepare(context, to, projection, true, parts));
+  }
   return failures;
 }
 
 void timeStages(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection)
 {
-  std::vector<double> encode, whole, cull, shade, sort, gather, frames;
+  std::vector<double> encode, whole, cull, shade, sort, gather, frames[3];
   for (int rep = 0; rep < 7; ++rep) {
     const Run run = prepare(context, view, projection);
     encode.push_back(run.encode_ms);
     whole.push_back(run.gpu_ms);
   }
-  // Incremental frames: every step of a build, in turn, and the draw.
-  for (int frame = 0; frame < 30; ++frame) {
-    frames.push_back(prepare(context, view, projection, true).gpu_ms);
+  // Incremental frames: every step of a build, in turn, and the draw, with
+  // colours refreshed not at all, half a frame, and every frame.
+  for (std::uint32_t parts : {0u, 2u, 1u}) {
+    prepare(context, view, projection, false, parts);
+    for (int frame = 0; frame < 30; ++frame) {
+      frames[parts].push_back(prepare(context, view, projection, true, parts).gpu_ms);
+    }
   }
+  context.core->setColourRefresh(0);
   const auto stage = [&](auto && body) {
       id<MTLCommandBuffer> command_buffer = [context.queue commandBuffer];
       id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
@@ -274,8 +304,12 @@ void timeStages(
   std::printf(
     "  GPU by stage: cull+compact %.2f | shade %.2f | sort %.2f | project+gather %.2f ms\n",
     median(cull), median(shade), median(sort), median(gather));
-  std::printf("  GPU per incremental frame: median %.2f, largest %.2f ms\n", median(frames),
-    *std::max_element(frames.begin(), frames.end()));
+  const char * refresh[3] = {"no colour refresh", "every colour", "half the colours"};
+  for (std::uint32_t parts : {0u, 2u, 1u}) {
+    std::printf("  GPU per incremental frame, %s: median %.2f, largest %.2f ms\n",
+      refresh[parts], median(frames[parts]),
+      *std::max_element(frames[parts].begin(), frames[parts].end()));
+  }
   std::printf("  preparation scratch buffers %.0f MiB\n\n",
     double(context.core->scratchBytes()) / (1024.0 * 1024.0));
 }
@@ -363,8 +397,12 @@ int main(int argc, char ** argv)
         moved.viewport_size[2] = 1.0f / 1600.0f;
         moved.viewport_size[3] = 1.0f / 900.0f;
         moved.fovy = 0.8f;
-        failures += verifyIncremental(context, scene, view,
-          makeView(scene, c.flags, c.far_clip, c.dx + 0.3f, c.dy, c.dz, 2.0f), moved);
+        // The camera moves too, so the new view's colours differ from the old.
+        ViewParameters to = makeView(scene, c.flags, c.far_clip, c.dx + 0.3f, c.dy, c.dz, 2.0f);
+        to.local_camera[0] = 0.6f;
+        to.local_camera[1] = -0.4f;
+        to.local_camera[2] = 0.3f;
+        failures += verifyIncremental(context, scene, view, to, moved);
       }
       if (!quick && c.count == kGardenCount) {
         timeStages(context, view, projection);

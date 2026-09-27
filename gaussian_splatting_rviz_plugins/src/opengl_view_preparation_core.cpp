@@ -262,7 +262,8 @@ OpenGlViewPreparationCore::OpenGlViewPreparationCore(
     "GSPLAT_STAGE_COMPACT_SCATTER", "GSPLAT_STAGE_RADIX_HISTOGRAM",
     "GSPLAT_STAGE_RADIX_SCAN_OFFSETS", "GSPLAT_STAGE_RADIX_SCAN_BASES",
     "GSPLAT_STAGE_RADIX_SCATTER", "GSPLAT_STAGE_SHADE_SLOTS", "GSPLAT_STAGE_FINISH_ORDER",
-    "GSPLAT_STAGE_PUBLISH", "GSPLAT_STAGE_REPROJECT_GATHER", "GSPLAT_STAGE_CLEAR_TAIL"};
+    "GSPLAT_STAGE_PUBLISH", "GSPLAT_STAGE_REPROJECT_GATHER", "GSPLAT_STAGE_CLEAR_TAIL",
+    "GSPLAT_STAGE_RECOLOUR_ORDER"};
   static_assert(sizeof(stages) / sizeof(stages[0]) == std::tuple_size<decltype(programs_)>::value,
     "a program per stage");
   for (std::size_t i = 0; i < programs_.size(); ++i) {
@@ -345,13 +346,17 @@ bool OpenGlViewPreparationCore::configure(std::uint32_t count, std::uint32_t ind
   pairs_ = newBuffer(pair_bytes, GL_DYNAMIC_COPY);
   slots_ = newBuffer(survivor_bytes, GL_DYNAMIC_COPY);
   drawn_ = newBuffer(survivor_bytes, GL_DYNAMIC_COPY);
+  colours_ = newBuffer(std::size_t(count) * sizeof(float) * 4u, GL_DYNAMIC_COPY);
+  slot_draws_ = newBuffer(std::size_t(count) * sizeof(std::uint32_t) * 2u, GL_DYNAMIC_COPY);
+  frame_view_parameters_ = newBuffer(sizeof(ViewParameters), GL_STREAM_DRAW);
   instance_state_ = newBuffer(sizeof(std::uint32_t) * 3u, GL_DYNAMIC_COPY);
   clear_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
   draw_arguments_ = newBuffer(sizeof(DrawIndexedArguments), GL_DYNAMIC_COPY);
   view_parameters_ = newBuffer(sizeof(ViewParameters), GL_STREAM_DRAW);
   projection_parameters_ = newBuffer(sizeof(ProjectionParameters), GL_STREAM_DRAW);
   bool allocated = staged_ && tile_counts_ && tile_offsets_ && histograms_ && offsets_ &&
-    totals_ && digit_bases_ && pairs_ && slots_ && drawn_ && instance_state_ &&
+    totals_ && digit_bases_ && pairs_ && slots_ && drawn_ && colours_ && slot_draws_ &&
+    frame_view_parameters_ && instance_state_ &&
     clear_dispatch_ && draw_arguments_ && view_parameters_ && projection_parameters_;
   const State empty_state{0u, 0u, 0u, 0u};
   for (Order & order : orders_) {
@@ -373,7 +378,8 @@ bool OpenGlViewPreparationCore::configure(std::uint32_t count, std::uint32_t ind
     error_ = failure;
     return false;
   }
-  scratch_bytes_ = 2u * pair_bytes + 2u * survivor_bytes + 2u * tile_bytes +
+  scratch_bytes_ = 2u * pair_bytes + 2u * survivor_bytes +
+    std::size_t(count) * (sizeof(float) * 4u + 2u * sizeof(std::uint32_t)) + 2u * tile_bytes +
     2u * table_bytes + 2u * kRadix * sizeof(std::uint32_t);
 
   // Every slot counts as written, so the first preparation that clears the
@@ -402,8 +408,8 @@ void OpenGlViewPreparationCore::clear()
   }
   std::vector<GLuint *> buffers = {&splats_, &sh_dc_, &sh_rest_, &staged_, &tile_counts_,
     &tile_offsets_, &histograms_, &offsets_, &totals_, &digit_bases_, &pairs_, &slots_,
-    &drawn_, &instance_state_, &clear_dispatch_, &draw_arguments_, &view_parameters_,
-    &projection_parameters_};
+    &drawn_, &colours_, &slot_draws_, &instance_state_, &clear_dispatch_,
+    &draw_arguments_, &view_parameters_, &frame_view_parameters_, &projection_parameters_};
   for (Order & order : orders_) {
     for (GLuint * buffer : {&order.state, &order.tile_dispatch, &order.gather_dispatch})
     {
@@ -425,6 +431,8 @@ void OpenGlViewPreparationCore::clear()
   current_ = -1;
   building_ = -1;
   build_step_ = 0;
+  colour_frame_ = 0u;
+  refreshable_ = false;
 }
 
 bool OpenGlViewPreparationCore::uploadStaticData(
@@ -645,7 +653,10 @@ bool OpenGlViewPreparationCore::prepare(
   }
   if (work.end_bit == 32u) {
     use(programs_[9]);
-    bind(0, pairs_); bind(1, slots_); bind(4, order.state); bind(5, drawn_);
+    bind(0, pairs_); bind(1, slots_); bind(2, slot_draws_); bind(4, order.state);
+    bind(5, drawn_); bind(6, colours_);
+    // An order nobody will recolour skips the colours and slot draws.
+    uniform("refreshable", colour_parts_ > 0u ? 1u : 0u);
     // The passes write disjoint positions, so they need no barrier between them.
     for (std::uint32_t first = 0; first < count_; first += kFinishSlotsPerPass) {
       uniform("first_slot", first);
@@ -653,6 +664,7 @@ bool OpenGlViewPreparationCore::prepare(
       dispatchIndirect(order.gather_dispatch);
     }
     storageBarrier();
+    refreshable_ = colour_parts_ > 0u;
     current_ = building_;
     building_ = -1;
     build_step_ = 0;
@@ -660,6 +672,19 @@ bool OpenGlViewPreparationCore::prepare(
   mark(3);
 
   const Order & drawn = orders_[current_];
+  // Colours for this frame's camera, on the order being drawn.
+  const bool refreshed = refreshable_ && colour_parts_ > 0u;
+  if (incremental && refreshed) {
+    updateBuffer(frame_view_parameters_, &parameters, sizeof(parameters));
+    use(programs_[13]);
+    bind(0, slot_draws_); bind(2, splats_); bind(3, sh_dc_); bind(4, sh_rest_);
+    bind(5, drawn.state); bind(6, colours_); bind(7, frame_view_parameters_);
+    uniform("part_index", colour_frame_++ % colour_parts_);
+    uniform("part_count", colour_parts_);
+    // Sized for every survivor; invocations past the part return at once.
+    dispatchIndirect(drawn.gather_dispatch);
+    storageBarrier();
+  }
   use(programs_[10]);
   bind(0, drawn.state); bind(1, instance_state_); bind(2, draw); bind(3, clear_dispatch_);
   uniform("index_count", index_count_); uniform("gather_width", kGatherWidth);
@@ -667,7 +692,9 @@ bool OpenGlViewPreparationCore::prepare(
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
 
   use(programs_[11]);
-  bind(0, drawn_); bind(4, drawn.state); bind(5, instances); bind(6, projection_parameters_);
+  bind(0, drawn_); bind(1, colours_); bind(4, drawn.state); bind(5, instances);
+  bind(6, projection_parameters_);
+  uniform("refreshed", refreshed ? 1u : 0u);
   dispatchIndirect(drawn.gather_dispatch);
   if (clear_tail) {
     storageBarrier();

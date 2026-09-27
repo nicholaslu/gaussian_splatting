@@ -653,18 +653,25 @@ kernel void shade_slots(
 }
 
 // Stage 4b, completing an order: the survivors in draw order, so that drawing
-// from the order reads them in sequence. This is the one permutation per
-// order, and it reads the slots at random. Random reads over a large enough
-// buffer fall off a cliff: on an RTX 4090 they took 0.9 ms spread over 110 MB
-// and 22 ms over 280 MB. So the permutation runs in passes, each moving only
-// the survivors whose slots fall in [first_slot, end_slot), a range small
-// enough to stay on the near side.
+// from the order reads them in sequence. With `refreshable`, also their
+// colours in draw order, where recolour_order can refresh them, and each
+// slot's splat and draw position for recolour_order, as one word pair per
+// slot. Writing those cost a few milliseconds more on an Apple M3 with the
+// full Garden scene, so an order nobody will recolour skips them. This is the one permutation per order, and
+// it reads the slots at random. Random reads over a large enough buffer fall
+// off a cliff: on an RTX 4090 they took 0.9 ms spread over 110 MB and 22 ms
+// over 280 MB. So the permutation runs in passes, each moving only the
+// survivors whose slots fall in [first_slot, end_slot), a range small enough to
+// stay on the near side.
 kernel void finish_order(
   device const uint2 * sorted [[buffer(0)]],
   device const DrawnSplat * slots [[buffer(1)]],
+  device uint2 * slot_draws [[buffer(2)]],
   device const PreparationState & state [[buffer(4)]],
   device DrawnSplat * drawn [[buffer(5)]],
   constant uint2 & slot_range [[buffer(6)]],
+  device float4 * colours [[buffer(7)]],
+  constant uint & refreshable [[buffer(8)]],
   uint output [[thread_position_in_grid]])
 {
   if (output >= state.visible) {
@@ -672,24 +679,63 @@ kernel void finish_order(
   }
   const uint slot = sorted[output].y;
   if (slot >= slot_range.x && slot < slot_range.y) {
-    drawn[output] = slots[slot];
+    const DrawnSplat d = slots[slot];
+    drawn[output] = d;
+    if (refreshable != 0u) {
+      colours[output] = float4(d.scale_red.w, d.green_blue, 0.0);
+      slot_draws[slot] = uint2(d.splat, output);
+    }
   }
 }
 
+// Optional, every frame of incremental preparation: the colours of the order
+// being drawn, evaluated again for this frame's camera, so that view-dependent
+// colour - specular highlights above all - follows the camera rather than
+// jumping each time an order completes. It walks the survivors by slot, in
+// index order, so the SH coefficients are read in the order they are stored,
+// and writes each colour to the survivor's draw position, at random but within
+// a buffer the size of the visible set. `part` is (which, of how many), to
+// refresh half the survivors a frame.
+kernel void recolour_order(
+  device const uint2 * slot_draws [[buffer(0)]],
+  device const SplatRecord * splats [[buffer(2)]],
+  device const float * sh_dc [[buffer(3)]],
+  device const float * sh_rest [[buffer(4)]],
+  device const PreparationState & state [[buffer(5)]],
+  device float4 * colours [[buffer(6)]],
+  constant ViewParameters & p [[buffer(7)]],
+  constant uint2 & part [[buffer(8)]],
+  uint index [[thread_position_in_grid]])
+{
+  const uint share = state.visible / part.y;
+  const uint spare = state.visible % part.y;
+  const uint begin = part.x * share + min(part.x, spare);
+  const uint end = begin + share + (part.x < spare ? 1u : 0u);
+  const uint slot = begin + index;
+  if (slot >= end) {
+    return;
+  }
+  const uint2 draw = slot_draws[slot];
+  colours[draw.y] =
+    float4(evaluateSH(draw.x, float3(splats[draw.x].position), sh_dc, sh_rest, p), 0.0);
+}
+
 // Stage 5: the draw stream, each survivor of an order projected for this
-// frame's camera with the colour the order was built with. Incremental
-// preparation runs only this stage on most frames, against an order built for
-// a camera a few frames old, so the projection always follows the camera
-// exactly while the order and the view-dependent colour lag it slightly. It
-// reads and writes in sequence. The first thread also writes the indirect draw
-// arguments.
+// frame's camera with its colour: the one the order was built with, or, with
+// `refreshed`, the one recolour_order last wrote. Incremental preparation runs only this stage on
+// most frames, against an order built for a camera a few frames old, so the
+// projection always follows the camera exactly while the order lags it
+// slightly. It reads and writes in sequence. The first thread also writes the
+// indirect draw arguments.
 kernel void reproject_gather(
   device const DrawnSplat * drawn [[buffer(0)]],
+  device const float4 * colours [[buffer(1)]],
   device const PreparationState & state [[buffer(4)]],
   device ProjectedInstance * instances [[buffer(5)]],
   constant ProjectionParameters & q [[buffer(6)]],
   device DrawIndexedArguments * draw [[buffer(7)]],
   constant uint & index_count [[buffer(8)]],
+  constant uint & refreshed [[buffer(9)]],
   uint output [[thread_position_in_grid]])
 {
   if (output == 0) {
@@ -709,5 +755,7 @@ kernel void reproject_gather(
   splat.scale = packed_float3(d.scale_red.xyz);
   splat.pad0 = 0.0;
   splat.quat = d.quat;
-  instances[output] = projectSplat(splat, float3(d.scale_red.w, d.green_blue), q);
+  const float3 colour =
+    refreshed != 0u ? colours[output].xyz : float3(d.scale_red.w, d.green_blue);
+  instances[output] = projectSplat(splat, colour, q);
 }
