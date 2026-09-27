@@ -532,6 +532,15 @@ only 1-2% of Garden's splats at this resolution, too few to matter. One large
 triangle per splat instead of two was slower. What remains to trade is quality:
 Sigma Radius shrinks every quad, Render Scale only the fill.
 
+Render Scale therefore buys little on the M3 (31 ms at 2940x1905, 25 ms at
+1297x840), but what it gives up it can partly get back: with Upscaling set to
+MetalFX, the reduced target is enlarged by Apple's spatial upscaler, about
+1.5 ms at Render Scale 0.5, noticeably sharper than bilinear filtering.
+MetalFX writes an alpha of one, so the composite takes alpha from the target.
+Its temporal upscaler and frame interpolation would need per-pixel motion and
+depth, which a stack of translucent splats does not have, and interpolation
+adds a frame of latency to a view of live robot data, so neither is tried.
+
 ### Culling by contribution
 
 Many splats of a trained scene are faint and a few pixels across, and each
