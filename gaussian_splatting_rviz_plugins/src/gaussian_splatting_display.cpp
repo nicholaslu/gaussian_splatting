@@ -550,6 +550,21 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
   min_screen_radius_property_->setMin(0.0f);
   min_screen_radius_property_->setMax(8.0f);
 
+  min_contribution_property_ = new rviz_common::properties::FloatProperty(
+    "Minimum Contribution", 0.0f,
+    "Skip splats whose whole footprint adds up to less than this many fully "
+    "opaque pixels: opacity integrated over the projected Gaussian, occlusion "
+    "ignored. Zero draws every splat. Many splats of a trained scene are faint "
+    "and a few pixels across; on the full Garden scene at 2940x1905 an Apple M3 "
+    "drew the splats about 10% faster at 0.1, with 1% of pixels more than two "
+    "steps off, and about 18% faster at 0.25, with 4% (the error 8-bit blending "
+    "used to make). Higher values thin fine detail and darken slightly. Close "
+    "views gain little, since their cost is large splats. Checked every frame "
+    "against the current projection; GPU preparation only.",
+    culling_property_);
+  min_contribution_property_->setMin(0.0f);
+  min_contribution_property_->setMax(4.0f);
+
   offscreen_property_ = new rviz_common::properties::BoolProperty(
     "Offscreen Rendering", true,
     "Rasterise the splats into their own target and composite the result over "
@@ -1713,6 +1728,9 @@ ProjectionParameters GaussianSplattingDisplay::makeProjectionParameters(
   projection.eps2d = eps2d_;
   projection.antialiased = antialiased_;
   projection.sigma_radius = sigma_radius;
+  // Like Minimum Screen Radius, only while culling.
+  projection.min_contribution =
+    culling_property_->getBool() ? min_contribution_property_->getFloat() : 0.0f;
   return projection;
 }
 

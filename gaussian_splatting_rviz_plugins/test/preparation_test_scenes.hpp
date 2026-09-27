@@ -234,6 +234,34 @@ inline void splatColour(
     scene.coefficients, direction, colour);
 }
 
+// Whether a splat's contribution is too close to the projection's minimum for
+// the CPU and the GPU to be expected to agree on culling it: within float
+// rounding of the threshold, where either answer is right.
+inline bool nearContributionThreshold(
+  const ProjectionParameters & projection, const SplatRecord & record, const float colour[3])
+{
+  if (projection.min_contribution <= 0.0f) {
+    return false;
+  }
+  ProjectionParameters all = projection;
+  all.min_contribution = 0.0f;
+  ProjectedInstance full;
+  projectSplat(all, record, colour, full);
+  if (full.visible_radius <= 0.0f) {
+    return false;
+  }
+  // The axes are sqrt(lambda) visible radii long, in NDC.
+  const double x1 = full.axes[0] * 0.5 * projection.viewport_size[0];
+  const double y1 = full.axes[1] * 0.5 * projection.viewport_size[1];
+  const double x2 = full.axes[2] * 0.5 * projection.viewport_size[0];
+  const double y2 = full.axes[3] * 0.5 * projection.viewport_size[1];
+  const double r = full.visible_radius;
+  const double contribution = full.colour[3] * 6.28318530718 *
+    std::sqrt(x1 * x1 + y1 * y1) * std::sqrt(x2 * x2 + y2 * y2) / (r * r);
+  return std::fabs(contribution - projection.min_contribution) <=
+         1e-3 * projection.min_contribution;
+}
+
 // How far two projected quads disagree, in units of what float rounding can
 // explain: above 1 is a real difference. Centres are measured in pixels, and
 // the ellipses through a1 a1^T + a2 a2^T in square pixels, which does not care

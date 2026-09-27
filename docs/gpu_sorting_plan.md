@@ -532,6 +532,34 @@ only 1-2% of Garden's splats at this resolution, too few to matter. One large
 triangle per splat instead of two was slower. What remains to trade is quality:
 Sigma Radius shrinks every quad, Render Scale only the fill.
 
+### Culling by contribution
+
+Many splats of a trained scene are faint and a few pixels across, and each
+costs the tiler and the blender as much as a bright one. `splatContribution()`
+measures what a projected splat adds to the image, its opacity integrated over
+its screen footprint, alpha 2 pi sigma1 sigma2, in fully opaque pixels, and the
+Minimum Contribution property (under Visibility Culling, 0 by default) leaves
+out splats below it. It is checked in the projection every frame, so it follows
+the camera in incremental preparation too; a culled splat becomes an empty
+quad, clipped before tiling. GPU preparation only.
+
+On the M3, full Garden scene at 2940x1905, measured while another RViz shared
+the GPU, so the times are relative (no culling: 35.9 and 32.9 ms):
+
+| Minimum | Culled, camera 0 | Splat pass, camera 0 / 40 | PSNR, camera 0 / 40 | Pixels > 2 steps off, camera 0 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.1 | 14% | 31.8 / 30.5 ms | 50.3 / 54.3 dB | 1.1% |
+| 0.25 | 26% | 29.3 / 29.5 ms | 43.3 / 46.0 dB | 3.9% |
+| 0.5 | 35% | 28.6 / 27.9 ms | 39.4 / 41.3 dB | 8.2% |
+| 1 | 43% | 26.4 / 25.8 ms | 35.7 / 37.2 dB | 15.5% |
+| 2 | 53% | 24.0 / 24.2 ms | 31.3 / 32.9 dB | 27.4% |
+
+The pass shrinks far less than the splat count, and close views, whose cost is
+large splats, hardly at all (camera 0 moved 3.5 units in: 52.5 ms to 49.7 ms at
+1, still at 51 dB). The losses are thin detail and a slight darkening, about a
+step on average at 1. Around 0.1-0.25 the error is no larger than 8-bit blending
+used to make.
+
 Still open:
 
 - Degree-3 SH is uploaded as float32, about 1 GiB at this count. Half precision

@@ -56,6 +56,10 @@ struct ProjectionParameters
   float eps2d;
   float antialiased;
   float sigma_radius;
+  float min_contribution;
+  float pad0;
+  float pad1;
+  float pad2;
 };
 
 // An order's survivor count and the dispatch sizes it implies.
@@ -835,6 +839,12 @@ ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
   float root = sqrt(half_difference * half_difference + b * b);
   float lambda1 = max(mid + root, 0.01);
   float lambda2 = max(mid - root, 0.01);
+  // splatContribution() in splat_view.hpp.
+  if (q.min_contribution > 0.0 &&
+    alpha * 6.28318530718 * sqrt(lambda1 * lambda2) < q.min_contribution)
+  {
+    return result;
+  }
   vec2 axis1 = half_difference >= 0.0 ?
     vec2(half_difference + root, b) : vec2(b, root - half_difference);
   float axis_length = length(axis1);

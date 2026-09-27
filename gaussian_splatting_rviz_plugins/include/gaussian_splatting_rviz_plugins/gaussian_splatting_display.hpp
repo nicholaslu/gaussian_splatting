@@ -111,6 +111,7 @@ private:
   rviz_common::properties::BoolProperty * incremental_property_ = nullptr;
   rviz_common::properties::EnumProperty * colour_refresh_property_ = nullptr;
   rviz_common::properties::FloatProperty * min_screen_radius_property_ = nullptr;
+  rviz_common::properties::FloatProperty * min_contribution_property_ = nullptr;
   rviz_common::properties::BoolProperty * offscreen_property_ = nullptr;
   rviz_common::properties::FloatProperty * render_scale_property_ = nullptr;
   rviz_common::properties::EnumProperty * antialiasing_property_ = nullptr;

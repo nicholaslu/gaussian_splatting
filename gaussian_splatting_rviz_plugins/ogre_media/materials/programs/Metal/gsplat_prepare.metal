@@ -72,6 +72,8 @@ struct ProjectionParameters
   float eps2d;
   float antialiased;
   float sigma_radius;
+  float min_contribution;
+  float pad[3];
 };
 
 struct ProjectedInstance
@@ -578,6 +580,13 @@ static ProjectedInstance projectSplat(
   const float root = sqrt(halfDifference * halfDifference + b * b);
   const float lambda1 = max(mid + root, 0.01);
   const float lambda2 = max(mid - root, 0.01);
+  // splatContribution() in splat_view.hpp: what the splat adds to the image,
+  // in fully opaque pixels.
+  if (q.min_contribution > 0.0 &&
+    alpha * 6.28318530718 * sqrt(lambda1 * lambda2) < q.min_contribution)
+  {
+    return out;
+  }
   float2 axis1 = halfDifference >= 0.0 ?
     float2(halfDifference + root, b) : float2(b, root - halfDifference);
   const float axisLength = length(axis1);

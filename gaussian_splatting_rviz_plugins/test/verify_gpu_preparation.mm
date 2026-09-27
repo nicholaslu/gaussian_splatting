@@ -131,6 +131,8 @@ bool check(
   const auto * drawn = static_cast<const ProjectedInstance *>(context.instances.contents);
 
   std::size_t order_bad = 0, key_bad = 0, quad_bad = 0, nonfinite = 0, colour_bad = 0;
+  // Splats the projection culls, and those it culls or keeps within rounding.
+  std::size_t culled = 0, borderline = 0;
   long first_bad = -1;
   long first_quad_bad = -1;
   double worst = 0.0;
@@ -152,8 +154,13 @@ bool check(
     } else {
       std::memcpy(colour, &reference.colours[std::size_t(want_splat) * 3], sizeof(colour));
     }
+    if (nearContributionThreshold(projection, scene.records[want_splat], colour)) {
+      ++borderline;
+      continue;
+    }
     ProjectedInstance expected;
     projectSplat(projection, scene.records[want_splat], colour, expected);
+    culled += expected.visible_radius == 0.0f;
     const double quad = quadDifference(drawn[i], expected, projection);
     if (!std::isfinite(quad)) {
       ++nonfinite;
@@ -191,6 +198,9 @@ bool check(
     pass ? "PASS" : "FAIL");
   if (first_bad >= 0) {
     std::printf("  first order mismatch at %ld", first_bad);
+  }
+  if (projection.min_contribution > 0.0f) {
+    std::printf("  below the minimum contribution: %zu, at it: %zu", culled, borderline);
   }
   std::printf("\n");
   if (first_quad_bad >= 0) {
@@ -403,6 +413,12 @@ int main(int argc, char ** argv)
         to.local_camera[1] = -0.4f;
         to.local_camera[2] = 0.3f;
         failures += verifyIncremental(context, scene, view, to, moved);
+
+        // Splats adding less than 20 opaque pixels left out: the synthetic
+        // splats are large, and this leaves out about one in fifteen.
+        ProjectionParameters thinned = projection;
+        thinned.min_contribution = 20.0f;
+        failures += !verify("  minimum contribution 20", context, scene, view, thinned);
       }
       if (!quick && c.count == kGardenCount) {
         timeStages(context, view, projection);

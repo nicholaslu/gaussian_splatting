@@ -197,6 +197,8 @@ bool verify(
 
   std::size_t order_bad = 0, key_bad = 0, sort_bad = 0, quad_bad = 0, colour_bad = 0;
   std::size_t nonfinite = 0, tail_bad = 0, max_shift = 0;
+  // Splats the projection culls, and those it culls or keeps within rounding.
+  std::size_t culled = 0, borderline = 0;
   std::uint32_t max_key_ulp = 0;
   long first_bad = -1;
   long first_quad_bad = -1;
@@ -236,8 +238,13 @@ bool verify(
     } else {
       std::memcpy(colour, &reference.colours[std::size_t(splat) * 3], sizeof(colour));
     }
+    if (nearContributionThreshold(projection, scene.records[splat], colour)) {
+      ++borderline;
+      continue;
+    }
     ProjectedInstance expected;
     projectSplat(projection, scene.records[splat], colour, expected);
+    culled += expected.visible_radius == 0.0f;
     const double quad = quadDifference(drawn[i], expected, projection);
     if (!std::isfinite(quad)) {
       ++nonfinite;
@@ -277,6 +284,9 @@ bool verify(
     name, scene.count, reference.order.size(), state.visible, arguments.instance_count,
     order_bad, key_bad, worst, colour_bad, worst_quad, quad_bad, nonfinite, tail_bad, gpu_ms,
     pass ? "PASS" : "FAIL");
+  if (projection.min_contribution > 0.0f) {
+    std::printf("  below the minimum contribution: %zu, at it: %zu\n", culled, borderline);
+  }
   if (order_bad || key_bad || sort_bad) {
     std::printf(
       "  sort_bad=%zu (GPU order against its own keys), max key difference %u ulp, "
@@ -504,6 +514,12 @@ int main(int argc, char ** argv)
       to.local_camera[1] = -0.4f;
       to.local_camera[2] = 0.3f;
       failures += verifyIncremental(context, scene, view, to, moved);
+
+      // Splats adding less than 20 opaque pixels left out: the synthetic
+      // splats are large, and this leaves out about one in fifteen.
+      ProjectionParameters thinned = projection;
+      thinned.min_contribution = 20.0f;
+      failures += !verify("  minimum contribution 20", context, scene, view, thinned);
     }
     if (!quick && c.count == kGardenCount) {
       timeStages(context, view, projection);

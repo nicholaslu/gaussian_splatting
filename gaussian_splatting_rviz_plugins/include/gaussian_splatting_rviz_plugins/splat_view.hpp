@@ -273,8 +273,22 @@ struct alignas(16) ProjectionParameters
   float eps2d;
   float antialiased;
   float sigma_radius;
+  // Splats whose whole footprint adds up to less than this many fully opaque
+  // pixels are not drawn; 0 draws every splat. See splatContribution().
+  float min_contribution;
+  float pad[3];
 };
-static_assert(sizeof(ProjectionParameters) == 160, "Metal projection layout changed");
+static_assert(sizeof(ProjectionParameters) == 176, "Metal projection layout changed");
+
+// What a projected splat adds to the image, measured in fully opaque pixels:
+// its opacity integrated over its screen footprint, alpha 2 pi sigma1 sigma2,
+// from the eigenvalues of its screen covariance in square pixels. Occlusion is
+// ignored. On the full Garden scene seen from its training cameras at
+// 2940x1905, a third of the visible splats add less than half a pixel.
+inline float splatContribution(float alpha, float lambda1, float lambda2)
+{
+  return alpha * 6.28318530718f * std::sqrt(lambda1 * lambda2);
+}
 
 // One splat projected to the screen: everything gsplat_projected_vp needs to
 // place and shade its quad. A splat behind the camera, or faded below the alpha
@@ -410,6 +424,11 @@ inline void projectSplat(
   const float root = std::sqrt(half_difference * half_difference + b * b);
   const float lambda1 = std::max(mid + root, 0.01f);
   const float lambda2 = std::max(mid - root, 0.01f);
+  if (q.min_contribution > 0.0f &&
+    splatContribution(alpha, lambda1, lambda2) < q.min_contribution)
+  {
+    return;
+  }
   float axis_x = half_difference >= 0.0f ? half_difference + root : b;
   float axis_y = half_difference >= 0.0f ? b : root - half_difference;
   const float axis_length = std::sqrt(axis_x * axis_x + axis_y * axis_y);
