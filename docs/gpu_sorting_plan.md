@@ -170,16 +170,28 @@ instance format.
 
 ### CUDA
 
-On NVIDIA systems, CUB `DeviceRadixSort::SortPairs` is the appropriate optional
-backend. CUDA/OpenGL buffer interop can keep its output on the GPU. It cannot
-serve Metal or Apple devices, and adding it before the renderer-independent
-buffer contract exists would duplicate integration work. Add it after the
-Metal/GL compute interface is stable.
+On NVIDIA systems, CUB `DeviceRadixSort::SortPairs` was the candidate optional
+backend, sorting OpenGL's buffers in place through CUDA/OpenGL interop. A
+headless prototype on an RTX 4090 (CUDA 12.4) measured it for the Garden scale:
+CUB sorts 5,834,784 key/value pairs in 0.34 ms, and with the interop map,
+splitting the interleaved pairs, sorting and merging back it takes 0.59 ms a
+frame, or 0.47 ms with separate key and value buffers. CUB's element count is a
+host value, so the sort would run over the full capacity with the culled tail
+filled with maximal keys (0.02 ms); its order matched the OpenGL radix entry for
+entry, ties included. Against the OpenGL sort of the time, 7.0 ms, that was a
+large saving, but after the parallel scans and subgroup ballots the OpenGL sort
+takes 1.40 ms on the same GPU, and CUDA would save less than a millisecond a
+frame for a build dependency and a second API on the draw path. It is not
+pursued; the prototype and its report are on Shannon's `cuda-sort` branch.
 
 The reference 3DGS rasterizer goes further: it emits tile/depth keys, sorts
 key/value pairs with CUB, identifies each tile's sorted range, and blends tiles
-on the GPU. That architecture is a useful later target, but it is not a drop-in
-replacement for this plugin's single global alpha-blended Ogre draw.
+on the GPU. The `tile-raster-experiment` branch tries that rasteriser in
+compute on Metal and OpenGL, after this preparation; see
+`docs/tile_rasterisation_experiment.md` there. It is 1.7-3x slower than drawing
+the quads through the render pipeline on both an Apple M3 and an RTX 4090, close
+views included, because most Garden splats cover a few pixels of a 16x16 tile
+and only about half the pixels become opaque, so stopping early saves little.
 
 ## Implementation stages
 
@@ -242,6 +254,13 @@ explicitly budget whether SH data is uploaded as float32, stored at half
 precision, or shared with the ROS message without another full-size copy. SH
 should be read only during the post-sort gather, for visible splats. This memory
 decision must be measured for both macOS and iPadOS.
+
+As built, preparation keeps the two key/index buffers, the per-tile tables, and
+two buffers of 64-byte `DrawnSplat`s - the survivors by compacted slot and in
+draw order - sized for every splat: about 810 MiB for Garden, beside the 48-byte
+projected instance buffer the draw reads (267 MiB) and the scene itself
+(records 267 MiB, SH 1.1 GiB). Before draw orders were kept, preparation took
+about 400 MiB. The offscreen target is 8 bytes a pixel in half float.
 
 ## Acceptance criteria
 
@@ -415,26 +434,89 @@ On the RTX 4090 the sort now splits into histograms 0.28 ms, scans 0.17 ms and
 scatters 1.08 ms over the four passes; `GSPLAT_PROFILE_GPU` and the OpenGL
 verifier report that breakdown.
 
+### Draw orders and incremental preparation
+
+Preparation now builds a draw order and draws from it. `shade_slots` colours
+each survivor and copies its record into its compacted slot, the sort orders
+the slots, and `finish_order` lays the survivors out in draw order as 64-byte
+`DrawnSplat`s: record, colour, key and splat index. `reproject_gather` then
+projects them in sequence for the frame's camera and writes the indirect draw
+arguments. A full preparation does all of that in one frame and draws the same
+stream as before.
+
+While the camera moves, the display prepares incrementally: every frame draws
+the newest complete order reprojected, and the next order is built one step a
+frame, five steps of comparable cost (culling, each half of the colour, each
+half of the sort). The order and the view-dependent colour lag by up to five
+frames; building culls against a frustum 15% wider, so turning uncovers no gaps;
+the first frame the camera stands still is prepared exactly. Only the orders'
+counts are kept twice: the survivors in draw order are replaced as a build
+completes, by which point nothing reads the old ones. The Incremental
+Preparation property turns it off. Both verifiers check that frames drawing an
+old order match the CPU path for that order projected with the new camera, and
+that the completed order matches the CPU path for the new view.
+
+Drawing reads the order in sequence because random reads over the whole scene
+fell off a cliff on the RTX 4090: 0.9 ms spread over 110 MB, 22 ms over the
+280 MB of Garden's records, whatever was done with them. The old gather escaped
+it only because it read a buffer the size of the visible set, just written. For
+the same reason `finish_order`, the one permutation per order, runs in passes
+over 64 MiB ranges of slots.
+
+GPU time per frame, median (largest) of the incremental frames:
+
+| Scene | Full preparation | Incremental frame |
+| --- | ---: | ---: |
+| M3, real Garden, training camera 0, 2940x1905 | 28.4 ms | 7.9 (10.3) ms |
+| M3, real Garden, training camera 40 | 26.5 ms | 7.4 (9.5) ms |
+| M3, synthetic Garden-sized | 29.7 ms | 8.1 (10.6) ms |
+| RTX 4090, synthetic Garden-sized | 5.9 ms | 1.2 (2.5) ms |
+
+In RViz on the M3, with the camera moving every frame over the real Garden
+scene at 2940x1905, the frame rate went from 10-13 fps to 15-18 fps.
+
+### Offscreen precision
+
+A pixel of the Garden scene blends about sixty splats, and an 8-bit target
+rounds after every one, dropping layers too faint to move the value by half a
+step and clipping highlights above 1.0 before the splats in front dim them.
+Against float accumulation, 8-bit blending left 1-17% of pixels more than two
+steps off on the M3 and 10-40% on the RTX 4090; blending into half float agrees
+to within 0.01%. The offscreen target is now half float by default (Precision,
+under Offscreen Rendering). It cost nothing measurable on the M3, whose blending
+stays in tile memory, and 0.3-2.7 ms a frame on the RTX 4090.
+
+### Where the M3 frame goes
+
+In RViz on the M3 with the camera moving, the GPU is 100% busy (its tiler too)
+and RViz uses about 10% of a CPU, so the frame is GPU-bound. A Metal System
+Trace puts each 55-60 ms frame at about 14 ms of vertex and tiling work for the
+splat pass, which the render pass cannot start fragments before, and about
+26 ms of fragment work, overlapping and contending with the next frame's
+preparation. Preparation is no longer the bottleneck there; drawing 2.26
+million quads is.
+
+Measured headless on the same view, the splat pass costs 23 ms at 320x207 and
+31 ms at 2940x1905: its cost is mostly geometry, not fill. Of that, the vertex
+stage alone is 13 ms, bound by the four instanced invocations per splat rather
+than by the 48 bytes each fetches (32 bytes measured the same). Pulling the
+instance data by vertex index instead of instancing cut the vertex stage to
+5 ms and the whole pass at 320x207 from 25 to 19 ms, pixel-identical, but at
+2940x1905 it saved nothing, since the tiler and fragments bound the pass there;
+it would also need a 6-index-per-splat index buffer (140 MiB for Garden) and a
+draw outside Ogre's instancing, so it is not done. Minimum Screen Radius culls
+only 1-2% of Garden's splats at this resolution, too few to matter. One large
+triangle per splat instead of two was slower. What remains to trade is quality:
+Sigma Radius shrinks every quad, Render Scale only the fill.
+
 Still open:
 
-- Degree-3 SH is uploaded as float32, about 1 GiB at this count. Uploads now
-  reuse the buffers in place, but the precision question is undecided: half
-  precision would halve it at the cost of exact agreement with the CPU colours.
-- Projection before the sort is measured on synthetic scenes only; the full
-  Garden PLY in RViz has yet to be timed with it.
-- The OpenGL scatters rank the 32 lanes of a chunk with subgroup ballots, as
-  Metal does with simd_ballot, where the driver has GL_KHR_shader_subgroup
-  with 32-lane subgroups; the shader checks the subgroup it gets and otherwise
-  counts through shared memory, and `GSPLAT_GL_NO_SUBGROUPS` forces that. On
-  the RTX 4090, median of four alternating runs: compaction's scatter 0.28 ms to
-  0.05 ms, the radix scatters 1.08 ms to 0.95 ms, the whole preparation 6.67 ms
-  to 5.89 ms. The radix scatter is latency-bound rather than ranking-bound: one
-  32-lane workgroup per 1024-element tile loads and writes 32 chunks in turn.
-  Loading each tile into shared memory first is the next thing to try.
-- On the M3 shading and projection is now the largest stage, 10.4 ms of about
-  25, and it is bound by reading float32 SH coefficients; half precision is the
-  candidate there.
-- Frame pacing is the next target: the sort could be spread over several frames
-  in slices, with the gather re-projecting the last completed order every
-  frame. That needs a guard band on the culling, since a stale cull would
-  otherwise drop splats entering the view.
+- Degree-3 SH is uploaded as float32, about 1 GiB at this count. Half precision
+  would halve it, and the M3's colour step, now half of each build, is bound by
+  reading it, at the cost of exact agreement with the CPU colours.
+- The OpenGL scatters rank lanes with subgroup ballots where the driver offers
+  GL_KHR_shader_subgroup with 32-lane subgroups (compaction's scatter 0.28 to
+  0.05 ms, the radix scatters 1.08 to 0.95 ms on the RTX 4090). Staging each
+  tile in shared memory first was tried and was slower.
+- Real frame rates in RViz on the RTX 4090 have not been measured since these
+  changes; the numbers above for it are headless.

@@ -1,5 +1,13 @@
 # OpenGL performance with a moving view on the full Garden scene
 
+> Status: this is a record of what was observed and inferred before the OpenGL
+> path was reworked; its suggestions have since been followed. The stages are
+> timed with timestamp queries (`GSPLAT_PROFILE_GPU` and the OpenGL verifier),
+> the scatters rank lanes with subgroup ballots, the scans are parallel, colour
+> and projection moved before the sort, and a moving camera is prepared
+> incrementally, drawing the last complete order while the next is built.
+> Current measurements are in `gpu_sorting_plan.md`.
+
 ## Background and scope
 
 This note collects the performance behaviour of the GaussianSplatting RViz plugin on the full Garden dataset, and makes a first comparison between the Metal and OpenGL 4.3 GPU preparation paths.
