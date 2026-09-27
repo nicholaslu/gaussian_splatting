@@ -34,6 +34,7 @@ namespace gaussian_splatting_rviz_plugins
 class DepthSchemeResolver;
 class GaussianSplatRenderable;
 class GpuViewPreparation;
+class MetalUpscaler;
 
 class GaussianSplattingDisplay
   : public rviz_common::MessageFilterDisplay<gaussian_splatting_msgs::msg::GaussianSplats>,
@@ -116,6 +117,7 @@ private:
   rviz_common::properties::FloatProperty * render_scale_property_ = nullptr;
   rviz_common::properties::EnumProperty * antialiasing_property_ = nullptr;
   rviz_common::properties::EnumProperty * precision_property_ = nullptr;
+  rviz_common::properties::EnumProperty * upscaling_property_ = nullptr;
   rviz_common::properties::FloatProperty * static_refresh_property_ = nullptr;
 
   Ogre::SceneNode * splat_node_ = nullptr;
@@ -134,6 +136,11 @@ private:
   Ogre::Rectangle2D * composite_rect_ = nullptr;
   Ogre::SceneNode * composite_node_ = nullptr;
   Ogre::MaterialPtr composite_material_;
+  // MetalFX upscaling of a reduced-resolution target: its output, the
+  // composite that reads it, and the upscaler.
+  Ogre::TexturePtr upscaled_texture_;
+  Ogre::MaterialPtr composite_upscaled_material_;
+  std::unique_ptr<MetalUpscaler> upscaler_;
   std::unique_ptr<DepthSchemeResolver> depth_scheme_resolver_;
   unsigned int rtt_width_ = 0;
   unsigned int rtt_height_ = 0;
@@ -142,6 +149,7 @@ private:
   unsigned int rtt_samples_ = 0;
   // Whether a half float target was asked for, and whether the target is one.
   bool rtt_requested_half_ = false;
+  bool rtt_requested_upscale_ = false;
   bool rtt_half_ = false;
 
   // Offscreen image reuse. The image is redrawn when anything it depends on

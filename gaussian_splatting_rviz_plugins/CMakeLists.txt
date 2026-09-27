@@ -115,7 +115,9 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(GSPLAT_METAL_PREPARATION)
+  # metal_upscaler.mm finds MetalFX at run time, so it adds nothing to link.
   set(gaussian_splatting_metal_sources
+    src/metal_upscaler.mm
     src/metal_view_preparation.mm
     src/metal_view_preparation_core.mm)
   target_sources(${PROJECT_NAME} PRIVATE ${gaussian_splatting_metal_sources})

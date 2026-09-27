@@ -35,3 +35,43 @@ material GaussianSplatting/Composite
     }
   }
 }
+
+// Composite of a MetalFX-upscaled target; see gsplat_composite_upscaled_fp.
+fragment_program GaussianSplatting/CompositeUpscaledFP metal
+{
+  source gsplat_composite.metal
+  entry_point gsplat_composite_upscaled_fp
+  shader_reflection_pair_hint GaussianSplatting/CompositeVP
+}
+
+material GaussianSplatting/CompositeUpscaled
+{
+  technique render
+  {
+    pass
+    {
+      lighting off
+      cull_hardware none
+      cull_software none
+      depth_check off
+      depth_write off
+      scene_blend one one_minus_src_alpha
+
+      vertex_program_ref GaussianSplatting/CompositeVP {}
+      fragment_program_ref GaussianSplatting/CompositeUpscaledFP {}
+
+      // The upscaled colour, drawn 1:1.
+      texture_unit
+      {
+        tex_address_mode clamp
+        filtering none
+      }
+      // The target it came from, for its alpha.
+      texture_unit
+      {
+        tex_address_mode clamp
+        filtering linear linear none
+      }
+    }
+  }
+}

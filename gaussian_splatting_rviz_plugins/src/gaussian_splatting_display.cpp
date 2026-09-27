@@ -2,6 +2,9 @@
 // Unconditional: the display holds a unique_ptr to this interface, and
 // destroying one needs the complete type in every renderer build.
 #include "gaussian_splatting_rviz_plugins/gpu_view_preparation.hpp"
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+#include "gaussian_splatting_rviz_plugins/metal_upscaler.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -66,6 +69,7 @@ constexpr const char * kResourceGroup = "GaussianSplattingRviz";
 constexpr const char * kMaterialName = "GaussianSplatting/RViz";
 constexpr const char * kProjectedMaterialName = "GaussianSplatting/RVizProjected";
 constexpr const char * kCompositeMaterialName = "GaussianSplatting/Composite";
+constexpr const char * kCompositeUpscaledMaterialName = "GaussianSplatting/CompositeUpscaled";
 constexpr const char * kDepthMaterialName = "GaussianSplatting/DepthOnly";
 constexpr const char * kDepthMaterialScheme = "GaussianDepthOnly";
 
@@ -622,6 +626,17 @@ GaussianSplattingDisplay::GaussianSplattingDisplay()
   precision_property_->addOption("8-bit", 1);
   precision_property_->addOption("Half float", 2);
 
+  upscaling_property_ = new rviz_common::properties::EnumProperty(
+    "Upscaling", "MetalFX",
+    "How a target drawn below full resolution (Render Scale under 1.0) is "
+    "enlarged onto the window. Bilinear filters it; MetalFX runs Apple's "
+    "spatial upscaler on its colour, which keeps edges and fine detail sharper, "
+    "for about 1.5 ms a frame on an Apple M3 upscaling to 2876x1524. MetalFX "
+    "needs the Metal render system and falls back to bilinear elsewhere.",
+    offscreen_property_);
+  upscaling_property_->addOption("Bilinear", 0);
+  upscaling_property_->addOption("MetalFX", 1);
+
   static_refresh_property_ = new rviz_common::properties::FloatProperty(
     "Static Refresh Interval", 0.5f,
     "While the camera, the splats and this display's settings stay unchanged, the "
@@ -665,6 +680,11 @@ GaussianSplattingDisplay::~GaussianSplattingDisplay()
   if (composite_material_) {
     Ogre::MaterialManager::getSingleton().remove(composite_material_);
     composite_material_.reset();
+  }
+
+  if (composite_upscaled_material_) {
+    Ogre::MaterialManager::getSingleton().remove(composite_upscaled_material_);
+    composite_upscaled_material_.reset();
   }
 
   if (composite_node_) {
@@ -728,9 +748,11 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
   if (splat_texture_) {
     setStatus(
       rviz_common::properties::StatusProperty::Ok, "Offscreen",
-      QString("splats rasterised at %1x%2, %3%4, redrawn %5 times in the last second")
+      QString("splats rasterised at %1x%2, %3%4%5, redrawn %6 times in the last second")
       .arg(rtt_width_).arg(rtt_height_).arg(rtt_half_ ? "half float" : "8-bit")
       .arg(rtt_samples_ > 1 ? QString(" with %1x MSAA").arg(rtt_samples_) : QString())
+      .arg(upscaled_texture_ ? QString(", upscaled by MetalFX to %1x%2")
+      .arg(upscaled_texture_->getWidth()).arg(upscaled_texture_->getHeight()) : QString())
       .arg(recent_offscreen_draws_.size()));
     if (depth_scheme_resolver_) {
       const auto stats = depth_scheme_resolver_->stats();
@@ -1867,8 +1889,19 @@ void GaussianSplattingDisplay::preViewportUpdate(const Ogre::RenderTargetViewpor
   }
 }
 
-void GaussianSplattingDisplay::postRenderTargetUpdate(const Ogre::RenderTargetEvent &)
+void GaussianSplattingDisplay::postRenderTargetUpdate(const Ogre::RenderTargetEvent & event)
 {
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  // The target is drawn; upscale it in the same command buffer, before the
+  // window's pass composites the result.
+  if (upscaler_ && splat_texture_ &&
+    event.source == splat_texture_->getBuffer()->getRenderTarget())
+  {
+    upscaler_->encode();
+  }
+#else
+  (void)event;
+#endif
   // Neither belongs in the selection and pick textures, which RViz renders
   // without notifying this listener, so leave both hidden between targets.
   setSplatsVisible(false);
@@ -1883,6 +1916,13 @@ void GaussianSplattingDisplay::postRenderTargetUpdate(const Ogre::RenderTargetEv
 
 void GaussianSplattingDisplay::destroyRenderTarget()
 {
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  upscaler_.reset();
+#endif
+  if (upscaled_texture_) {
+    Ogre::TextureManager::getSingleton().remove(upscaled_texture_);
+    upscaled_texture_.reset();
+  }
   if (splat_texture_) {
     Ogre::RenderTexture * target = splat_texture_->getBuffer()->getRenderTarget();
     target->removeListener(this);
@@ -1904,6 +1944,7 @@ void GaussianSplattingDisplay::destroyRenderTarget()
   rtt_samples_ = 0;
   rtt_requested_half_ = false;
   rtt_half_ = false;
+  rtt_requested_upscale_ = false;
 
   // Back to drawing straight into the scene.
   if (composite_rect_) {
@@ -1934,6 +1975,9 @@ void GaussianSplattingDisplay::updateRenderTarget()
   }
 #endif
   const bool half = precision_property_->getOptionInt() != 1;
+  // MetalFX only where there is something to enlarge.
+  const bool upscale = upscaling_property_->getOptionInt() == 1 && scale < 1.0f &&
+    usesMetalRenderSystem();
   Ogre::Viewport * main_viewport = mainViewport();
 
   if (!offscreen_property_->getBool() || !main_viewport) {
@@ -1955,8 +1999,8 @@ void GaussianSplattingDisplay::updateRenderTarget()
   // Switching view controller swaps in a different camera, which the offscreen
   // viewport has to follow or it renders from a stale one.
   if (splat_texture_ && width == rtt_width_ && height == rtt_height_ &&
-    samples == rtt_requested_samples_ && half == rtt_requested_half_ && rtt_viewport_ &&
-    rtt_viewport_->getCamera() == camera)
+    samples == rtt_requested_samples_ && half == rtt_requested_half_ &&
+    upscale == rtt_requested_upscale_ && rtt_viewport_ && rtt_viewport_->getCamera() == camera)
   {
     return;
   }
@@ -2040,6 +2084,64 @@ void GaussianSplattingDisplay::updateRenderTarget()
     composite_node_ = scene_manager_->getRootSceneNode()->createChildSceneNode();
     composite_node_->attachObject(composite_rect_);
   }
+
+  rtt_requested_upscale_ = upscale;
+#ifdef GSPLAT_HAS_METAL_PREPARATION
+  if (upscale) {
+    // A render texture the size of the window, which MetalFX writes and the
+    // composite samples 1:1. Nothing renders into it, so Ogre skips it.
+    upscaled_texture_ = Ogre::TextureManager::getSingleton().createManual(
+      mesh_name_ + "_Upscaled", kResourceGroup, Ogre::TEX_TYPE_2D,
+      main_viewport->getActualWidth(), main_viewport->getActualHeight(), 0,
+      splat_texture_->getFormat(), Ogre::TU_RENDERTARGET);
+    Ogre::RenderTarget * upscaled_target = upscaled_texture_->getBuffer()->getRenderTarget();
+    upscaled_target->setAutoUpdated(false);
+    upscaled_target->setActive(false);
+    std::string reason;
+    upscaler_ = makeMetalUpscaler(
+      Ogre::Root::getSingleton().getRenderSystem(), splat_texture_.get(),
+      upscaled_texture_.get(), reason);
+    if (!composite_upscaled_material_ && upscaler_) {
+      Ogre::MaterialPtr base = Ogre::MaterialManager::getSingleton().getByName(
+        kCompositeUpscaledMaterialName, kResourceGroup);
+      if (base) {
+        composite_upscaled_material_ =
+          base->clone(material_name_ + "_CompositeUpscaled", true, kResourceGroup);
+      } else {
+        reason = std::string("material ") + kCompositeUpscaledMaterialName + " was not found";
+        upscaler_.reset();
+      }
+    }
+    if (upscaler_) {
+      deleteStatus("Upscaling");
+    } else {
+      setStatus(
+        rviz_common::properties::StatusProperty::Warn, "Upscaling",
+        QString::fromStdString(reason + "; enlarging bilinearly"));
+      Ogre::TextureManager::getSingleton().remove(upscaled_texture_);
+      upscaled_texture_.reset();
+    }
+  } else {
+    deleteStatus("Upscaling");
+  }
+  if (upscaler_) {
+    Ogre::Pass * pass = composite_upscaled_material_->getTechnique(0)->getPass(0);
+    pass->getTextureUnitState(0)->setTextureName(upscaled_texture_->getName());
+    pass->getTextureUnitState(1)->setTextureName(splat_texture_->getName());
+    composite_upscaled_material_->load();
+    composite_rect_->setMaterial(composite_upscaled_material_);
+    setSplatsVisible(false);
+    return;
+  }
+#else
+  if (upscale) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, "Upscaling",
+      "this build has no Metal support; enlarging bilinearly");
+  } else {
+    deleteStatus("Upscaling");
+  }
+#endif
 
   Ogre::Pass * pass = composite_material_->getTechnique(0)->getPass(0);
   pass->getTextureUnitState(0)->setTextureName(splat_texture_->getName());
