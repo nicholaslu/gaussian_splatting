@@ -288,6 +288,21 @@ struct ProjectedInstance
 };
 static_assert(sizeof(ProjectedInstance) == 48, "four float quadruples");
 
+// One survivor of a draw order as GPU preparation keeps it, in draw order:
+// the splat's record, its colour for the view the order was built for, its
+// depth key and its index. Every frame of incremental preparation projects
+// these in sequence. Mirrored by DrawnSplat in gsplat_prepare.metal.
+struct DrawnSplat
+{
+  float position_opacity[4];
+  float scale_red[4];
+  float quat[4];
+  float green_blue[2];
+  std::uint32_t key;
+  std::uint32_t splat;
+};
+static_assert(sizeof(DrawnSplat) == 64, "four quadruples");
+
 // gsplat_vp from gsplat.metal for one splat, less the corner displacement: the
 // reference the projection in gather_instances is checked against.
 inline void projectSplat(

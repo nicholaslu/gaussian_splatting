@@ -24,6 +24,8 @@ constexpr std::uint32_t kElementsPerTile = 1024;
 constexpr std::uint32_t kRadix = 256;
 // Threads in each scan threadgroup; kScanWidth in gsplat_prepare.metal.
 constexpr std::uint32_t kScanWidth = 256;
+// Slots finish_order gathers from per pass: 64 MiB of DrawnSplat.
+constexpr std::uint32_t kFinishSlotsPerPass = 1u << 20;
 
 // Mirror the structs of the same names in gsplat_prepare.metal.
 struct TileParameters
@@ -86,8 +88,9 @@ MetalViewPreparationCore::MetalViewPreparationCore(
     offset_pipeline_ = makePipeline(@"radix_scan_offsets", Dispatch::kScan);
     base_pipeline_ = makePipeline(@"radix_scan_digit_bases", Dispatch::kScan);
     scatter_pipeline_ = makePipeline(@"radix_scatter", Dispatch::kSimdRanked);
-    shade_pipeline_ = makePipeline(@"shade_project", Dispatch::kLinear);
-    gather_pipeline_ = makePipeline(@"gather_instances", Dispatch::kLinear);
+    shade_pipeline_ = makePipeline(@"shade_slots", Dispatch::kLinear);
+    gather_pipeline_ = makePipeline(@"reproject_gather", Dispatch::kLinear);
+    finish_pipeline_ = makePipeline(@"finish_order", Dispatch::kLinear);
   }
 }
 
@@ -95,7 +98,8 @@ bool MetalViewPreparationCore::ready() const
 {
   return keys_pipeline_ && compact_count_pipeline_ && compact_scan_pipeline_ &&
          compact_scatter_pipeline_ && histogram_pipeline_ && offset_pipeline_ &&
-         base_pipeline_ && scatter_pipeline_ && shade_pipeline_ && gather_pipeline_;
+         base_pipeline_ && scatter_pipeline_ && shade_pipeline_ && gather_pipeline_ &&
+         finish_pipeline_;
 }
 
 const std::string & MetalViewPreparationCore::error() const
@@ -125,30 +129,34 @@ bool MetalViewPreparationCore::configure(std::uint32_t count, std::uint32_t inde
   const NSUInteger pairs = static_cast<NSUInteger>(count) * sizeof(std::uint32_t) * 2u;
   const NSUInteger per_tile = static_cast<NSUInteger>(tile_count_) * sizeof(std::uint32_t);
   const NSUInteger tables = per_tile * kRadix;
-  keys_a_ = newBuffer(pairs, "compacted keys");
-  keys_b_ = newBuffer(pairs, "staged keys");
+  staged_ = newBuffer(pairs, "staged keys");
   tile_counts_ = newBuffer(per_tile, "tile survivor counts");
   tile_offsets_ = newBuffer(per_tile, "tile survivor offsets");
   histograms_ = newBuffer(tables, "radix histograms");
   offsets_ = newBuffer(tables, "radix offsets");
   totals_ = newBuffer(kRadix * sizeof(std::uint32_t), "radix totals");
   digit_bases_ = newBuffer(kRadix * sizeof(std::uint32_t), "radix digit bases");
-  state_ = newBuffer(sizeof(State), "preparation state");
-  tile_dispatch_ = newBuffer(sizeof(std::uint32_t) * 3u, "tile dispatch arguments");
-  gather_dispatch_ = newBuffer(sizeof(std::uint32_t) * 3u, "gather dispatch arguments");
-  projected_ = newBuffer(
-    static_cast<NSUInteger>(count) * sizeof(ProjectedInstance), "projected survivors");
-  slot_splats_ = newBuffer(static_cast<NSUInteger>(count) * sizeof(std::uint32_t), "slot splats");
-  if (!keys_a_ || !keys_b_ || !tile_counts_ || !tile_offsets_ || !histograms_ || !offsets_ ||
-    !totals_ || !digit_bases_ || !state_ || !tile_dispatch_ || !gather_dispatch_ ||
-    !projected_ || !slot_splats_)
-  {
+  const NSUInteger survivors = static_cast<NSUInteger>(count) * sizeof(DrawnSplat);
+  pairs_ = newBuffer(pairs, "key/slot pairs");
+  slots_ = newBuffer(survivors, "survivors by slot");
+  drawn_ = newBuffer(survivors, "survivors in draw order");
+  bool allocated = staged_ && tile_counts_ && tile_offsets_ && histograms_ && offsets_ &&
+    totals_ && digit_bases_ && pairs_ && slots_ && drawn_;
+  for (Order & order : orders_) {
+    order.state = newBuffer(sizeof(State), "order state");
+    order.tile_dispatch = newBuffer(sizeof(std::uint32_t) * 3u, "order tile dispatch");
+    order.gather_dispatch = newBuffer(sizeof(std::uint32_t) * 3u, "order gather dispatch");
+    allocated = allocated && order.state && order.tile_dispatch && order.gather_dispatch;
+    if (order.state) {
+      std::memset(order.state.contents, 0, sizeof(State));
+    }
+  }
+  if (!allocated) {
     const std::string failure = error_;
     clear();
     error_ = failure;
     return false;
   }
-  std::memset(state_.contents, 0, sizeof(State));
   error_.clear();
   return true;
 }
@@ -162,19 +170,22 @@ void MetalViewPreparationCore::clear()
   splats_ = nil;
   sh_dc_ = nil;
   sh_rest_ = nil;
-  keys_a_ = nil;
-  keys_b_ = nil;
+  staged_ = nil;
   tile_counts_ = nil;
   tile_offsets_ = nil;
   histograms_ = nil;
   offsets_ = nil;
   totals_ = nil;
   digit_bases_ = nil;
-  state_ = nil;
-  tile_dispatch_ = nil;
-  gather_dispatch_ = nil;
-  projected_ = nil;
-  slot_splats_ = nil;
+  pairs_ = nil;
+  slots_ = nil;
+  drawn_ = nil;
+  for (Order & order : orders_) {
+    order = Order{};
+  }
+  current_ = -1;
+  building_ = -1;
+  build_step_ = 0;
 }
 
 bool MetalViewPreparationCore::uploadStaticData(
@@ -217,15 +228,18 @@ bool MetalViewPreparationCore::uploadStaticData(
   if (sh_rest && rest_bytes > 0) {
     std::memcpy(sh_rest_.contents, sh_rest, rest_bytes);
   }
+  // The orders' colours and survivors belong to the old data.
+  current_ = -1;
+  building_ = -1;
+  build_step_ = 0;
   error_.clear();
   return true;
 }
 
 bool MetalViewPreparationCore::encodeCull(
-  id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
-  id<MTLBuffer> draw_arguments)
+  id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters)
 {
-  if (!ready() || count_ == 0 || !splats_ || !sh_dc_ || !sh_rest_ || !draw_arguments ||
+  if (!ready() || count_ == 0 || !splats_ || !sh_dc_ || !sh_rest_ ||
     parameters.count != count_)
   {
     error_ = "Metal view preparation is not fully configured";
@@ -237,10 +251,15 @@ bool MetalViewPreparationCore::encodeCull(
     error_ = "uploaded SH coefficients do not cover the requested degree";
     return false;
   }
+  // The order not being drawn from.
+  building_ = current_ == 0 ? 1 : 0;
+  build_step_ = 1;
+  build_view_ = parameters;
+  const Order & order = orders_[building_];
 
   [encoder setComputePipelineState:keys_pipeline_];
   [encoder setBuffer:splats_ offset:0 atIndex:0];
-  [encoder setBuffer:keys_b_ offset:0 atIndex:1];
+  [encoder setBuffer:staged_ offset:0 atIndex:1];
   [encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
   [encoder dispatchThreads:MTLSizeMake(count_, 1, 1)
      threadsPerThreadgroup:linearWidth(keys_pipeline_, 256u)];
@@ -248,7 +267,7 @@ bool MetalViewPreparationCore::encodeCull(
 
   const TileParameters tiles{count_, tile_count_, kElementsPerTile, 0u};
   [encoder setComputePipelineState:compact_count_pipeline_];
-  [encoder setBuffer:keys_b_ offset:0 atIndex:0];
+  [encoder setBuffer:staged_ offset:0 atIndex:0];
   [encoder setBuffer:tile_counts_ offset:0 atIndex:1];
   [encoder setBytes:&tiles length:sizeof(tiles) atIndex:2];
   [encoder dispatchThreads:MTLSizeMake(tile_count_, 1, 1)
@@ -259,18 +278,17 @@ bool MetalViewPreparationCore::encodeCull(
   [encoder setComputePipelineState:compact_scan_pipeline_];
   [encoder setBuffer:tile_counts_ offset:0 atIndex:0];
   [encoder setBuffer:tile_offsets_ offset:0 atIndex:1];
-  [encoder setBuffer:state_ offset:0 atIndex:2];
-  [encoder setBuffer:tile_dispatch_ offset:0 atIndex:3];
-  [encoder setBuffer:gather_dispatch_ offset:0 atIndex:4];
-  [encoder setBuffer:draw_arguments offset:0 atIndex:5];
+  [encoder setBuffer:order.state offset:0 atIndex:2];
+  [encoder setBuffer:order.tile_dispatch offset:0 atIndex:3];
+  [encoder setBuffer:order.gather_dispatch offset:0 atIndex:4];
   [encoder setBytes:&scan length:sizeof(scan) atIndex:6];
   [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
   barrier(encoder);
 
   [encoder setComputePipelineState:compact_scatter_pipeline_];
-  [encoder setBuffer:keys_b_ offset:0 atIndex:0];
-  [encoder setBuffer:keys_a_ offset:0 atIndex:1];
+  [encoder setBuffer:staged_ offset:0 atIndex:0];
+  [encoder setBuffer:pairs_ offset:0 atIndex:1];
   [encoder setBuffer:tile_offsets_ offset:0 atIndex:2];
   [encoder setBytes:&tiles length:sizeof(tiles) atIndex:3];
   [encoder dispatchThreadgroups:MTLSizeMake(tile_count_, 1, 1)
@@ -279,24 +297,46 @@ bool MetalViewPreparationCore::encodeCull(
   return true;
 }
 
-id<MTLBuffer> MetalViewPreparationCore::encodeSort(
-  id<MTLComputeCommandEncoder> encoder, std::uint32_t key_bits)
+void MetalViewPreparationCore::encodeShade(
+  id<MTLComputeCommandEncoder> encoder, std::uint32_t index, std::uint32_t count)
 {
-  if (!ready() || count_ == 0 || key_bits == 0u || key_bits > 32u || key_bits % 8u != 0u) {
-    error_ = "Metal sort is not configured, or the key width is not a whole number of bytes";
-    return nil;
+  if (building_ < 0 || count == 0 || index >= count) {
+    return;
   }
-  id<MTLBuffer> input = keys_a_;
-  id<MTLBuffer> output = keys_b_;
-  for (std::uint32_t shift = 0; shift < key_bits; shift += 8u) {
+  const Order & order = orders_[building_];
+  // Rewrites the compacted pairs, the sort's input, to carry slots.
+  [encoder setComputePipelineState:shade_pipeline_];
+  [encoder setBuffer:pairs_ offset:0 atIndex:0];
+  [encoder setBuffer:splats_ offset:0 atIndex:1];
+  [encoder setBuffer:sh_dc_ offset:0 atIndex:2];
+  [encoder setBuffer:sh_rest_ offset:0 atIndex:3];
+  [encoder setBuffer:order.state offset:0 atIndex:4];
+  [encoder setBuffer:slots_ offset:0 atIndex:5];
+  [encoder setBytes:&build_view_ length:sizeof(build_view_) atIndex:6];
+  const std::uint32_t part[2] = {index, count};
+  [encoder setBytes:part length:sizeof(part) atIndex:7];
+  // Sized for every survivor; threads past the part return at once.
+  [encoder dispatchThreadgroupsWithIndirectBuffer:order.gather_dispatch indirectBufferOffset:0
+                            threadsPerThreadgroup:MTLSizeMake(gather_width_, 1, 1)];
+  barrier(encoder);
+  build_step_ = index + 1 == count ? 3 : 2;
+}
+
+void MetalViewPreparationCore::encodeRadix(
+  id<MTLComputeCommandEncoder> encoder, const Order & order, std::uint32_t first_bit,
+  std::uint32_t end_bit)
+{
+  id<MTLBuffer> input = pairs_;
+  id<MTLBuffer> output = staged_;
+  for (std::uint32_t shift = first_bit; shift < end_bit; shift += 8u) {
     const TileParameters radix{count_, tile_count_, kElementsPerTile, shift};
 
     [encoder setComputePipelineState:histogram_pipeline_];
     [encoder setBuffer:input offset:0 atIndex:0];
     [encoder setBuffer:histograms_ offset:0 atIndex:1];
     [encoder setBytes:&radix length:sizeof(radix) atIndex:2];
-    [encoder setBuffer:state_ offset:0 atIndex:3];
-    [encoder dispatchThreadgroupsWithIndirectBuffer:tile_dispatch_ indirectBufferOffset:0
+    [encoder setBuffer:order.state offset:0 atIndex:3];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:order.tile_dispatch indirectBufferOffset:0
                               threadsPerThreadgroup:MTLSizeMake(kThreadsPerTile, 1, 1)];
     barrier(encoder);
 
@@ -305,7 +345,7 @@ id<MTLBuffer> MetalViewPreparationCore::encodeSort(
     [encoder setBuffer:offsets_ offset:0 atIndex:1];
     [encoder setBuffer:totals_ offset:0 atIndex:2];
     [encoder setBytes:&radix length:sizeof(radix) atIndex:3];
-    [encoder setBuffer:state_ offset:0 atIndex:4];
+    [encoder setBuffer:order.state offset:0 atIndex:4];
     [encoder dispatchThreadgroups:MTLSizeMake(kRadix, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(kScanWidth, 1, 1)];
     barrier(encoder);
@@ -323,92 +363,170 @@ id<MTLBuffer> MetalViewPreparationCore::encodeSort(
     [encoder setBuffer:offsets_ offset:0 atIndex:2];
     [encoder setBuffer:digit_bases_ offset:0 atIndex:3];
     [encoder setBytes:&radix length:sizeof(radix) atIndex:4];
-    [encoder setBuffer:state_ offset:0 atIndex:5];
-    [encoder dispatchThreadgroupsWithIndirectBuffer:tile_dispatch_ indirectBufferOffset:0
+    [encoder setBuffer:order.state offset:0 atIndex:5];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:order.tile_dispatch indirectBufferOffset:0
                               threadsPerThreadgroup:MTLSizeMake(kThreadsPerTile, 1, 1)];
     barrier(encoder);
     std::swap(input, output);
   }
-  return input;
 }
 
-void MetalViewPreparationCore::encodeShade(
-  id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
-  const ProjectionParameters & projection)
+bool MetalViewPreparationCore::encodeSort(
+  id<MTLComputeCommandEncoder> encoder, std::uint32_t key_bits)
 {
-  // Rewrites the compacted pairs in keys_a_, the sort's input, to carry slots.
-  [encoder setComputePipelineState:shade_pipeline_];
-  [encoder setBuffer:keys_a_ offset:0 atIndex:0];
-  [encoder setBuffer:splats_ offset:0 atIndex:1];
-  [encoder setBuffer:sh_dc_ offset:0 atIndex:2];
-  [encoder setBuffer:sh_rest_ offset:0 atIndex:3];
-  [encoder setBuffer:state_ offset:0 atIndex:4];
-  [encoder setBuffer:projected_ offset:0 atIndex:5];
-  [encoder setBytes:&parameters length:sizeof(parameters) atIndex:6];
-  [encoder setBytes:&projection length:sizeof(projection) atIndex:7];
-  [encoder setBuffer:slot_splats_ offset:0 atIndex:8];
-  [encoder dispatchThreadgroupsWithIndirectBuffer:gather_dispatch_ indirectBufferOffset:0
-                            threadsPerThreadgroup:MTLSizeMake(gather_width_, 1, 1)];
-  barrier(encoder);
+  // Whole byte pairs, so that the pairs end back in the order's own buffer.
+  if (!ready() || count_ == 0 || key_bits == 0u || key_bits > 32u || key_bits % 16u != 0u) {
+    error_ = "Metal sort is not configured, or the key width is not 16 or 32 bits";
+    return false;
+  }
+  // With no build under way, as when benchmarking, the newest order again.
+  const int sorting = building_ >= 0 ? building_ : current_;
+  if (sorting < 0) {
+    error_ = "no order to sort";
+    return false;
+  }
+  encodeRadix(encoder, orders_[sorting], 0u, key_bits);
+  if (building_ >= 0) {
+    completeBuild(encoder);
+  }
+  return true;
 }
 
-void MetalViewPreparationCore::encodeGather(
-  id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> sorted, id<MTLBuffer> instances)
+bool MetalViewPreparationCore::encodeGather(
+  id<MTLComputeCommandEncoder> encoder, const ProjectionParameters & projection,
+  id<MTLBuffer> instances, id<MTLBuffer> draw_arguments)
 {
+  if (current_ < 0 || !instances || !draw_arguments ||
+    instances.length < static_cast<NSUInteger>(count_) * sizeof(ProjectedInstance))
+  {
+    error_ = "no complete order, or an instance buffer smaller than the splat count";
+    return false;
+  }
+  const Order & order = orders_[current_];
   [encoder setComputePipelineState:gather_pipeline_];
-  [encoder setBuffer:sorted offset:0 atIndex:0];
-  [encoder setBuffer:projected_ offset:0 atIndex:1];
-  [encoder setBuffer:state_ offset:0 atIndex:4];
+  [encoder setBuffer:drawn_ offset:0 atIndex:0];
+  [encoder setBuffer:order.state offset:0 atIndex:4];
   [encoder setBuffer:instances offset:0 atIndex:5];
-  [encoder dispatchThreadgroupsWithIndirectBuffer:gather_dispatch_ indirectBufferOffset:0
+  [encoder setBytes:&projection length:sizeof(projection) atIndex:6];
+  [encoder setBuffer:draw_arguments offset:0 atIndex:7];
+  [encoder setBytes:&index_count_ length:sizeof(index_count_) atIndex:8];
+  [encoder dispatchThreadgroupsWithIndirectBuffer:order.gather_dispatch indirectBufferOffset:0
                             threadsPerThreadgroup:MTLSizeMake(gather_width_, 1, 1)];
+  return true;
 }
 
-id<MTLBuffer> MetalViewPreparationCore::encode(
+bool MetalViewPreparationCore::encode(
   id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
   const ProjectionParameters & projection, id<MTLBuffer> instances,
   id<MTLBuffer> draw_arguments)
 {
-  if (!instances ||
-    instances.length < static_cast<NSUInteger>(count_) * sizeof(ProjectedInstance))
+  if (!encodeCull(encoder, parameters)) {
+    return false;
+  }
+  encodeShade(encoder);
+  if (!encodeSort(encoder, 32u) ||
+    !encodeGather(encoder, projection, instances, draw_arguments))
   {
-    error_ = "instance buffer is missing or smaller than the splat count";
-    return nil;
+    return false;
   }
-  if (!encodeCull(encoder, parameters, draw_arguments)) {
-    return nil;
-  }
-  encodeShade(encoder, parameters, projection);
-  id<MTLBuffer> sorted = encodeSort(encoder, 32u);
-  if (!sorted) {
-    return nil;
-  }
-  encodeGather(encoder, sorted, instances);
   error_.clear();
-  return sorted;
+  return true;
+}
+
+bool MetalViewPreparationCore::encodeIncremental(
+  id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters,
+  const ProjectionParameters & projection, id<MTLBuffer> instances,
+  id<MTLBuffer> draw_arguments)
+{
+  if (current_ < 0) {
+    return encode(encoder, parameters, projection, instances, draw_arguments);
+  }
+  if (encodeBuildStep(encoder, parameters) == BuildStep::kFailed ||
+    !encodeGather(encoder, projection, instances, draw_arguments))
+  {
+    return false;
+  }
+  error_.clear();
+  return true;
+}
+
+MetalViewPreparationCore::BuildStep MetalViewPreparationCore::encodeBuildStep(
+  id<MTLComputeCommandEncoder> encoder, const ViewParameters & parameters)
+{
+  // Five steps of comparable cost on the full Garden scene: culling and
+  // compaction, each half of the colour, and each half of the sort.
+  if (building_ < 0) {
+    return encodeCull(encoder, parameters) ? BuildStep::kCull : BuildStep::kFailed;
+  }
+  if (build_step_ == 1 || build_step_ == 2) {
+    encodeShade(encoder, static_cast<std::uint32_t>(build_step_ - 1), 2u);
+    return BuildStep::kShade;
+  }
+  if (build_step_ == 3) {
+    encodeRadix(encoder, orders_[building_], 0u, 16u);
+    build_step_ = 4;
+    return BuildStep::kSortLow;
+  }
+  encodeRadix(encoder, orders_[building_], 16u, 32u);
+  completeBuild(encoder);
+  return BuildStep::kSortHigh;
+}
+
+void MetalViewPreparationCore::completeBuild(id<MTLComputeCommandEncoder> encoder)
+{
+  const Order & order = orders_[building_];
+  [encoder setComputePipelineState:finish_pipeline_];
+  [encoder setBuffer:pairs_ offset:0 atIndex:0];
+  [encoder setBuffer:slots_ offset:0 atIndex:1];
+  [encoder setBuffer:order.state offset:0 atIndex:4];
+  [encoder setBuffer:drawn_ offset:0 atIndex:5];
+  // The passes write disjoint positions, so they need no barrier between them.
+  for (std::uint32_t first = 0; first < count_; first += kFinishSlotsPerPass) {
+    const std::uint32_t range[2] = {first, first + std::min(kFinishSlotsPerPass, count_ - first)};
+    [encoder setBytes:range length:sizeof(range) atIndex:6];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:order.gather_dispatch indirectBufferOffset:0
+                              threadsPerThreadgroup:MTLSizeMake(gather_width_, 1, 1)];
+  }
+  barrier(encoder);
+  current_ = building_;
+  building_ = -1;
+  build_step_ = 0;
 }
 
 void MetalViewPreparationCore::primeSortInput(std::uint32_t visible)
 {
-  auto * state = static_cast<State *>(state_.contents);
+  building_ = current_ == 0 ? 1 : 0;
+  build_step_ = 3;
+  const Order & order = orders_[building_];
+  auto * state = static_cast<State *>(order.state.contents);
   state->visible = std::min(visible, count_);
   state->visible_tiles = (state->visible + kElementsPerTile - 1u) / kElementsPerTile;
   state->gather_groups = 0;
   state->reserved = 0;
-  auto * dispatch = static_cast<std::uint32_t *>(tile_dispatch_.contents);
+  auto * dispatch = static_cast<std::uint32_t *>(order.tile_dispatch.contents);
   dispatch[0] = std::max<std::uint32_t>(state->visible_tiles, 1u);
   dispatch[1] = 1u;
   dispatch[2] = 1u;
 }
 
+id<MTLBuffer> MetalViewPreparationCore::stateBuffer() const
+{
+  return current_ >= 0 ? orders_[current_].state : nil;
+}
+
 NSUInteger MetalViewPreparationCore::scratchBytes() const
 {
   NSUInteger total = 0;
-  for (id<MTLBuffer> buffer : {keys_a_, keys_b_, tile_counts_, tile_offsets_, histograms_,
-      offsets_, totals_, digit_bases_, state_, tile_dispatch_, gather_dispatch_, projected_,
-      slot_splats_})
+  for (id<MTLBuffer> buffer : {staged_, pairs_, slots_, drawn_, tile_counts_, tile_offsets_,
+      histograms_, offsets_, totals_, digit_bases_})
   {
     total += buffer ? buffer.length : 0u;
+  }
+  for (const Order & order : orders_) {
+    for (id<MTLBuffer> buffer : {order.state, order.tile_dispatch, order.gather_dispatch})
+    {
+      total += buffer ? buffer.length : 0u;
+    }
   }
   return total;
 }

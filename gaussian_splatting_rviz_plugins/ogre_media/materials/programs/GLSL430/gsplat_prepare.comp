@@ -58,16 +58,13 @@ struct ProjectionParameters
   float sigma_radius;
 };
 
+// An order's survivor count and the dispatch sizes it implies.
 struct PreparationState
 {
   uint visible;
   uint visible_tiles;
   uint gather_groups;
-  // Leading instance slots an earlier frame may have filled, and the end of
-  // the stale range clear_tail empties this frame. Only a renderer that draws
-  // every instance needs them, but they are kept either way.
-  uint written;
-  uint clear_end;
+  uint reserved;
 };
 
 struct ProjectedInstance
@@ -75,6 +72,17 @@ struct ProjectedInstance
   vec4 centre_radius;
   vec4 axes;
   vec4 colour;
+};
+
+// One survivor as the draw needs it; see DrawnSplat in splat_view.hpp.
+struct DrawnSplat
+{
+  vec4 position_opacity;
+  vec4 scale_red;
+  vec4 quat;
+  vec2 green_blue;
+  uint key;
+  uint splat;
 };
 
 uint orderedFloatKey(float value)
@@ -256,6 +264,8 @@ void main()
 }
 
 #elif defined(GSPLAT_STAGE_COMPACT_SCAN)
+// Where each tile's survivors start in the compacted buffer, the survivor
+// count, and the dispatch sizes the rest of the order's stages run from.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Counts {uint tile_counts[];};
 layout(std430, binding = 1) writeonly buffer Offsets {uint tile_offsets[];};
@@ -270,22 +280,9 @@ layout(std430, binding = 4) writeonly buffer GatherDispatch {
   uint gather_groups_y;
   uint gather_groups_z;
 };
-layout(std430, binding = 5) buffer DrawArguments {
-  uint index_count_out;
-  uint instance_count_out;
-  uint index_start_out;
-  uint base_vertex_out;
-  uint base_instance_out;
-};
-layout(std430, binding = 6) writeonly buffer ClearDispatch {
-  uint clear_groups_x;
-  uint clear_groups_y;
-  uint clear_groups_z;
-};
 uniform uint tile_count;
 uniform uint elements_per_tile;
 uniform uint gather_width;
-uniform uint index_count;
 
 uint loadTileCount(uint tile)
 {
@@ -304,18 +301,10 @@ void main()
     return;
   }
   uint visible = scan_carry;
-  uint written = state.written;
   state.visible = visible;
   state.visible_tiles = (visible + elements_per_tile - 1u) / elements_per_tile;
   state.gather_groups = (visible + gather_width - 1u) / gather_width;
-  // The gather fills [0, visible); what an earlier, larger frame left past
-  // that is emptied by clear_tail, so only the shrink costs anything.
-  state.clear_end = written;
-  state.written = visible;
-  uint stale = written > visible ? written - visible : 0u;
-  clear_groups_x = max((stale + gather_width - 1u) / gather_width, 1u);
-  clear_groups_y = 1u;
-  clear_groups_z = 1u;
+  state.reserved = 0u;
   // OpenGL rejects a zero-sized indirect dispatch, so launch one guarded
   // group for an empty view just as the Metal backend does.
   tile_groups_x = max(state.visible_tiles, 1u);
@@ -324,11 +313,6 @@ void main()
   gather_groups_x = max(state.gather_groups, 1u);
   gather_groups_y = 1u;
   gather_groups_z = 1u;
-  index_count_out = index_count;
-  instance_count_out = visible;
-  index_start_out = 0u;
-  base_vertex_out = 0u;
-  base_instance_out = 0u;
 }
 
 #elif defined(GSPLAT_STAGE_COMPACT_SCATTER)
@@ -550,26 +534,29 @@ void main()
   }
 }
 
-#elif defined(GSPLAT_STAGE_SHADE_PROJECT)
-// Every survivor coloured and projected between compaction and the sort, while
-// the compacted list is still in index order, so the splat records and the
-// spherical harmonics - by far the scene's largest arrays - are read in the
-// order they are stored. After the sort the same reads land in depth order,
-// scattered over the whole scene: on an RTX 4090 with the full Garden scene,
-// evaluating SH there made the gather 24 times slower. Each result goes to the
-// survivor's compacted slot, and the slot replaces the splat index as the
-// sort's value, so GATHER only permutes a buffer the size of the visible set.
-// The sort is stable and slots follow index order, so the draw order is
-// unchanged. Eight storage blocks, the most OpenGL guarantees.
+#elif defined(GSPLAT_STAGE_SHADE_SLOTS)
+// Every survivor coloured, and its record copied, between compaction and the
+// sort, while the compacted list is still in index order, so the splat records
+// and the spherical harmonics - by far the scene's largest arrays - are read
+// in the order they are stored. After the sort the same reads land in depth
+// order, scattered over the whole scene: on an RTX 4090 with the full Garden
+// scene, reading the records that way took 22 ms against 0.3 ms in sequence,
+// and evaluating SH that way made the gather 24 times slower. Each survivor
+// goes to its compacted slot, and the slot replaces the splat index as the
+// sort's value. The sort is stable and slots follow index order, so the draw
+// order is unchanged.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer Records {uvec2 records[];};
 layout(std430, binding = 1) readonly buffer Splats {SplatRecord splats[];};
 layout(std430, binding = 2) readonly buffer Dc {float sh_dc[];};
 layout(std430, binding = 3) readonly buffer Rest {float sh_rest[];};
 layout(std430, binding = 4) readonly buffer State {PreparationState state;};
-layout(std430, binding = 5) writeonly buffer Projected {ProjectedInstance projected[];};
+layout(std430, binding = 5) writeonly buffer Slots {DrawnSplat slots[];};
 layout(std430, binding = 6) readonly buffer ViewBlock {ViewParameters p;};
-layout(std430, binding = 7) readonly buffer ProjectionBlock {ProjectionParameters q;};
+// Which part, of how many, of the survivors to shade: incremental preparation
+// shades half a frame.
+uniform uint part_index;
+uniform uint part_count;
 
 vec3 evaluateSH(uint splat, vec3 position)
 {
@@ -611,6 +598,103 @@ vec3 evaluateSH(uint splat, vec3 position)
   }
   return max(colour, vec3(0.0));
 }
+
+void main()
+{
+  uint share = state.visible / part_count;
+  uint spare = state.visible % part_count;
+  uint begin = part_index * share + min(part_index, spare);
+  uint end = begin + share + (part_index < spare ? 1u : 0u);
+  uint slot = begin + gl_GlobalInvocationID.x;
+  if (slot >= end) {
+    return;
+  }
+  uvec2 record = records[slot];
+  SplatRecord splat = splats[record.y];
+  vec3 colour = evaluateSH(record.y, splat.position_opacity.xyz);
+  slots[slot] = DrawnSplat(
+    splat.position_opacity, vec4(splat.scale_pad.xyz, colour.x), splat.quat, colour.yz,
+    record.x, record.y);
+  records[slot].y = slot;
+}
+
+#elif defined(GSPLAT_STAGE_FINISH_ORDER)
+// Completing an order: the survivors in draw order, so that drawing from the
+// order reads them in sequence. The one permutation per order, in passes over
+// ranges of slots; see finish_order in gsplat_prepare.metal for why.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Sorted {uvec2 sorted_records[];};
+layout(std430, binding = 1) readonly buffer Slots {DrawnSplat slots[];};
+layout(std430, binding = 4) readonly buffer State {PreparationState state;};
+layout(std430, binding = 5) writeonly buffer Drawn {DrawnSplat drawn[];};
+uniform uint first_slot;
+uniform uint end_slot;
+
+void main()
+{
+  uint output_index = gl_GlobalInvocationID.x;
+  if (output_index >= state.visible) {
+    return;
+  }
+  uint slot = sorted_records[output_index].y;
+  if (slot >= first_slot && slot < end_slot) {
+    drawn[output_index] = slots[slot];
+  }
+}
+
+#elif defined(GSPLAT_STAGE_PUBLISH)
+// The indirect draw arguments for the order being drawn from, and, for a
+// renderer that draws every instance, the stale range CLEAR_TAIL empties: the
+// slots past this order's survivors that an earlier frame filled.
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly buffer State {PreparationState state;};
+layout(std430, binding = 1) buffer InstanceState {
+  uint instances_visible;
+  uint instances_written;
+  uint instances_clear_end;
+};
+layout(std430, binding = 2) writeonly buffer DrawArguments {
+  uint index_count_out;
+  uint instance_count_out;
+  uint index_start_out;
+  uint base_vertex_out;
+  uint base_instance_out;
+};
+layout(std430, binding = 3) writeonly buffer ClearDispatch {
+  uint clear_groups_x;
+  uint clear_groups_y;
+  uint clear_groups_z;
+};
+uniform uint index_count;
+uniform uint gather_width;
+
+void main()
+{
+  uint visible = state.visible;
+  uint written = instances_written;
+  instances_visible = visible;
+  instances_clear_end = written;
+  instances_written = visible;
+  uint stale = written > visible ? written - visible : 0u;
+  clear_groups_x = max((stale + gather_width - 1u) / gather_width, 1u);
+  clear_groups_y = 1u;
+  clear_groups_z = 1u;
+  index_count_out = index_count;
+  instance_count_out = visible;
+  index_start_out = 0u;
+  base_vertex_out = 0u;
+  base_instance_out = 0u;
+}
+
+#elif defined(GSPLAT_STAGE_REPROJECT_GATHER)
+// The draw stream, each survivor of an order projected for this frame's camera
+// with the colour the order was built with, read and written in sequence; see
+// reproject_gather in gsplat_prepare.metal.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Drawn {DrawnSplat drawn[];};
+layout(std430, binding = 4) readonly buffer State {PreparationState state;};
+layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
+layout(std430, binding = 6) readonly buffer ProjectionBlock {ProjectionParameters q;};
 
 ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
 {
@@ -686,31 +770,13 @@ ProjectedInstance projectSplat(SplatRecord splat, vec3 colour)
 
 void main()
 {
-  uint slot = gl_GlobalInvocationID.x;
-  if (slot >= state.visible) {
-    return;
-  }
-  uint index = records[slot].y;
-  SplatRecord splat = splats[index];
-  projected[slot] = projectSplat(splat, evaluateSH(index, splat.position_opacity.xyz));
-  records[slot].y = slot;
-}
-
-#elif defined(GSPLAT_STAGE_GATHER)
-// The draw stream in depth order, a permutation of what SHADE_PROJECT wrote.
-layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer Sorted {uvec2 sorted_records[];};
-layout(std430, binding = 1) readonly buffer Projected {ProjectedInstance projected[];};
-layout(std430, binding = 4) readonly buffer State {PreparationState state;};
-layout(std430, binding = 5) writeonly buffer Instances {ProjectedInstance instances[];};
-
-void main()
-{
   uint output_index = gl_GlobalInvocationID.x;
   if (output_index >= state.visible) {
     return;
   }
-  instances[output_index] = projected[sorted_records[output_index].y];
+  DrawnSplat d = drawn[output_index];
+  SplatRecord splat = SplatRecord(d.position_opacity, vec4(d.scale_red.xyz, 0.0), d.quat);
+  instances[output_index] = projectSplat(splat, vec3(d.scale_red.w, d.green_blue));
 }
 
 #elif defined(GSPLAT_STAGE_CLEAR_TAIL)
@@ -718,13 +784,17 @@ void main()
 // every instance. An empty quad sits outside the clip volume with no extent,
 // as projectSplat() leaves a rejected splat.
 layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer State {PreparationState state;};
+layout(std430, binding = 0) readonly buffer InstanceState {
+  uint instances_visible;
+  uint instances_written;
+  uint instances_clear_end;
+};
 layout(std430, binding = 1) writeonly buffer Instances {ProjectedInstance instances[];};
 
 void main()
 {
-  uint slot = state.visible + gl_GlobalInvocationID.x;
-  if (slot >= state.clear_end) {
+  uint slot = instances_visible + gl_GlobalInvocationID.x;
+  if (slot >= instances_clear_end) {
     return;
   }
   instances[slot].centre_radius = vec4(0.0, 0.0, 2.0, 0.0);

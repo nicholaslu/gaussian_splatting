@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <sstream>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 #include <dlfcn.h>
 
@@ -14,6 +16,8 @@ namespace
 constexpr std::uint32_t kElementsPerTile = 1024u;
 constexpr std::uint32_t kGatherWidth = 256u;
 constexpr std::uint32_t kRadix = 256u;
+// Slots FINISH_ORDER gathers from per pass: 64 MiB of DrawnSplat.
+constexpr std::uint32_t kFinishSlotsPerPass = 1u << 20;
 
 // Timestamp slots: the stage boundaries, then the steps inside culling and
 // inside each of the four radix passes.
@@ -126,7 +130,7 @@ struct DispatchArguments
 static_assert(sizeof(DispatchArguments) == 12, "OpenGL dispatch indirect argument layout");
 
 static_assert(
-  sizeof(OpenGlViewPreparationCore::State) == 20, "OpenGL preparation state layout");
+  sizeof(OpenGlViewPreparationCore::State) == 16, "OpenGL preparation state layout");
 
 std::string shaderLog(GLuint object, bool program)
 {
@@ -253,17 +257,17 @@ OpenGlViewPreparationCore::OpenGlViewPreparationCore(
   }
 
   subgroup_ballot_ = allow_subgroups && subgroupBallotUsable();
-  programs_[0] = compile("GSPLAT_STAGE_MAKE_DEPTH_KEYS");
-  programs_[1] = compile("GSPLAT_STAGE_COMPACT_COUNT");
-  programs_[2] = compile("GSPLAT_STAGE_COMPACT_SCAN");
-  programs_[3] = compile("GSPLAT_STAGE_COMPACT_SCATTER");
-  programs_[4] = compile("GSPLAT_STAGE_RADIX_HISTOGRAM");
-  programs_[5] = compile("GSPLAT_STAGE_RADIX_SCAN_OFFSETS");
-  programs_[6] = compile("GSPLAT_STAGE_RADIX_SCAN_BASES");
-  programs_[7] = compile("GSPLAT_STAGE_RADIX_SCATTER");
-  programs_[8] = compile("GSPLAT_STAGE_GATHER");
-  programs_[9] = compile("GSPLAT_STAGE_CLEAR_TAIL");
-  programs_[10] = compile("GSPLAT_STAGE_SHADE_PROJECT");
+  const char * stages[] = {
+    "GSPLAT_STAGE_MAKE_DEPTH_KEYS", "GSPLAT_STAGE_COMPACT_COUNT", "GSPLAT_STAGE_COMPACT_SCAN",
+    "GSPLAT_STAGE_COMPACT_SCATTER", "GSPLAT_STAGE_RADIX_HISTOGRAM",
+    "GSPLAT_STAGE_RADIX_SCAN_OFFSETS", "GSPLAT_STAGE_RADIX_SCAN_BASES",
+    "GSPLAT_STAGE_RADIX_SCATTER", "GSPLAT_STAGE_SHADE_SLOTS", "GSPLAT_STAGE_FINISH_ORDER",
+    "GSPLAT_STAGE_PUBLISH", "GSPLAT_STAGE_REPROJECT_GATHER", "GSPLAT_STAGE_CLEAR_TAIL"};
+  static_assert(sizeof(stages) / sizeof(stages[0]) == std::tuple_size<decltype(programs_)>::value,
+    "a program per stage");
+  for (std::size_t i = 0; i < programs_.size(); ++i) {
+    programs_[i] = compile(stages[i]);
+  }
 }
 
 OpenGlViewPreparationCore::~OpenGlViewPreparationCore()
@@ -320,13 +324,10 @@ bool OpenGlViewPreparationCore::configure(std::uint32_t count, std::uint32_t ind
   index_count_ = index_count;
   tile_count_ = (count_ + kElementsPerTile - 1u) / kElementsPerTile;
   const std::size_t pair_bytes = std::size_t(count) * sizeof(std::uint32_t) * 2u;
+  const std::size_t survivor_bytes = std::size_t(count) * sizeof(DrawnSplat);
   const std::size_t tile_bytes = static_cast<std::size_t>(tile_count_) * sizeof(std::uint32_t);
   const std::size_t table_bytes = tile_bytes * kRadix;
-  const std::size_t projected_bytes = std::size_t(count) * sizeof(ProjectedInstance);
-  const std::array<std::size_t, 8> storage_sizes = {
-    pair_bytes, pair_bytes, tile_bytes, tile_bytes,
-    table_bytes, table_bytes, kRadix * sizeof(std::uint32_t), projected_bytes};
-  for (std::size_t bytes : storage_sizes) {
+  for (std::size_t bytes : {pair_bytes, survivor_bytes, table_bytes}) {
     if (!fitsStorageBlock(bytes)) {
       error_ = "scene requires an SSBO larger than GL_MAX_SHADER_STORAGE_BLOCK_SIZE";
       clear();
@@ -334,43 +335,51 @@ bool OpenGlViewPreparationCore::configure(std::uint32_t count, std::uint32_t ind
     }
   }
 
-  keys_a_ = newBuffer(pair_bytes, GL_DYNAMIC_COPY);
-  keys_b_ = newBuffer(pair_bytes, GL_DYNAMIC_COPY);
+  staged_ = newBuffer(pair_bytes, GL_DYNAMIC_COPY);
   tile_counts_ = newBuffer(tile_bytes, GL_DYNAMIC_COPY);
   tile_offsets_ = newBuffer(tile_bytes, GL_DYNAMIC_COPY);
   histograms_ = newBuffer(table_bytes, GL_DYNAMIC_COPY);
   offsets_ = newBuffer(table_bytes, GL_DYNAMIC_COPY);
   totals_ = newBuffer(kRadix * sizeof(std::uint32_t), GL_DYNAMIC_COPY);
   digit_bases_ = newBuffer(kRadix * sizeof(std::uint32_t), GL_DYNAMIC_COPY);
-  state_ = newBuffer(sizeof(State), GL_DYNAMIC_COPY);
-  tile_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
-  gather_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
+  pairs_ = newBuffer(pair_bytes, GL_DYNAMIC_COPY);
+  slots_ = newBuffer(survivor_bytes, GL_DYNAMIC_COPY);
+  drawn_ = newBuffer(survivor_bytes, GL_DYNAMIC_COPY);
+  instance_state_ = newBuffer(sizeof(std::uint32_t) * 3u, GL_DYNAMIC_COPY);
   clear_dispatch_ = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
-  projected_ = newBuffer(projected_bytes, GL_DYNAMIC_COPY);
   draw_arguments_ = newBuffer(sizeof(DrawIndexedArguments), GL_DYNAMIC_COPY);
   view_parameters_ = newBuffer(sizeof(ViewParameters), GL_STREAM_DRAW);
   projection_parameters_ = newBuffer(sizeof(ProjectionParameters), GL_STREAM_DRAW);
+  bool allocated = staged_ && tile_counts_ && tile_offsets_ && histograms_ && offsets_ &&
+    totals_ && digit_bases_ && pairs_ && slots_ && drawn_ && instance_state_ &&
+    clear_dispatch_ && draw_arguments_ && view_parameters_ && projection_parameters_;
+  const State empty_state{0u, 0u, 0u, 0u};
+  for (Order & order : orders_) {
+    order.state = newBuffer(sizeof(State), GL_DYNAMIC_COPY);
+    order.tile_dispatch = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
+    order.gather_dispatch = newBuffer(sizeof(DispatchArguments), GL_DYNAMIC_COPY);
+    allocated = allocated && order.state && order.tile_dispatch && order.gather_dispatch;
+    if (order.state) {
+      updateBuffer(order.state, &empty_state, sizeof(empty_state));
+    }
+  }
   for (Readback & readback : readbacks_) {
     readback.buffer = newBuffer(sizeof(std::uint32_t), GL_STREAM_READ);
+    allocated = allocated && readback.buffer;
   }
-  if (!keys_a_ || !keys_b_ || !tile_counts_ || !tile_offsets_ || !histograms_ ||
-    !offsets_ || !totals_ || !digit_bases_ || !state_ || !tile_dispatch_ ||
-    !gather_dispatch_ || !clear_dispatch_ || !projected_ || !draw_arguments_ ||
-    !view_parameters_ || !projection_parameters_ || !readbacks_[0].buffer ||
-    !readbacks_[1].buffer || !readbacks_[2].buffer)
-  {
+  if (!allocated) {
     const std::string failure = error_.empty() ? "allocating OpenGL preparation buffers" : error_;
     clear();
     error_ = failure;
     return false;
   }
-  scratch_bytes_ = 2u * pair_bytes + 2u * tile_bytes + 2u * table_bytes +
-    2u * kRadix * sizeof(std::uint32_t) + projected_bytes;
+  scratch_bytes_ = 2u * pair_bytes + 2u * survivor_bytes + 2u * tile_bytes +
+    2u * table_bytes + 2u * kRadix * sizeof(std::uint32_t);
 
   // Every slot counts as written, so the first preparation that clears the
   // tail empties whatever an instance buffer was allocated holding.
-  const State initial{0u, 0u, 0u, count_, 0u};
-  updateBuffer(state_, &initial, sizeof(initial));
+  const std::uint32_t instances[3] = {0u, count_, 0u};
+  updateBuffer(instance_state_, instances, sizeof(instances));
   const DrawIndexedArguments empty{index_count_, 0u, 0u, 0u, 0u};
   updateBuffer(draw_arguments_, &empty, sizeof(empty));
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -391,11 +400,17 @@ void OpenGlViewPreparationCore::clear()
       readback.buffer = 0u;
     }
   }
-  for (GLuint * buffer : {&splats_, &sh_dc_, &sh_rest_, &keys_a_, &keys_b_, &tile_counts_,
-      &tile_offsets_, &histograms_, &offsets_, &totals_, &digit_bases_, &state_, &tile_dispatch_,
-      &gather_dispatch_, &clear_dispatch_, &projected_, &draw_arguments_, &view_parameters_,
-      &projection_parameters_})
-  {
+  std::vector<GLuint *> buffers = {&splats_, &sh_dc_, &sh_rest_, &staged_, &tile_counts_,
+    &tile_offsets_, &histograms_, &offsets_, &totals_, &digit_bases_, &pairs_, &slots_,
+    &drawn_, &instance_state_, &clear_dispatch_, &draw_arguments_, &view_parameters_,
+    &projection_parameters_};
+  for (Order & order : orders_) {
+    for (GLuint * buffer : {&order.state, &order.tile_dispatch, &order.gather_dispatch})
+    {
+      buffers.push_back(buffer);
+    }
+  }
+  for (GLuint * buffer : buffers) {
     if (*buffer != 0u) {
       glDeleteBuffers(1, buffer);
       *buffer = 0u;
@@ -407,6 +422,9 @@ void OpenGlViewPreparationCore::clear()
   scratch_bytes_ = 0u;
   readback_cursor_ = 0u;
   last_visible_ = -1;
+  current_ = -1;
+  building_ = -1;
+  build_step_ = 0;
 }
 
 bool OpenGlViewPreparationCore::uploadStaticData(
@@ -442,6 +460,10 @@ bool OpenGlViewPreparationCore::uploadStaticData(
     return false;
   }
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  // The orders' colours and survivors belong to the old data.
+  current_ = -1;
+  building_ = -1;
+  build_step_ = 0;
   error_.clear();
   return true;
 }
@@ -450,7 +472,19 @@ bool OpenGlViewPreparationCore::encode(
   const ViewParameters & parameters, const ProjectionParameters & projection,
   GLuint instances, GLuint draw_arguments, bool clear_tail)
 {
-  if (!ready() || count_ == 0 || !splats_ || !sh_dc_ || !sh_rest_ || !instances ||
+  return prepare(parameters, projection, instances, draw_arguments, clear_tail, false);
+}
+
+bool OpenGlViewPreparationCore::encodeIncremental(
+  const ViewParameters & parameters, const ProjectionParameters & projection,
+  GLuint instances, GLuint draw_arguments, bool clear_tail)
+{
+  return prepare(parameters, projection, instances, draw_arguments, clear_tail, current_ >= 0);
+}
+
+bool OpenGlViewPreparationCore::checkScene(const ViewParameters & parameters)
+{
+  if (!ready() || count_ == 0 || !splats_ || !sh_dc_ || !sh_rest_ ||
     parameters.count != count_)
   {
     error_ = "OpenGL view preparation is not fully configured";
@@ -460,104 +494,185 @@ bool OpenGlViewPreparationCore::encode(
     error_ = "OpenGL preparation supports spherical harmonics through degree 3";
     return false;
   }
+  return true;
+}
+
+bool OpenGlViewPreparationCore::prepare(
+  const ViewParameters & parameters, const ProjectionParameters & projection,
+  GLuint instances, GLuint draw_arguments, bool clear_tail, bool incremental)
+{
+  if (!checkScene(parameters) || !instances) {
+    if (!instances) {
+      error_ = "OpenGL view preparation has no instance buffer";
+    }
+    return false;
+  }
   const GLuint draw = draw_arguments ? draw_arguments : draw_arguments_;
+
+  // What this call builds: a whole order, or the next of four steps of one.
+  // Culling and colour run with the view the build started with, which the
+  // view block keeps until the next build starts.
+  Work work;
+  if (!incremental || building_ < 0) {
+    building_ = current_ == 0 ? 1 : 0;
+    build_step_ = 0;
+    work.cull = true;
+    updateBuffer(view_parameters_, &parameters, sizeof(parameters));
+  }
+  // Five steps of comparable cost on the full Garden scene: culling and
+  // compaction, each half of the colour, and each half of the sort.
+  if (!incremental) {
+    work.shade_parts = 1u;
+    work.first_bit = 0u;
+    work.end_bit = 32u;
+  } else if (build_step_ == 1 || build_step_ == 2) {
+    work.shade_parts = 2u;
+    work.shade_part = static_cast<std::uint32_t>(build_step_ - 1);
+  } else if (build_step_ == 3) {
+    work.end_bit = 16u;
+  } else if (build_step_ == 4) {
+    work.first_bit = 16u;
+    work.end_bit = 32u;
+  }
+  const Order & order = orders_[building_];
 
   pollReadbacks();
   GLint previous_program = 0;
   glGetIntegerv(GL_CURRENT_PROGRAM, &previous_program);
-  updateBuffer(view_parameters_, &parameters, sizeof(parameters));
   updateBuffer(projection_parameters_, &projection, sizeof(projection));
 
+  // Every boundary is marked whether or not its stage ran, so that a stage an
+  // incremental call skipped times as zero.
   mark(0);
-  use(programs_[0]);
-  bind(0, splats_); bind(1, keys_b_); bind(2, view_parameters_);
-  glDispatchCompute(groups(count_, 256u), 1, 1);
-  storageBarrier();
+  if (work.cull) {
+    use(programs_[0]);
+    bind(0, splats_); bind(1, staged_); bind(2, view_parameters_);
+    glDispatchCompute(groups(count_, 256u), 1, 1);
+    storageBarrier();
+  }
   mark(kMarkAfterKeys);
-
-  use(programs_[1]);
-  bind(0, keys_b_); bind(1, tile_counts_);
-  uniform("count", count_); uniform("tile_count", tile_count_);
-  uniform("elements_per_tile", kElementsPerTile);
-  glDispatchCompute(groups(tile_count_, 256u), 1, 1);
-  storageBarrier();
+  if (work.cull) {
+    use(programs_[1]);
+    bind(0, staged_); bind(1, tile_counts_);
+    uniform("count", count_); uniform("tile_count", tile_count_);
+    uniform("elements_per_tile", kElementsPerTile);
+    glDispatchCompute(groups(tile_count_, 256u), 1, 1);
+    storageBarrier();
+  }
   mark(kMarkAfterCompactCount);
-
-  use(programs_[2]);
-  bind(0, tile_counts_); bind(1, tile_offsets_); bind(2, state_);
-  bind(3, tile_dispatch_); bind(4, gather_dispatch_); bind(5, draw);
-  bind(6, clear_dispatch_);
-  uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
-  uniform("gather_width", kGatherWidth); uniform("index_count", index_count_);
-  glDispatchCompute(1, 1, 1);
-  glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+  if (work.cull) {
+    use(programs_[2]);
+    bind(0, tile_counts_); bind(1, tile_offsets_); bind(2, order.state);
+    bind(3, order.tile_dispatch); bind(4, order.gather_dispatch);
+    uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
+    uniform("gather_width", kGatherWidth);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+  }
   mark(kMarkAfterCompactScan);
-
-  use(programs_[3]);
-  bind(0, keys_b_); bind(1, keys_a_); bind(2, tile_offsets_);
-  uniform("count", count_); uniform("tile_count", tile_count_);
-  uniform("elements_per_tile", kElementsPerTile);
-  // Compaction must visit every source tile. The GPU-generated indirect
-  // count describes compacted tiles and is used only by the radix stages.
-  glDispatchCompute(tile_count_, 1, 1);
-  storageBarrier();
+  if (work.cull) {
+    use(programs_[3]);
+    bind(0, staged_); bind(1, pairs_); bind(2, tile_offsets_);
+    uniform("count", count_); uniform("tile_count", tile_count_);
+    uniform("elements_per_tile", kElementsPerTile);
+    // Compaction must visit every source tile. The GPU-generated indirect
+    // count describes compacted tiles and is used only by the radix stages.
+    glDispatchCompute(tile_count_, 1, 1);
+    storageBarrier();
+    build_step_ = 1;
+  }
   mark(1);
 
-  // Colour and project before the sort, while the survivors are still in
-  // index order; see GSPLAT_STAGE_SHADE_PROJECT. Rewrites keys_a_, the sort's
-  // input, to carry compacted slots.
-  use(programs_[10]);
-  bind(0, keys_a_); bind(1, splats_); bind(2, sh_dc_); bind(3, sh_rest_);
-  bind(4, state_); bind(5, projected_); bind(6, view_parameters_);
-  bind(7, projection_parameters_);
-  dispatchIndirect(gather_dispatch_);
-  storageBarrier();
+  // Colour and copy before the sort, while the survivors are still in index
+  // order; see GSPLAT_STAGE_SHADE_SLOTS. Rewrites the pairs, the sort's input,
+  // to carry compacted slots.
+  if (work.shade_parts > 0u) {
+    use(programs_[8]);
+    bind(0, pairs_); bind(1, splats_); bind(2, sh_dc_); bind(3, sh_rest_);
+    bind(4, order.state); bind(5, slots_); bind(6, view_parameters_);
+    uniform("part_index", work.shade_part); uniform("part_count", work.shade_parts);
+    // Sized for every survivor; invocations past the part return at once.
+    dispatchIndirect(order.gather_dispatch);
+    storageBarrier();
+    build_step_ = work.shade_part + 1u == work.shade_parts ? 3 : 2;
+  }
   mark(2);
 
-  // Four passes, so the sorted pairs end in keys_a_ again; sortedBuffer().
-  GLuint input = keys_a_;
-  GLuint output = keys_b_;
+  // Pairs of passes, so the sorted pairs end back in pairs_.
+  GLuint input = pairs_;
+  GLuint output = staged_;
   for (std::uint32_t shift = 0; shift < 32u; shift += 8u) {
     const std::size_t pass_mark = kMarkRadix + 4u * (shift / 8u);
-    use(programs_[4]);
-    bind(0, input); bind(1, histograms_); bind(2, state_);
-    uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
-    uniform("shift", shift);
-    dispatchIndirect(tile_dispatch_);
-    storageBarrier();
+    const bool run = shift >= work.first_bit && shift < work.end_bit;
+    if (run) {
+      use(programs_[4]);
+      bind(0, input); bind(1, histograms_); bind(2, order.state);
+      uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
+      uniform("shift", shift);
+      dispatchIndirect(order.tile_dispatch);
+      storageBarrier();
+    }
     mark(pass_mark);
-
-    use(programs_[5]);
-    bind(0, histograms_); bind(1, offsets_); bind(2, totals_); bind(3, state_);
-    uniform("tile_count", tile_count_);
-    glDispatchCompute(kRadix, 1, 1);
-    storageBarrier();
+    if (run) {
+      use(programs_[5]);
+      bind(0, histograms_); bind(1, offsets_); bind(2, totals_); bind(3, order.state);
+      uniform("tile_count", tile_count_);
+      glDispatchCompute(kRadix, 1, 1);
+      storageBarrier();
+    }
     mark(pass_mark + 1u);
-
-    use(programs_[6]);
-    bind(0, totals_); bind(1, digit_bases_);
-    glDispatchCompute(1, 1, 1);
-    storageBarrier();
+    if (run) {
+      use(programs_[6]);
+      bind(0, totals_); bind(1, digit_bases_);
+      glDispatchCompute(1, 1, 1);
+      storageBarrier();
+    }
     mark(pass_mark + 2u);
-
-    use(programs_[7]);
-    bind(0, input); bind(1, output); bind(2, offsets_); bind(3, digit_bases_); bind(4, state_);
-    uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
-    uniform("shift", shift);
-    dispatchIndirect(tile_dispatch_);
-    storageBarrier();
+    if (run) {
+      use(programs_[7]);
+      bind(0, input); bind(1, output); bind(2, offsets_); bind(3, digit_bases_);
+      bind(4, order.state);
+      uniform("tile_count", tile_count_); uniform("elements_per_tile", kElementsPerTile);
+      uniform("shift", shift);
+      dispatchIndirect(order.tile_dispatch);
+      storageBarrier();
+      std::swap(input, output);
+    }
     mark(pass_mark + 3u);
-    std::swap(input, output);
+  }
+  if (work.end_bit == 16u) {
+    build_step_ = 4;
+  }
+  if (work.end_bit == 32u) {
+    use(programs_[9]);
+    bind(0, pairs_); bind(1, slots_); bind(4, order.state); bind(5, drawn_);
+    // The passes write disjoint positions, so they need no barrier between them.
+    for (std::uint32_t first = 0; first < count_; first += kFinishSlotsPerPass) {
+      uniform("first_slot", first);
+      uniform("end_slot", first + std::min(kFinishSlotsPerPass, count_ - first));
+      dispatchIndirect(order.gather_dispatch);
+    }
+    storageBarrier();
+    current_ = building_;
+    building_ = -1;
+    build_step_ = 0;
   }
   mark(3);
 
-  use(programs_[8]);
-  bind(0, input); bind(1, projected_); bind(4, state_); bind(5, instances);
-  dispatchIndirect(gather_dispatch_);
+  const Order & drawn = orders_[current_];
+  use(programs_[10]);
+  bind(0, drawn.state); bind(1, instance_state_); bind(2, draw); bind(3, clear_dispatch_);
+  uniform("index_count", index_count_); uniform("gather_width", kGatherWidth);
+  glDispatchCompute(1, 1, 1);
+  glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+
+  use(programs_[11]);
+  bind(0, drawn_); bind(4, drawn.state); bind(5, instances); bind(6, projection_parameters_);
+  dispatchIndirect(drawn.gather_dispatch);
   if (clear_tail) {
     storageBarrier();
-    use(programs_[9]);
-    bind(0, state_); bind(1, instances);
+    use(programs_[12]);
+    bind(0, instance_state_); bind(1, instances);
     dispatchIndirect(clear_dispatch_);
   }
   glMemoryBarrier(
@@ -582,6 +697,11 @@ bool OpenGlViewPreparationCore::encode(
   }
   error_.clear();
   return true;
+}
+
+GLuint OpenGlViewPreparationCore::stateBuffer() const
+{
+  return current_ >= 0 ? orders_[current_].state : 0u;
 }
 
 std::size_t OpenGlViewPreparationCore::scratchBytes() const
@@ -746,7 +866,7 @@ void OpenGlViewPreparationCore::queueReadback()
   if (readback.fence) {
     return;
   }
-  glBindBuffer(GL_COPY_READ_BUFFER, state_);
+  glBindBuffer(GL_COPY_READ_BUFFER, stateBuffer());
   glBindBuffer(GL_COPY_WRITE_BUFFER, readback.buffer);
   glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, sizeof(std::uint32_t));
   readback.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);

@@ -120,7 +120,7 @@ int main(int argc, char ** argv)
             id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
             command_buffer.label = @"3DGS radix sort benchmark";
             id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-            id<MTLBuffer> sorted = core.encodeSort(encoder, key_bits);
+            const bool sorted = core.encodeSort(encoder, key_bits);
             [encoder endEncoding];
             [command_buffer commit];
             [command_buffer waitUntilCompleted];

@@ -5,7 +5,9 @@
 // prepareSplat() and projectSplat() from splat_view.hpp, on identical synthetic
 // scenes and views, and requires them to agree: the visible count, the draw
 // arguments, every entry of the depth order including ties, every colour, and
-// every projected quad within float rounding.
+// every projected quad within float rounding. Incremental preparation is held
+// to the same: while it builds an order it must draw the previous one exactly,
+// projected for the new camera, and then the new one.
 //
 // `colcon test` runs it through CTest with --quick. The full run adds a
 // Garden-sized scene (5,834,784 splats at degree 3, about 2.7 GB) and times
@@ -39,6 +41,7 @@
 namespace
 {
 using namespace gaussian_splatting_rviz_plugins::verification;
+using gaussian_splatting_rviz_plugins::DrawnSplat;
 using gaussian_splatting_rviz_plugins::MetalViewPreparationCore;
 using gaussian_splatting_rviz_plugins::ProjectedInstance;
 using gaussian_splatting_rviz_plugins::ProjectionParameters;
@@ -77,18 +80,24 @@ bool load(Context & context, const Scene & scene, id<MTLCommandBuffer> last_user
 struct Run
 {
   id<MTLCommandBuffer> command_buffer = nil;
-  id<MTLBuffer> sorted = nil;
+  bool encoded = false;
   double encode_ms = 0.0;
   double gpu_ms = 0.0;
 };
 
-Run prepare(Context & context, const ViewParameters & view, const ProjectionParameters & projection)
+// One preparation in a command buffer of its own: a full one, or a frame of
+// incremental preparation.
+Run prepare(
+  Context & context, const ViewParameters & view, const ProjectionParameters & projection,
+  bool incremental = false)
 {
   Run run;
   run.command_buffer = [context.queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [run.command_buffer computeCommandEncoder];
   const auto start = std::chrono::steady_clock::now();
-  run.sorted = context.core->encode(encoder, view, projection, context.instances, context.draw);
+  run.encoded = incremental ?
+    context.core->encodeIncremental(encoder, view, projection, context.instances, context.draw) :
+    context.core->encode(encoder, view, projection, context.instances, context.draw);
   run.encode_ms = milliseconds(std::chrono::steady_clock::now() - start);
   [encoder endEncoding];
   [run.command_buffer commit];
@@ -97,14 +106,15 @@ Run prepare(Context & context, const ViewParameters & view, const ProjectionPara
   return run;
 }
 
-bool verify(
+// Checks the draw stream `run` left against the CPU path for `view`: its order
+// and colours, projected with `projection`.
+bool check(
   const char * name, Context & context, const Scene & scene, const ViewParameters & view,
-  const ProjectionParameters & projection, Run * finished = nullptr)
+  const ProjectionParameters & projection, const Run & run)
 {
   const Reference reference = cpuReference(scene, view);
-  Run run = prepare(context, view, projection);
-  if (!run.sorted || run.command_buffer.status != MTLCommandBufferStatusCompleted) {
-    std::printf("%-34s FAIL: %s\n", name, run.sorted ?
+  if (!run.encoded || run.command_buffer.status != MTLCommandBufferStatusCompleted) {
+    std::printf("%-34s FAIL: %s\n", name, run.encoded ?
       run.command_buffer.error.localizedDescription.UTF8String : context.core->error().c_str());
     return false;
   }
@@ -112,10 +122,9 @@ bool verify(
   const auto * state =
     static_cast<const MetalViewPreparationCore::State *>(context.core->stateBuffer().contents);
   const auto * arguments = static_cast<const DrawIndexedArguments *>(context.draw.contents);
-  const auto * pairs = static_cast<const std::uint32_t *>(run.sorted.contents);
-  // The sort carries compacted slots; this maps each back to its splat.
-  const auto * slot_splats =
-    static_cast<const std::uint32_t *>(context.core->slotSplatBuffer().contents);
+  // The order keeps each survivor's key and splat index in draw order.
+  const auto * order =
+    static_cast<const DrawnSplat *>(context.core->drawnBuffer().contents);
   const auto * drawn = static_cast<const ProjectedInstance *>(context.instances.contents);
 
   std::size_t order_bad = 0, key_bad = 0, quad_bad = 0, nonfinite = 0, colour_bad = 0;
@@ -127,14 +136,13 @@ bool verify(
   for (std::size_t i = 0; i < checked; ++i) {
     const std::uint32_t want_key = std::uint32_t(reference.order[i] >> 32);
     const std::uint32_t want_splat = std::uint32_t(reference.order[i]);
-    const std::uint32_t slot = pairs[2 * i + 1];
-    if (slot >= state->visible || slot_splats[slot] != want_splat) {
+    if (order[i].splat != want_splat) {
       ++order_bad;
       if (first_bad < 0) {
         first_bad = long(i);
       }
     }
-    key_bad += pairs[2 * i] != want_key;
+    key_bad += order[i].key != want_key;
     ProjectedInstance expected;
     projectSplat(
       projection, scene.records[want_splat], &reference.colours[std::size_t(want_splat) * 3],
@@ -188,20 +196,52 @@ bool verify(
     printQuad("cpu", expected);
   }
   std::fflush(stdout);
+  return pass;
+}
+
+bool verify(
+  const char * name, Context & context, const Scene & scene, const ViewParameters & view,
+  const ProjectionParameters & projection, Run * finished = nullptr)
+{
+  const Run run = prepare(context, view, projection);
   if (finished) {
     *finished = run;
   }
-  return pass;
+  return check(name, context, scene, view, projection, run);
+}
+
+// Incremental preparation from an order for `from` towards one for `to`,
+// projecting every frame with `projection`: four frames drawing the old order
+// while the new one is built, then the frame that completes it.
+int verifyIncremental(
+  Context & context, const Scene & scene, const ViewParameters & from,
+  const ViewParameters & to, const ProjectionParameters & projection)
+{
+  int failures = !verify("  incremental: starting order", context, scene, from, projection);
+  const char * names[4] = {"  incremental: culling, old order",
+    "  incremental: half coloured, old order", "  incremental: coloured, old order",
+    "  incremental: half sorted, old order"};
+  for (const char * name : names) {
+    failures += !check(name, context, scene, from, projection,
+      prepare(context, to, projection, true));
+  }
+  failures += !check("  incremental: new order", context, scene, to, projection,
+    prepare(context, to, projection, true));
+  return failures;
 }
 
 void timeStages(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection)
 {
-  std::vector<double> encode, whole, cull, shade, sort, gather;
+  std::vector<double> encode, whole, cull, shade, sort, gather, frames;
   for (int rep = 0; rep < 7; ++rep) {
     const Run run = prepare(context, view, projection);
     encode.push_back(run.encode_ms);
     whole.push_back(run.gpu_ms);
+  }
+  // Incremental frames: every step of a build, in turn, and the draw.
+  for (int frame = 0; frame < 30; ++frame) {
+    frames.push_back(prepare(context, view, projection, true).gpu_ms);
   }
   const auto stage = [&](auto && body) {
       id<MTLCommandBuffer> command_buffer = [context.queue commandBuffer];
@@ -213,18 +253,17 @@ void timeStages(
       return (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
     };
   for (int rep = 0; rep < 7; ++rep) {
-    id<MTLBuffer> sorted = nil;
     cull.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
-        context.core->encodeCull(encoder, view, context.draw);
+        context.core->encodeCull(encoder, view);
       }));
     shade.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
-        context.core->encodeShade(encoder, view, projection);
+        context.core->encodeShade(encoder);
       }));
     sort.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
-        sorted = context.core->encodeSort(encoder);
+        context.core->encodeSort(encoder);
       }));
     gather.push_back(stage([&](id<MTLComputeCommandEncoder> encoder) {
-        context.core->encodeGather(encoder, sorted, context.instances);
+        context.core->encodeGather(encoder, projection, context.instances, context.draw);
       }));
   }
   const auto * state =
@@ -233,8 +272,10 @@ void timeStages(
   std::printf("  CPU encode of one preparation      %8.3f ms\n", median(encode));
   std::printf("  GPU, one command buffer as shipped %8.2f ms\n", median(whole));
   std::printf(
-    "  GPU by stage: cull+compact %.2f | shade+project %.2f | sort %.2f | gather %.2f ms\n",
+    "  GPU by stage: cull+compact %.2f | shade %.2f | sort %.2f | project+gather %.2f ms\n",
     median(cull), median(shade), median(sort), median(gather));
+  std::printf("  GPU per incremental frame: median %.2f, largest %.2f ms\n", median(frames),
+    *std::max_element(frames.begin(), frames.end()));
   std::printf("  preparation scratch buffers %.0f MiB\n\n",
     double(context.core->scratchBytes()) / (1024.0 * 1024.0));
 }
@@ -313,6 +354,17 @@ int main(int argc, char ** argv)
         } else {
           failures += !verify("  re-uploaded in place", context, scene, view, projection);
         }
+
+        // Another view and camera: a different sort axis and a narrower
+        // frustum for the order, a different viewport for the projection.
+        ProjectionParameters moved = projection;
+        moved.viewport_size[0] = 1600.0f;
+        moved.viewport_size[1] = 900.0f;
+        moved.viewport_size[2] = 1.0f / 1600.0f;
+        moved.viewport_size[3] = 1.0f / 900.0f;
+        moved.fovy = 0.8f;
+        failures += verifyIncremental(context, scene, view,
+          makeView(scene, c.flags, c.far_clip, c.dx + 0.3f, c.dy, c.dz, 2.0f), moved);
       }
       if (!quick && c.count == kGardenCount) {
         timeStages(context, view, projection);

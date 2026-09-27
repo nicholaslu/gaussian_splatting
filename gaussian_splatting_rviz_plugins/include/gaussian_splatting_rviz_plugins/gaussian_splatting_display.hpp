@@ -108,6 +108,7 @@ private:
 
   rviz_common::properties::FloatProperty * sigma_radius_property_ = nullptr;
   rviz_common::properties::BoolProperty * culling_property_ = nullptr;
+  rviz_common::properties::BoolProperty * incremental_property_ = nullptr;
   rviz_common::properties::FloatProperty * min_screen_radius_property_ = nullptr;
   rviz_common::properties::BoolProperty * offscreen_property_ = nullptr;
   rviz_common::properties::FloatProperty * render_scale_property_ = nullptr;
@@ -208,6 +209,9 @@ private:
   float last_min_screen_radius_ = -1.0f;
   bool last_culling_enabled_ = false;
   bool using_gpu_preparation_ = false;
+  // Whether the draw order was built for the current camera, rather than for
+  // one a few frames back by incremental preparation.
+  bool order_exact_ = false;
   // The mesh holds ProjectedInstance records rather than DrawInstance ones.
   bool gpu_projected_ = false;
   ProjectionParameters last_projection_{};

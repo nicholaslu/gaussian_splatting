@@ -42,6 +42,7 @@
 namespace
 {
 using namespace gaussian_splatting_rviz_plugins::verification;
+using gaussian_splatting_rviz_plugins::DrawnSplat;
 using gaussian_splatting_rviz_plugins::OpenGlViewPreparationCore;
 using gaussian_splatting_rviz_plugins::ProjectedInstance;
 using gaussian_splatting_rviz_plugins::ProjectionParameters;
@@ -135,13 +136,15 @@ bool load(Context & context, const Scene & scene)
 }
 
 // One preparation as the display encodes it on stock Ogre: the core's own draw
-// arguments, and the tail cleared.
+// arguments, and the tail cleared. `incremental` makes it a frame of
+// incremental preparation.
 bool prepare(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection,
-  double * gpu_ms = nullptr)
+  double * gpu_ms = nullptr, bool incremental = false)
 {
   const auto start = std::chrono::steady_clock::now();
-  const bool encoded =
+  const bool encoded = incremental ?
+    context.core->encodeIncremental(view, projection, context.instances, 0u, true) :
     context.core->encode(view, projection, context.instances, 0u, true);
   glFinish();
   if (gpu_ms) {
@@ -158,13 +161,18 @@ bool emptyInstance(const ProjectedInstance & q)
          q.colour[2] == 0.0f && q.colour[3] == 0.0f;
 }
 
+// Prepares for `prepared`, fully or as one incremental frame, and checks the
+// draw stream against the CPU path for `view`: its order and colours,
+// projected with `projection`. The two views differ only while an incremental
+// build is under way.
 bool verify(
   const char * name, Context & context, const Scene & scene, const ViewParameters & view,
-  const ProjectionParameters & projection)
+  const ProjectionParameters & projection, const ViewParameters * prepared = nullptr,
+  bool incremental = false)
 {
   const Reference reference = cpuReference(scene, view);
   double gpu_ms = 0.0;
-  if (!prepare(context, view, projection, &gpu_ms)) {
+  if (!prepare(context, prepared ? *prepared : view, projection, &gpu_ms, incremental)) {
     std::printf("%-34s FAIL: %s\n", name, context.core->error().c_str());
     return false;
   }
@@ -173,22 +181,14 @@ bool verify(
     readBuffer<OpenGlViewPreparationCore::State>(context.core->stateBuffer(), 1)[0];
   const auto arguments =
     readBuffer<DrawIndexedArguments>(context.core->drawArgumentsBuffer(), 1)[0];
-  const auto pairs = readBuffer<std::uint32_t>(
-    context.core->sortedBuffer(), std::size_t(std::min(state.visible, scene.count)) * 2u);
+  const auto order = readBuffer<DrawnSplat>(
+    context.core->drawnBuffer(), std::size_t(std::min(state.visible, scene.count)));
   const auto drawn = readBuffer<ProjectedInstance>(context.instances, scene.count);
 
-  // The sort carries compacted slots, and compaction keeps index order, so
-  // slot k is the k-th survivor by index - the CPU's survivors, if the GPU
-  // kept the same ones, which the visible count checks.
-  std::vector<std::uint32_t> survivors;
-  survivors.reserve(reference.order.size());
   std::vector<std::size_t> rank(scene.count, std::numeric_limits<std::size_t>::max());
   for (std::size_t i = 0; i < reference.order.size(); ++i) {
-    const std::uint32_t splat = std::uint32_t(reference.order[i]);
-    survivors.push_back(splat);
-    rank[splat] = i;
+    rank[std::uint32_t(reference.order[i])] = i;
   }
-  std::sort(survivors.begin(), survivors.end());
 
   std::size_t order_bad = 0, key_bad = 0, sort_bad = 0, quad_bad = 0, colour_bad = 0;
   std::size_t nonfinite = 0, tail_bad = 0, max_shift = 0;
@@ -200,17 +200,16 @@ bool verify(
   double worst_quad = 0.0;
   const std::size_t checked = std::min<std::size_t>(state.visible, reference.order.size());
   for (std::size_t i = 0; i < checked; ++i) {
-    const std::uint32_t key = pairs[2 * i];
-    const std::uint32_t slot = pairs[2 * i + 1];
+    // The order keeps each survivor's key and splat index; ties must stay in
+    // index order.
+    const std::uint32_t key = order[i].key;
+    const std::uint32_t splat = order[i].splat;
     if (i > 0) {
-      const std::uint32_t previous_key = pairs[2 * i - 2];
-      const std::uint32_t previous_slot = pairs[2 * i - 1];
-      sort_bad += !(key > previous_key || (key == previous_key && slot > previous_slot));
+      sort_bad += !(key > order[i - 1].key ||
+        (key == order[i - 1].key && splat > order[i - 1].splat));
     }
     const std::uint32_t want_key = std::uint32_t(reference.order[i] >> 32);
     const std::uint32_t want_splat = std::uint32_t(reference.order[i]);
-    const std::uint32_t splat =
-      slot < survivors.size() ? survivors[slot] : std::numeric_limits<std::uint32_t>::max();
     if (splat != want_splat) {
       ++order_bad;
       if (first_bad < 0) {
@@ -287,6 +286,24 @@ bool verify(
   return pass;
 }
 
+// Incremental preparation from an order for `from` towards one for `to`,
+// projecting every frame with `projection`: four frames drawing the old order
+// while the new one is built, then the frame that completes it.
+int verifyIncremental(
+  Context & context, const Scene & scene, const ViewParameters & from,
+  const ViewParameters & to, const ProjectionParameters & projection)
+{
+  int failures = !verify("  incremental: starting order", context, scene, from, projection);
+  const char * names[4] = {"  incremental: culling, old order",
+    "  incremental: half coloured, old order", "  incremental: coloured, old order",
+    "  incremental: half sorted, old order"};
+  for (const char * name : names) {
+    failures += !verify(name, context, scene, from, projection, &to, true);
+  }
+  failures += !verify("  incremental: new order", context, scene, to, projection, &to, true);
+  return failures;
+}
+
 void timeStages(
   Context & context, const ViewParameters & view, const ProjectionParameters & projection)
 {
@@ -317,14 +334,22 @@ void timeStages(
     radix_scan.push_back(timings.radix_scan_ms);
     radix_scatter.push_back(timings.radix_scatter_ms);
   }
+  std::vector<double> frames;
+  for (int frame = 0; frame < 30; ++frame) {
+    prepare(context, view, projection, nullptr, true);
+    const OpenGlViewPreparationCore::Timings & timings = context.core->lastTimings();
+    frames.push_back(timings.cull_ms + timings.shade_ms + timings.sort_ms + timings.gather_ms);
+  }
   context.core->setProfiling(false);
   const auto state =
     readBuffer<OpenGlViewPreparationCore::State>(context.core->stateBuffer(), 1)[0];
   std::printf("\nTiming, median of 7, %u of %u visible:\n", state.visible, view.count);
   std::printf("  encode and glFinish, as shipped     %8.2f ms\n", median(whole));
   std::printf(
-    "  GPU by stage: cull+compact %.2f | shade+project %.2f | sort %.2f | gather %.2f ms\n",
+    "  GPU by stage: cull+compact %.2f | shade %.2f | sort %.2f | project+gather %.2f ms\n",
     median(cull), median(shade), median(sort), median(gather));
+  std::printf("  GPU per incremental frame: median %.2f, largest %.2f ms\n", median(frames),
+    *std::max_element(frames.begin(), frames.end()));
   std::printf(
     "    cull: keys %.2f | compact count %.2f | compact scan %.2f | compact scatter %.2f ms\n",
     median(keys), median(compact_count), median(compact_scan), median(compact_scatter));
@@ -425,6 +450,17 @@ int main(int argc, char ** argv)
       } else {
         failures += !verify("  re-uploaded in place", context, scene, view, projection);
       }
+
+      // Another view and camera: a different sort axis and a narrower
+      // frustum for the order, a different viewport for the projection.
+      ProjectionParameters moved = projection;
+      moved.viewport_size[0] = 1600.0f;
+      moved.viewport_size[1] = 900.0f;
+      moved.viewport_size[2] = 1.0f / 1600.0f;
+      moved.viewport_size[3] = 1.0f / 900.0f;
+      moved.fovy = 0.8f;
+      failures += verifyIncremental(context, scene, view,
+        makeView(scene, c.flags, c.far_clip, c.dx + 0.3f, c.dy, c.dz, 2.0f), moved);
     }
     if (!quick && c.count == kGardenCount) {
       timeStages(context, view, projection);

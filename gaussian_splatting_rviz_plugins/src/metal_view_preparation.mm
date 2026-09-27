@@ -145,7 +145,8 @@ public:
   }
 
   bool encode(
-    const ViewParameters & parameters, const ProjectionParameters & projection) override
+    const ViewParameters & parameters, const ProjectionParameters & projection,
+    bool incremental) override
   {
     if (!core_ || !instance_buffer_ || !indirect_buffer_) {
       error_ = "Metal view preparation is not fully configured";
@@ -161,8 +162,8 @@ public:
       error_ = "Ogre did not expose the Metal output buffers";
       return false;
     }
-    return profiling_ ? encodeProfiled(parameters, projection, instances, draw) :
-           encodeInFrame(parameters, projection, instances, draw);
+    return profiling_ ? encodeProfiled(parameters, projection, instances, draw, incremental) :
+           encodeInFrame(parameters, projection, instances, draw, incremental);
   }
 
   std::int64_t lastVisibleCount() const override
@@ -206,7 +207,7 @@ public:
 private:
   bool encodeInFrame(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    id<MTLBuffer> instances, id<MTLBuffer> draw)
+    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental)
   {
     id<MTLComputeCommandEncoder> encoder = device_->getComputeEncoder();
     id<MTLCommandBuffer> command_buffer = device_->mCurrentCommandBuffer;
@@ -218,7 +219,10 @@ private:
     // A later Ogre render encoder consumes the instance and draw buffers. Ogre
     // ends this compute encoder when it asks its device for that render
     // encoder, which keeps both in order within the same command buffer.
-    if (!core_->encode(encoder, parameters, projection, instances, draw)) {
+    const bool encoded = incremental ?
+      core_->encodeIncremental(encoder, parameters, projection, instances, draw) :
+      core_->encode(encoder, parameters, projection, instances, draw);
+    if (!encoded) {
       error_ = core_->error();
       return false;
     }
@@ -243,7 +247,7 @@ private:
 
   bool encodeProfiled(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    id<MTLBuffer> instances, id<MTLBuffer> draw)
+    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental)
   {
     id<MTLCommandQueue> queue = device_->mMainCommandQueue;
     if (!queue) {
@@ -266,29 +270,36 @@ private:
         return (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
       };
 
-    id<MTLBuffer> sorted = nil;
     StageTimes times;
-    times.cull_ms = stage(@"Gaussian splat preparation: cull and compact",
+    if (incremental && core_->hasOrder()) {
+      // One build step, timed as the stage it belongs to.
+      using Step = MetalViewPreparationCore::BuildStep;
+      Step step = Step::kFailed;
+      const double ms = stage(@"Gaussian splat preparation: build step",
+          [&](id<MTLComputeCommandEncoder> encoder) {
+            step = core_->encodeBuildStep(encoder, parameters);
+            return step != Step::kFailed;
+          });
+      (step == Step::kCull ? times.cull_ms : step == Step::kShade ? times.shade_ms :
+      times.sort_ms) = ms;
+    } else {
+      times.cull_ms = stage(@"Gaussian splat preparation: cull and compact",
+          [&](id<MTLComputeCommandEncoder> encoder) {
+            return core_->encodeCull(encoder, parameters);
+          });
+      times.shade_ms = stage(@"Gaussian splat preparation: shade",
+          [&](id<MTLComputeCommandEncoder> encoder) {
+            core_->encodeShade(encoder);
+            return true;
+          });
+      times.sort_ms = stage(@"Gaussian splat preparation: sort",
+          [&](id<MTLComputeCommandEncoder> encoder) {
+            return core_->encodeSort(encoder, 32u);
+          });
+    }
+    times.gather_ms = stage(@"Gaussian splat preparation: project and gather",
         [&](id<MTLComputeCommandEncoder> encoder) {
-          return core_->encodeCull(encoder, parameters, draw);
-        });
-    times.shade_ms = stage(@"Gaussian splat preparation: shade",
-        [&](id<MTLComputeCommandEncoder> encoder) {
-          core_->encodeShade(encoder, parameters, projection);
-          return true;
-        });
-    times.sort_ms = stage(@"Gaussian splat preparation: sort",
-        [&](id<MTLComputeCommandEncoder> encoder) {
-          sorted = core_->encodeSort(encoder, 32u);
-          return sorted != nil;
-        });
-    times.gather_ms = stage(@"Gaussian splat preparation: gather",
-        [&](id<MTLComputeCommandEncoder> encoder) {
-          if (!sorted) {
-            return false;
-          }
-          core_->encodeGather(encoder, sorted, instances);
-          return true;
+          return core_->encodeGather(encoder, projection, instances, draw);
         });
     if (!ok) {
       error_ = core_->error().empty() ? "a GPU preparation stage failed" : core_->error();
@@ -296,7 +307,7 @@ private:
     }
     times_ = times;
     if (debug_projection_ && debug_frame_++ % 60 == 0) {
-      dumpProjection(projection, sorted, instances);
+      dumpProjection(projection, instances);
     }
     report_->visible.store(
       static_cast<const MetalViewPreparationCore::State *>(core_->stateBuffer().contents)->visible);
@@ -307,8 +318,7 @@ private:
 
   // GSPLAT_DEBUG_PROJECTION: what the GPU wrote for a few sorted splats, next
   // to projectSplat() on the same records, with the parameters both used.
-  void dumpProjection(
-    const ProjectionParameters & q, id<MTLBuffer> sorted, id<MTLBuffer> instances)
+  void dumpProjection(const ProjectionParameters & q, id<MTLBuffer> instances)
   {
     const auto * state =
       static_cast<const MetalViewPreparationCore::State *>(core_->stateBuffer().contents);
@@ -325,22 +335,20 @@ private:
         q.worldviewproj_rows[r * 4 + 3]);
     }
     id<MTLBuffer> splats = core_->splatBuffer();
-    id<MTLBuffer> slots = core_->slotSplatBuffer();
-    if (!sorted.contents || !instances.contents || !splats.contents || !slots.contents) {
-      std::fprintf(stderr, "[gsplat debug]   buffers are not CPU-visible (sorted %p instances %p "
-        "splats %p slots %p)\n", sorted.contents, instances.contents, splats.contents,
-        slots.contents);
+    id<MTLBuffer> drawn_order = core_->drawnBuffer();
+    if (!instances.contents || !splats.contents || !drawn_order.contents) {
+      std::fprintf(stderr, "[gsplat debug]   buffers are not CPU-visible (instances %p splats %p "
+        "order %p)\n", instances.contents, splats.contents, drawn_order.contents);
       return;
     }
-    const auto * pairs = static_cast<const std::uint32_t *>(sorted.contents);
-    const auto * slot_splats = static_cast<const std::uint32_t *>(slots.contents);
+    const auto * order = static_cast<const DrawnSplat *>(drawn_order.contents);
     const auto * drawn = static_cast<const ProjectedInstance *>(instances.contents);
     const auto * records = static_cast<const SplatRecord *>(splats.contents);
     const std::uint32_t visible = state->visible;
     const std::uint32_t picks[3] = {0u, visible / 2u, visible > 0 ? visible - 1u : 0u};
     for (std::uint32_t k = 0; k < (visible > 0 ? 3u : 0u); ++k) {
       const std::uint32_t output = picks[k];
-      const std::uint32_t index = slot_splats[pairs[2 * output + 1]];
+      const std::uint32_t index = order[output].splat;
       const SplatRecord & record = records[index];
       const float no_colour[3] = {0.0f, 0.0f, 0.0f};
       ProjectedInstance cpu;

@@ -46,8 +46,15 @@ public:
     const float * sh_dc, std::size_t sh_dc_floats,
     const float * sh_rest, std::size_t sh_rest_floats) = 0;
 
+  // One preparation. A full one builds a draw order for `parameters` and
+  // draws from it. An incremental one takes one step of building the next
+  // order, started for `parameters` if none is under way, and draws the newest
+  // complete order projected with `projection`: much cheaper per frame, while
+  // the order and the colours lag the camera by a few frames. The first
+  // preparation after configure() or an upload is always full.
   virtual bool encode(
-    const ViewParameters & parameters, const ProjectionParameters & projection) = 0;
+    const ViewParameters & parameters, const ProjectionParameters & projection,
+    bool incremental) = 0;
 
   // Implementations may update this asynchronously. A negative value means
   // that no completed preparation has reported a count yet.

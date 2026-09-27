@@ -1,5 +1,6 @@
-// GPU view preparation for the Gaussian splat display: cull, compact, sort and
-// gather, encoded into the frame's command buffer with no CPU readback.
+// GPU view preparation for the Gaussian splat display: cull, compact, shade,
+// sort and project, encoded into the frame's command buffer with no CPU
+// readback.
 //
 // The per-splat arithmetic mirrors prepareSplat() in splat_view.hpp and the
 // structs mirror that header's layouts; test/verify_gpu_preparation.mm checks
@@ -235,16 +236,14 @@ kernel void compact_count(
 }
 
 // Stage 2b: where each tile's survivors start in the compacted buffer, and
-// every count the later stages need - the visible total, how many tiles and
-// gather threadgroups it spans, and the arguments Ogre's indirect draw reads.
-// One thread; a scan over a few thousand tiles.
+// every count the later stages need: the visible total, and how many tiles and
+// gather threadgroups it spans.
 kernel void compact_scan(
   device const uint * tile_counts [[buffer(0)]],
   device uint * tile_offsets [[buffer(1)]],
   device PreparationState * state [[buffer(2)]],
   device DispatchArguments * tile_dispatch [[buffer(3)]],
   device DispatchArguments * gather_dispatch [[buffer(4)]],
-  device DrawIndexedArguments * draw [[buffer(5)]],
   constant ScanParameters & parameters [[buffer(6)]],
   uint lane [[thread_index_in_threadgroup]])
 {
@@ -288,12 +287,6 @@ kernel void compact_scan(
   gather_dispatch->threadgroups[0] = max(gather_groups, 1u);
   gather_dispatch->threadgroups[1] = 1u;
   gather_dispatch->threadgroups[2] = 1u;
-
-  draw->index_count = parameters.index_count;
-  draw->instance_count = visible;
-  draw->index_start = 0u;
-  draw->base_vertex = 0;
-  draw->base_instance = 0u;
 }
 
 // Stage 2c: moves each tile's survivors, in index order, to the tile's offset
@@ -602,50 +595,119 @@ static ProjectedInstance projectSplat(
   return out;
 }
 
-// Stage 3: every survivor coloured and projected, between compaction and the
-// sort. The compacted list is still in index order here, so the splat records
-// and the spherical harmonics - by far the scene's largest arrays - are read in
-// the order they are stored. After the sort the same reads land in depth order,
-// scattered over the whole scene: on an RTX 4090 with the full Garden scene,
-// evaluating SH there made the gather 24 times slower. Each result goes to the
-// survivor's compacted slot, and the slot replaces the splat index as the
-// sort's value, so the gather only permutes a buffer the size of the visible
-// set. The sort is stable and slots follow index order, so the draw order is
-// unchanged. slot_splats keeps each slot's splat index for diagnostics.
-kernel void shade_project(
+// One survivor as the draw needs it: the splat's record, its colour for the
+// view the order was built for, and, for diagnostics, its depth key and index.
+// Mirrors DrawnSplat in splat_view.hpp.
+struct DrawnSplat
+{
+  float4 position_opacity;
+  float4 scale_red;
+  float4 quat;
+  float2 green_blue;
+  uint key;
+  uint splat;
+};
+
+// Stage 3: every survivor coloured, between compaction and the sort. The
+// compacted list is still in index order here, so the splat records and the
+// spherical harmonics - by far the scene's largest arrays - are read in the
+// order they are stored. After the sort the same reads land in depth order,
+// scattered over the whole scene, which on an RTX 4090 with the full Garden
+// scene cost more than twenty times as much once the scene outgrows what the
+// GPU can reach quickly. So each survivor's record goes to its compacted slot
+// along with its colour, and the slot replaces the splat index as the sort's
+// value. The sort is stable and slots follow index order, so the draw order is
+// unchanged. `part` is (which, of how many): incremental preparation shades
+// half the survivors a frame.
+kernel void shade_slots(
   device uint2 * compacted [[buffer(0)]],
   device const SplatRecord * splats [[buffer(1)]],
   device const float * sh_dc [[buffer(2)]],
   device const float * sh_rest [[buffer(3)]],
   device const PreparationState & state [[buffer(4)]],
-  device ProjectedInstance * projected [[buffer(5)]],
+  device DrawnSplat * slots [[buffer(5)]],
   constant ViewParameters & p [[buffer(6)]],
-  constant ProjectionParameters & q [[buffer(7)]],
-  device uint * slot_splats [[buffer(8)]],
-  uint slot [[thread_position_in_grid]])
+  constant uint2 & part [[buffer(7)]],
+  uint index [[thread_position_in_grid]])
 {
-  if (slot >= state.visible) {
+  const uint share = state.visible / part.y;
+  const uint spare = state.visible % part.y;
+  const uint begin = part.x * share + min(part.x, spare);
+  const uint end = begin + share + (part.x < spare ? 1u : 0u);
+  const uint slot = begin + index;
+  if (slot >= end) {
     return;
   }
-  const uint index = compacted[slot].y;
-  const SplatRecord splat = splats[index];
-  const float3 colour = evaluateSH(index, float3(splat.position), sh_dc, sh_rest, p);
-  projected[slot] = projectSplat(splat, colour, q);
-  slot_splats[slot] = index;
+  const uint2 pair = compacted[slot];
+  const SplatRecord splat = splats[pair.y];
+  const float3 colour = evaluateSH(pair.y, float3(splat.position), sh_dc, sh_rest, p);
+  DrawnSplat drawn;
+  drawn.position_opacity = float4(float3(splat.position), splat.opacity);
+  drawn.scale_red = float4(float3(splat.scale), colour.x);
+  drawn.quat = splat.quat;
+  drawn.green_blue = colour.yz;
+  drawn.key = pair.x;
+  drawn.splat = pair.y;
+  slots[slot] = drawn;
   compacted[slot].y = slot;
 }
 
-// Stage 5: the draw stream in depth order, a permutation of what shade_project
-// wrote, so the vertex program only has to place each quad's corners.
-kernel void gather_instances(
+// Stage 4b, completing an order: the survivors in draw order, so that drawing
+// from the order reads them in sequence. This is the one permutation per
+// order, and it reads the slots at random. Random reads over a large enough
+// buffer fall off a cliff: on an RTX 4090 they took 0.9 ms spread over 110 MB
+// and 22 ms over 280 MB. So the permutation runs in passes, each moving only
+// the survivors whose slots fall in [first_slot, end_slot), a range small
+// enough to stay on the near side.
+kernel void finish_order(
   device const uint2 * sorted [[buffer(0)]],
-  device const ProjectedInstance * projected [[buffer(1)]],
+  device const DrawnSplat * slots [[buffer(1)]],
   device const PreparationState & state [[buffer(4)]],
-  device ProjectedInstance * instances [[buffer(5)]],
+  device DrawnSplat * drawn [[buffer(5)]],
+  constant uint2 & slot_range [[buffer(6)]],
   uint output [[thread_position_in_grid]])
 {
   if (output >= state.visible) {
     return;
   }
-  instances[output] = projected[sorted[output].y];
+  const uint slot = sorted[output].y;
+  if (slot >= slot_range.x && slot < slot_range.y) {
+    drawn[output] = slots[slot];
+  }
+}
+
+// Stage 5: the draw stream, each survivor of an order projected for this
+// frame's camera with the colour the order was built with. Incremental
+// preparation runs only this stage on most frames, against an order built for
+// a camera a few frames old, so the projection always follows the camera
+// exactly while the order and the view-dependent colour lag it slightly. It
+// reads and writes in sequence. The first thread also writes the indirect draw
+// arguments.
+kernel void reproject_gather(
+  device const DrawnSplat * drawn [[buffer(0)]],
+  device const PreparationState & state [[buffer(4)]],
+  device ProjectedInstance * instances [[buffer(5)]],
+  constant ProjectionParameters & q [[buffer(6)]],
+  device DrawIndexedArguments * draw [[buffer(7)]],
+  constant uint & index_count [[buffer(8)]],
+  uint output [[thread_position_in_grid]])
+{
+  if (output == 0) {
+    draw->index_count = index_count;
+    draw->instance_count = state.visible;
+    draw->index_start = 0u;
+    draw->base_vertex = 0;
+    draw->base_instance = 0u;
+  }
+  if (output >= state.visible) {
+    return;
+  }
+  const DrawnSplat d = drawn[output];
+  SplatRecord splat;
+  splat.position = packed_float3(d.position_opacity.xyz);
+  splat.opacity = d.position_opacity.w;
+  splat.scale = packed_float3(d.scale_red.xyz);
+  splat.pad0 = 0.0;
+  splat.quat = d.quat;
+  instances[output] = projectSplat(splat, float3(d.scale_red.w, d.green_blue), q);
 }

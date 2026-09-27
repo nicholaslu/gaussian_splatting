@@ -154,13 +154,18 @@ public:
   }
 
   bool encode(
-    const ViewParameters & parameters, const ProjectionParameters & projection) override
+    const ViewParameters & parameters, const ProjectionParameters & projection,
+    bool incremental) override
   {
     if (!core_ || !instance_gl_) {
       error_ = "OpenGL view preparation is not fully configured";
       return false;
     }
-    if (!core_->encode(parameters, projection, instance_gl_, indirect_gl_, !kOgreIndirectDraw)) {
+    const bool encoded = incremental ?
+      core_->encodeIncremental(
+      parameters, projection, instance_gl_, indirect_gl_, !kOgreIndirectDraw) :
+      core_->encode(parameters, projection, instance_gl_, indirect_gl_, !kOgreIndirectDraw);
+    if (!encoded) {
       error_ = core_->error();
       return false;
     }
