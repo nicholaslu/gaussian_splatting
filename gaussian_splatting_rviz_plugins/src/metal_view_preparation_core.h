@@ -15,6 +15,16 @@
 namespace gaussian_splatting_rviz_plugins
 {
 
+// One survivor of a Metal draw order: its colour and the splat it is. Leaner
+// than the OpenGL path's DrawnSplat, which carries the record too; see
+// OrderedSplat in gsplat_prepare.metal, which this mirrors.
+struct OrderedSplat
+{
+  float colour[3];
+  std::uint32_t splat;
+};
+static_assert(sizeof(OrderedSplat) == 16, "one quadruple");
+
 // GPU view preparation with no Ogre in it. The display's Ogre adapter and the
 // offline verifier both encode through this class, so what the verifier checks
 // is the dispatch sequence the display runs.
@@ -22,13 +32,13 @@ namespace gaussian_splatting_rviz_plugins
 // Preparation builds a draw order and draws from it. Building an order for a
 // view: make_depth_keys writes a key, or a rejection mark, per splat;
 // compact_count, compact_scan and compact_scatter pack the survivors in index
-// order and count them; shade_slots colours them and copies their records
-// while they are still in index order, and makes each one's compacted slot the
-// sort's value; the radix sorts only those survivors; finish_order lays the
-// survivors and their colours out in draw order. Drawing: reproject_gather
-// projects them in sequence for the frame's camera, and writes the indirect
-// draw arguments; recolour_order can first evaluate their colours again for
-// the frame's camera. Nothing is read back on the CPU.
+// order and count them; shade_slots colours them while they are still in
+// index order, and makes each one's compacted slot the sort's value; the radix
+// sorts only those survivors; finish_order lays the survivors and their
+// colours out in draw order. Drawing: reproject_gather projects them in draw
+// order for the frame's camera, and writes the indirect draw arguments;
+// recolour_order can first evaluate their colours again for the frame's
+// camera. Nothing is read back on the CPU.
 //
 // The next order can be built while the last is drawn from: encode() builds
 // one for its view and draws from it in the same frame, encodeIncremental()
@@ -121,7 +131,7 @@ public:
 
   std::uint32_t count() const {return count_;}
   // The newest complete order: its state, and its survivors in draw order as
-  // DrawnSplat.
+  // OrderedSplat.
   id<MTLBuffer> stateBuffer() const;
   id<MTLBuffer> drawnBuffer() const {return drawn_;}
   // The key/slot pairs the sort works on.
@@ -183,12 +193,11 @@ private:
   // The order under way's compacted key/slot pairs, sorted in place.
   id<MTLBuffer> pairs_ = nil;
   // The order under way's survivors by compacted slot, and the newest complete
-  // order's in draw order.
+  // order's in draw order, as OrderedSplat.
   id<MTLBuffer> slots_ = nil;
   id<MTLBuffer> drawn_ = nil;
-  // The newest complete order's colours in draw order, and for each slot its
-  // splat and draw position, by which recolour_order refreshes them.
-  id<MTLBuffer> colours_ = nil;
+  // For each slot of the newest complete order, its splat and draw position,
+  // by which recolour_order refreshes the colours in drawn_.
   id<MTLBuffer> slot_draws_ = nil;
   std::uint32_t colour_parts_ = 0;
   std::uint32_t colour_frame_ = 0;

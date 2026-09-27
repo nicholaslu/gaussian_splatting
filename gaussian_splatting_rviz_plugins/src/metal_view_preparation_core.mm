@@ -24,8 +24,8 @@ constexpr std::uint32_t kElementsPerTile = 1024;
 constexpr std::uint32_t kRadix = 256;
 // Threads in each scan threadgroup; kScanWidth in gsplat_prepare.metal.
 constexpr std::uint32_t kScanWidth = 256;
-// Slots finish_order gathers from per pass: 64 MiB of DrawnSplat.
-constexpr std::uint32_t kFinishSlotsPerPass = 1u << 20;
+// Slots finish_order gathers from per pass: 64 MiB of OrderedSplat.
+constexpr std::uint32_t kFinishSlotsPerPass = 1u << 22;
 
 // Mirror the structs of the same names in gsplat_prepare.metal.
 struct TileParameters
@@ -137,15 +137,14 @@ bool MetalViewPreparationCore::configure(std::uint32_t count, std::uint32_t inde
   offsets_ = newBuffer(tables, "radix offsets");
   totals_ = newBuffer(kRadix * sizeof(std::uint32_t), "radix totals");
   digit_bases_ = newBuffer(kRadix * sizeof(std::uint32_t), "radix digit bases");
-  const NSUInteger survivors = static_cast<NSUInteger>(count) * sizeof(DrawnSplat);
+  const NSUInteger survivors = static_cast<NSUInteger>(count) * sizeof(OrderedSplat);
   pairs_ = newBuffer(pairs, "key/slot pairs");
   slots_ = newBuffer(survivors, "survivors by slot");
   drawn_ = newBuffer(survivors, "survivors in draw order");
-  colours_ = newBuffer(static_cast<NSUInteger>(count) * sizeof(float) * 4u, "drawn colours");
   slot_draws_ = newBuffer(
     static_cast<NSUInteger>(count) * sizeof(std::uint32_t) * 2u, "slot splats and positions");
   bool allocated = staged_ && tile_counts_ && tile_offsets_ && histograms_ && offsets_ &&
-    totals_ && digit_bases_ && pairs_ && slots_ && drawn_ && colours_ && slot_draws_;
+    totals_ && digit_bases_ && pairs_ && slots_ && drawn_ && slot_draws_;
   for (Order & order : orders_) {
     order.state = newBuffer(sizeof(State), "order state");
     order.tile_dispatch = newBuffer(sizeof(std::uint32_t) * 3u, "order tile dispatch");
@@ -184,7 +183,6 @@ void MetalViewPreparationCore::clear()
   pairs_ = nil;
   slots_ = nil;
   drawn_ = nil;
-  colours_ = nil;
   slot_draws_ = nil;
   colour_frame_ = 0;
   refreshable_ = false;
@@ -413,10 +411,8 @@ bool MetalViewPreparationCore::encodeGather(
   const Order & order = orders_[current_];
   [encoder setComputePipelineState:gather_pipeline_];
   [encoder setBuffer:drawn_ offset:0 atIndex:0];
-  [encoder setBuffer:colours_ offset:0 atIndex:1];
+  [encoder setBuffer:splats_ offset:0 atIndex:1];
   [encoder setBuffer:order.state offset:0 atIndex:4];
-  const std::uint32_t refreshed = refreshable_ && colour_parts_ > 0 ? 1u : 0u;
-  [encoder setBytes:&refreshed length:sizeof(refreshed) atIndex:9];
   [encoder setBuffer:instances offset:0 atIndex:5];
   [encoder setBytes:&projection length:sizeof(projection) atIndex:6];
   [encoder setBuffer:draw_arguments offset:0 atIndex:7];
@@ -479,7 +475,7 @@ void MetalViewPreparationCore::encodeRecolour(
   [encoder setBuffer:sh_dc_ offset:0 atIndex:3];
   [encoder setBuffer:sh_rest_ offset:0 atIndex:4];
   [encoder setBuffer:order.state offset:0 atIndex:5];
-  [encoder setBuffer:colours_ offset:0 atIndex:6];
+  [encoder setBuffer:drawn_ offset:0 atIndex:6];
   [encoder setBytes:&parameters length:sizeof(parameters) atIndex:7];
   const std::uint32_t part[2] = {index, count};
   [encoder setBytes:part length:sizeof(part) atIndex:8];
@@ -520,7 +516,6 @@ void MetalViewPreparationCore::completeBuild(id<MTLComputeCommandEncoder> encode
   [encoder setBuffer:slot_draws_ offset:0 atIndex:2];
   [encoder setBuffer:order.state offset:0 atIndex:4];
   [encoder setBuffer:drawn_ offset:0 atIndex:5];
-  [encoder setBuffer:colours_ offset:0 atIndex:7];
   const std::uint32_t refreshable = colour_parts_ > 0 ? 1u : 0u;
   [encoder setBytes:&refreshable length:sizeof(refreshable) atIndex:8];
   // The passes write disjoint positions, so they need no barrier between them.
@@ -561,7 +556,7 @@ id<MTLBuffer> MetalViewPreparationCore::stateBuffer() const
 NSUInteger MetalViewPreparationCore::scratchBytes() const
 {
   NSUInteger total = 0;
-  for (id<MTLBuffer> buffer : {staged_, pairs_, slots_, drawn_, colours_, slot_draws_,
+  for (id<MTLBuffer> buffer : {staged_, pairs_, slots_, drawn_, slot_draws_,
       tile_counts_, tile_offsets_, histograms_, offsets_, totals_, digit_bases_})
   {
     total += buffer ? buffer.length : 0u;

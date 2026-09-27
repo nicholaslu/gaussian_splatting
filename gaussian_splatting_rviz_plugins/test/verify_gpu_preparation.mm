@@ -41,7 +41,7 @@
 namespace
 {
 using namespace gaussian_splatting_rviz_plugins::verification;
-using gaussian_splatting_rviz_plugins::DrawnSplat;
+using gaussian_splatting_rviz_plugins::OrderedSplat;
 using gaussian_splatting_rviz_plugins::MetalViewPreparationCore;
 using gaussian_splatting_rviz_plugins::ProjectedInstance;
 using gaussian_splatting_rviz_plugins::ProjectionParameters;
@@ -125,12 +125,13 @@ bool check(
   const auto * state =
     static_cast<const MetalViewPreparationCore::State *>(context.core->stateBuffer().contents);
   const auto * arguments = static_cast<const DrawIndexedArguments *>(context.draw.contents);
-  // The order keeps each survivor's key and splat index in draw order.
+  // The order keeps each survivor's splat index in draw order. It keeps no
+  // key, so the keys are checked through the order they produce.
   const auto * order =
-    static_cast<const DrawnSplat *>(context.core->drawnBuffer().contents);
+    static_cast<const OrderedSplat *>(context.core->drawnBuffer().contents);
   const auto * drawn = static_cast<const ProjectedInstance *>(context.instances.contents);
 
-  std::size_t order_bad = 0, key_bad = 0, quad_bad = 0, nonfinite = 0, colour_bad = 0;
+  std::size_t order_bad = 0, quad_bad = 0, nonfinite = 0, colour_bad = 0;
   // Splats the projection culls, and those it culls or keeps within rounding.
   std::size_t culled = 0, borderline = 0;
   long first_bad = -1;
@@ -139,7 +140,6 @@ bool check(
   double worst_quad = 0.0;
   const std::size_t checked = std::min<std::size_t>(state->visible, reference.order.size());
   for (std::size_t i = 0; i < checked; ++i) {
-    const std::uint32_t want_key = std::uint32_t(reference.order[i] >> 32);
     const std::uint32_t want_splat = std::uint32_t(reference.order[i]);
     if (order[i].splat != want_splat) {
       ++order_bad;
@@ -147,7 +147,6 @@ bool check(
         first_bad = long(i);
       }
     }
-    key_bad += order[i].key != want_key;
     float colour[3];
     if (colour_view) {
       splatColour(scene, *colour_view, want_splat, colour);
@@ -189,12 +188,12 @@ bool check(
 
   const bool pass = state->visible == reference.order.size() &&
     arguments->instance_count == state->visible && arguments->index_count == kIndexCount &&
-    order_bad == 0 && key_bad == 0 && quad_bad == 0 && nonfinite == 0 && colour_bad == 0;
+    order_bad == 0 && quad_bad == 0 && nonfinite == 0 && colour_bad == 0;
   std::printf(
-    "%-34s N=%-8u visible cpu=%-8zu gpu=%-8u draw=%-8u order_bad=%zu key_bad=%zu "
+    "%-34s N=%-8u visible cpu=%-8zu gpu=%-8u draw=%-8u order_bad=%zu "
     "colour max|d|=%.1e >1e-4:%zu quad worst/tolerance=%.2f bad=%zu nonfinite=%zu  gpu %.2f ms  %s",
     name, scene.count, reference.order.size(), state->visible, arguments->instance_count,
-    order_bad, key_bad, worst, colour_bad, worst_quad, quad_bad, nonfinite, run.gpu_ms,
+    order_bad, worst, colour_bad, worst_quad, quad_bad, nonfinite, run.gpu_ms,
     pass ? "PASS" : "FAIL");
   if (first_bad >= 0) {
     std::printf("  first order mismatch at %ld", first_bad);

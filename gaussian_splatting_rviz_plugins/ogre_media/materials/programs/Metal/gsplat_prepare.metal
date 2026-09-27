@@ -604,16 +604,16 @@ static ProjectedInstance projectSplat(
   return out;
 }
 
-// One survivor as the draw needs it: the splat's record, its colour for the
-// view the order was built for, and, for diagnostics, its depth key and index.
-// Mirrors DrawnSplat in splat_view.hpp.
-struct DrawnSplat
+// One survivor of a draw order: its colour for the view the order was built
+// for, or refreshed since, and the splat it is. The record itself stays where
+// it was uploaded and is read by index each frame, scattered: on Apple GPUs
+// that costs a fraction of what it does on an RTX 4090 (see finish_order), and
+// keeping records in the order instead took four times the memory, which an
+// iPad does not have for a large scene. The OpenGL path keeps them. Mirrors
+// OrderedSplat in metal_view_preparation_core.h.
+struct OrderedSplat
 {
-  float4 position_opacity;
-  float4 scale_red;
-  float4 quat;
-  float2 green_blue;
-  uint key;
+  packed_float3 colour;
   uint splat;
 };
 
@@ -623,9 +623,8 @@ struct DrawnSplat
 // order they are stored. After the sort the same reads land in depth order,
 // scattered over the whole scene, which on an RTX 4090 with the full Garden
 // scene cost more than twenty times as much once the scene outgrows what the
-// GPU can reach quickly. So each survivor's record goes to its compacted slot
-// along with its colour, and the slot replaces the splat index as the sort's
-// value. The sort is stable and slots follow index order, so the draw order is
+// GPU can reach quickly. So each survivor's colour goes to its compacted slot,
+// and the slot replaces the splat index as the sort's value. The sort is stable and slots follow index order, so the draw order is
 // unchanged. `part` is (which, of how many): incremental preparation shades
 // half the survivors a frame.
 kernel void shade_slots(
@@ -634,7 +633,7 @@ kernel void shade_slots(
   device const float * sh_dc [[buffer(2)]],
   device const float * sh_rest [[buffer(3)]],
   device const PreparationState & state [[buffer(4)]],
-  device DrawnSplat * slots [[buffer(5)]],
+  device OrderedSplat * slots [[buffer(5)]],
   constant ViewParameters & p [[buffer(6)]],
   constant uint2 & part [[buffer(7)]],
   uint index [[thread_position_in_grid]])
@@ -649,24 +648,19 @@ kernel void shade_slots(
   }
   const uint2 pair = compacted[slot];
   const SplatRecord splat = splats[pair.y];
-  const float3 colour = evaluateSH(pair.y, float3(splat.position), sh_dc, sh_rest, p);
-  DrawnSplat drawn;
-  drawn.position_opacity = float4(float3(splat.position), splat.opacity);
-  drawn.scale_red = float4(float3(splat.scale), colour.x);
-  drawn.quat = splat.quat;
-  drawn.green_blue = colour.yz;
-  drawn.key = pair.x;
+  OrderedSplat drawn;
+  drawn.colour = packed_float3(evaluateSH(pair.y, float3(splat.position), sh_dc, sh_rest, p));
   drawn.splat = pair.y;
   slots[slot] = drawn;
   compacted[slot].y = slot;
 }
 
 // Stage 4b, completing an order: the survivors in draw order, so that drawing
-// from the order reads them in sequence. With `refreshable`, also their
-// colours in draw order, where recolour_order can refresh them, and each
-// slot's splat and draw position for recolour_order, as one word pair per
-// slot. Writing those cost a few milliseconds more on an Apple M3 with the
-// full Garden scene, so an order nobody will recolour skips them. This is the one permutation per order, and
+// from the order reads them in sequence. With `refreshable`, also each slot's
+// splat and draw position for recolour_order, as one word pair per slot.
+// Writing those cost a few milliseconds more on an Apple M3 with the full
+// Garden scene, so an order nobody will recolour skips them. This is the one
+// permutation per order, and
 // it reads the slots at random. Random reads over a large enough buffer fall
 // off a cliff: on an RTX 4090 they took 0.9 ms spread over 110 MB and 22 ms
 // over 280 MB. So the permutation runs in passes, each moving only the
@@ -674,12 +668,11 @@ kernel void shade_slots(
 // stay on the near side.
 kernel void finish_order(
   device const uint2 * sorted [[buffer(0)]],
-  device const DrawnSplat * slots [[buffer(1)]],
+  device const OrderedSplat * slots [[buffer(1)]],
   device uint2 * slot_draws [[buffer(2)]],
   device const PreparationState & state [[buffer(4)]],
-  device DrawnSplat * drawn [[buffer(5)]],
+  device OrderedSplat * drawn [[buffer(5)]],
   constant uint2 & slot_range [[buffer(6)]],
-  device float4 * colours [[buffer(7)]],
   constant uint & refreshable [[buffer(8)]],
   uint output [[thread_position_in_grid]])
 {
@@ -688,10 +681,9 @@ kernel void finish_order(
   }
   const uint slot = sorted[output].y;
   if (slot >= slot_range.x && slot < slot_range.y) {
-    const DrawnSplat d = slots[slot];
+    const OrderedSplat d = slots[slot];
     drawn[output] = d;
     if (refreshable != 0u) {
-      colours[output] = float4(d.scale_red.w, d.green_blue, 0.0);
       slot_draws[slot] = uint2(d.splat, output);
     }
   }
@@ -702,8 +694,8 @@ kernel void finish_order(
 // colour - specular highlights above all - follows the camera rather than
 // jumping each time an order completes. It walks the survivors by slot, in
 // index order, so the SH coefficients are read in the order they are stored,
-// and writes each colour to the survivor's draw position, at random but within
-// a buffer the size of the visible set. `part` is (which, of how many), to
+// and writes each colour over the one at the survivor's draw position, at
+// random but within the order. `part` is (which, of how many), to
 // refresh half the survivors a frame.
 kernel void recolour_order(
   device const uint2 * slot_draws [[buffer(0)]],
@@ -711,7 +703,7 @@ kernel void recolour_order(
   device const float * sh_dc [[buffer(3)]],
   device const float * sh_rest [[buffer(4)]],
   device const PreparationState & state [[buffer(5)]],
-  device float4 * colours [[buffer(6)]],
+  device OrderedSplat * drawn [[buffer(6)]],
   constant ViewParameters & p [[buffer(7)]],
   constant uint2 & part [[buffer(8)]],
   uint index [[thread_position_in_grid]])
@@ -725,26 +717,25 @@ kernel void recolour_order(
     return;
   }
   const uint2 draw = slot_draws[slot];
-  colours[draw.y] =
-    float4(evaluateSH(draw.x, float3(splats[draw.x].position), sh_dc, sh_rest, p), 0.0);
+  drawn[draw.y].colour =
+    packed_float3(evaluateSH(draw.x, float3(splats[draw.x].position), sh_dc, sh_rest, p));
 }
 
 // Stage 5: the draw stream, each survivor of an order projected for this
-// frame's camera with its colour: the one the order was built with, or, with
-// `refreshed`, the one recolour_order last wrote. Incremental preparation runs only this stage on
+// frame's camera with its colour: the one the order was built with, or the one
+// recolour_order last wrote. Incremental preparation runs only this stage on
 // most frames, against an order built for a camera a few frames old, so the
 // projection always follows the camera exactly while the order lags it
-// slightly. It reads and writes in sequence. The first thread also writes the
-// indirect draw arguments.
+// slightly. It reads the order and writes in sequence, and reads the records
+// by index. The first thread also writes the indirect draw arguments.
 kernel void reproject_gather(
-  device const DrawnSplat * drawn [[buffer(0)]],
-  device const float4 * colours [[buffer(1)]],
+  device const OrderedSplat * drawn [[buffer(0)]],
+  device const SplatRecord * splats [[buffer(1)]],
   device const PreparationState & state [[buffer(4)]],
   device ProjectedInstance * instances [[buffer(5)]],
   constant ProjectionParameters & q [[buffer(6)]],
   device DrawIndexedArguments * draw [[buffer(7)]],
   constant uint & index_count [[buffer(8)]],
-  constant uint & refreshed [[buffer(9)]],
   uint output [[thread_position_in_grid]])
 {
   if (output == 0) {
@@ -757,14 +748,6 @@ kernel void reproject_gather(
   if (output >= state.visible) {
     return;
   }
-  const DrawnSplat d = drawn[output];
-  SplatRecord splat;
-  splat.position = packed_float3(d.position_opacity.xyz);
-  splat.opacity = d.position_opacity.w;
-  splat.scale = packed_float3(d.scale_red.xyz);
-  splat.pad0 = 0.0;
-  splat.quat = d.quat;
-  const float3 colour =
-    refreshed != 0u ? colours[output].xyz : float3(d.scale_red.w, d.green_blue);
-  instances[output] = projectSplat(splat, colour, q);
+  const OrderedSplat d = drawn[output];
+  instances[output] = projectSplat(splats[d.splat], float3(d.colour), q);
 }

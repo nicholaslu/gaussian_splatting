@@ -352,7 +352,7 @@ private:
         "order %p)\n", instances.contents, splats.contents, drawn_order.contents);
       return;
     }
-    const auto * order = static_cast<const DrawnSplat *>(drawn_order.contents);
+    const auto * order = static_cast<const OrderedSplat *>(drawn_order.contents);
     const auto * drawn = static_cast<const ProjectedInstance *>(instances.contents);
     const auto * records = static_cast<const SplatRecord *>(splats.contents);
     const std::uint32_t visible = state->visible;

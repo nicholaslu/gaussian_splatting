@@ -256,12 +256,18 @@ should be read only during the post-sort gather, for visible splats. This memory
 decision must be measured for both macOS and iPadOS.
 
 As built, preparation keeps the two key/index buffers, the per-tile tables,
-two buffers of 64-byte `DrawnSplat`s - the survivors by compacted slot and in
-draw order - and, for Colour Refresh, a colour and a slot's splat and draw
-position per splat, all sized for every splat: about 950 MiB for Garden, beside the 48-byte
+two buffers of survivors - by compacted slot and in draw order - and, for
+Colour Refresh, a slot's splat and draw position per splat, all sized for every
+splat. On OpenGL a survivor is a 64-byte `DrawnSplat` (record, colour, key,
+index) and a colour buffer is added, about 950 MiB for Garden; on Metal it is a
+16-byte `OrderedSplat` (colour, index), 323 MiB. Beside that are the 48-byte
 projected instance buffer the draw reads (267 MiB) and the scene itself
 (records 267 MiB, SH 1.1 GiB). Before draw orders were kept, preparation took
 about 400 MiB. The offscreen target is 8 bytes a pixel in half float.
+
+Once GPU preparation has the scene, the display lets go of the ROS message and
+of its own records, and makes neither the CPU path's arrays nor its data
+texture; see "Memory" below.
 
 ## Acceptance criteria
 
@@ -473,6 +479,47 @@ GPU time per frame, median (largest) of the incremental frames:
 | M3, real Garden, training camera 40 | 26.5 ms | 7.4 (9.5) ms |
 | M3, synthetic Garden-sized | 29.7 ms | 8.1 (10.6) ms |
 | RTX 4090, synthetic Garden-sized | 5.9 ms | 1.2 (2.5) ms |
+
+### Memory
+
+Garden ran an iPad mini out of memory. RViz on the M3 with Garden, prepared on
+the GPU, measured with `footprint` once the scene was drawn:
+
+| | Before | After |
+| --- | ---: | ---: |
+| Malloc Large (CPU) | 3428 MB | 1313 MB |
+| IOAccelerator (GPU) | 2898 MB | 2005 MB |
+| Whole process | 6710 MB | 4093-4405 MB |
+| Peak | 6759 MB | 5719 MB |
+
+Two changes made the difference. The display held the message (1.3 GB at
+degree 3) for the CPU path's harmonics, its own records, the data texture the
+CPU path's vertex program reads, and the CPU path's arrays, none of which GPU
+preparation reads. It now drops the message and the records once they are
+uploaded, and makes the rest only for the CPU path. Should GPU preparation fail
+later, the display subscribes again, and a Transient Local publisher delivers
+the scene anew for the CPU path; with volatile durability it waits for the next
+message.
+
+On Metal, draw orders now keep each survivor's colour and splat index, 16 bytes
+instead of 64, and `reproject_gather` reads the record by index. Those reads are
+scattered, which costs the 4090 twenty times over (above) but the M3 about
+1.5 ms a frame, so OpenGL keeps whole records in its orders. Colour Refresh
+writes into the order itself, so Metal needs no separate colour buffer.
+Synthetic Garden-sized scene on the M3, median (largest):
+
+| | 64-byte orders | 16-byte orders |
+| --- | ---: | ---: |
+| Preparation buffers | 946 MiB | 323 MiB |
+| Full preparation | 28.6 ms | 27.0 ms |
+| Incremental frame, no colour refresh | 8.1 (10.1) ms | 9.7 (10.5) ms |
+| Incremental frame, half the colours | 13.4 (18.9) ms | 14.8 (17.1) ms |
+| Incremental frame, every colour | 18.3 (23.9) ms | 19.6 (22.4) ms |
+
+The 1313 MB left on the CPU side is exactly one message's size, which the
+display no longer holds; it is most likely the payload Fast DDS keeps after
+receiving, though that is not yet confirmed. The peak adds the message while it
+is converted and uploaded.
 
 In RViz on the M3, with the camera moving every frame over the real Garden
 scene at 2940x1905, the frame rate went from 10-13 fps to 15-18 fps.
