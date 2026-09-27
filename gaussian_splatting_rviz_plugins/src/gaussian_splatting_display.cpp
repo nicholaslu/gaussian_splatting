@@ -1,10 +1,8 @@
 #include "gaussian_splatting_rviz_plugins/gaussian_splatting_display.hpp"
-// Unconditional: the display holds a unique_ptr to this interface, and
+// Unconditional: the display holds unique_ptrs to these interfaces, and
 // destroying one needs the complete type in every renderer build.
 #include "gaussian_splatting_rviz_plugins/gpu_view_preparation.hpp"
-#ifdef GSPLAT_HAS_METAL_PREPARATION
 #include "gaussian_splatting_rviz_plugins/metal_upscaler.hpp"
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -744,6 +742,16 @@ void GaussianSplattingDisplay::reset()
 void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
 {
   rviz_common::MessageFilterDisplay<GaussianSplats>::update(wall_dt, ros_dt);
+  if (resubscribe_pending_) {
+    resubscribe_pending_ = false;
+    // Clears the statuses, so the explanation is set after it.
+    updateTopic();
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, "Message",
+      "GPU preparation failed after the scene was handed to the GPU; subscribed again "
+      "to receive it for CPU preparation, which needs Transient Local durability or "
+      "a new message");
+  }
   updateRenderTarget();
   if (splat_texture_) {
     setStatus(
@@ -866,12 +874,14 @@ void GaussianSplattingDisplay::processMessage(GaussianSplats::ConstSharedPtr msg
   }
 
   // Held for as long as the harmonics are read out of it, which is until the
-  // next message or until the display is cleared. Assigning here releases the
-  // previous message, so the pointers into it are dropped in the same breath
-  // rather than left dangling until uploadSplats re-points them.
+  // next message, until the display is cleared, or until GPU preparation has
+  // its own copy. Assigning here releases the previous message, so the
+  // pointers into it are dropped in the same breath rather than left dangling
+  // until uploadSplats re-points them.
   sh_dc_ = nullptr;
   sh_rest_ = nullptr;
   message_ = msg;
+  deleteStatus("Message");
 
   eps2d_ = msg->eps2d;
   antialiased_ =
@@ -1045,12 +1055,14 @@ void GaussianSplattingDisplay::clearMesh()
 
   splat_count_ = 0;
   visible_splat_count_ = 0;
-  positions_.clear();
-  order_.clear();
-  order_scratch_.clear();
-  records_.clear();
-  draw_instances_.clear();
-  colours_.clear();
+  // Released rather than cleared: a scene of millions of splats leaves
+  // hundreds of megabytes of capacity behind.
+  std::vector<std::uint64_t>().swap(order_);
+  std::vector<std::uint64_t>().swap(order_scratch_);
+  std::vector<SplatRecord>().swap(records_);
+  std::vector<DrawInstance>().swap(draw_instances_);
+  std::vector<float>().swap(colours_);
+  cull_partitions_.clear();
   message_.reset();
   sh_dc_ = nullptr;
   sh_rest_ = nullptr;
@@ -1094,21 +1106,24 @@ void GaussianSplattingDisplay::allocateMesh(std::size_t count)
 
   splat_count_ = count;
 
-  positions_.resize(count);
-  order_.reserve(count);
-  order_scratch_.resize(count);
-  records_.resize(count);
-  draw_instances_.resize(count);
-  colours_.assign(count * 3, 0.0f);
-  createSplatDataTexture(count);
-
-  auto * vertex_data = OGRE_NEW Ogre::VertexData();
-  vertex_data->vertexCount = kVerticesPerSplat;
-
   // GPU preparation writes each instance already projected, so its vertex
   // program only places the corners; the CPU path hands over an index and a
   // colour and leaves the projection to the vertex program, once per vertex.
   gpu_projected_ = gpu_view_preparation_ != nullptr && projected_material_;
+
+  // GPU preparation reads only its own copy of the splats, so the CPU path's
+  // arrays and the data texture its vertex program reads are left out.
+  if (!gpu_projected_) {
+    order_.reserve(count);
+    order_scratch_.resize(count);
+    draw_instances_.resize(count);
+    colours_.assign(count * 3, 0.0f);
+    createSplatDataTexture(count);
+  }
+
+  auto * vertex_data = OGRE_NEW Ogre::VertexData();
+  vertex_data->vertexCount = kVerticesPerSplat;
+
   Ogre::VertexDeclaration * declaration = vertex_data->vertexDeclaration;
   if (gpu_projected_) {
     declaration->addElement(
@@ -1247,8 +1262,12 @@ void GaussianSplattingDisplay::writeSplatDataTexture()
 
 void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::size_t count)
 {
-  // Each worker writes a disjoint range of positions_ and records_, and keeps
-  // its own bounds so the reduction needs no lock.
+  // Released after an upload to GPU preparation, so sized here rather than
+  // only when the mesh is allocated.
+  records_.resize(count);
+
+  // Each worker writes a disjoint range of records_, and keeps its own bounds
+  // so the reduction needs no lock.
   const std::size_t workers = workerCount(count);
   std::vector<Ogre::AxisAlignedBox> worker_bounds(workers);
   parallelFor(
@@ -1257,7 +1276,6 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
       local.setNull();
       for (std::size_t i = begin; i < end; ++i) {
         const Ogre::Vector3 position(msg.means[i * 3], msg.means[i * 3 + 1], msg.means[i * 3 + 2]);
-        positions_[i] = position;
         local.merge(position);
 
         SplatRecord & record = records_[i];
@@ -1287,10 +1305,21 @@ void GaussianSplattingDisplay::uploadSplats(const GaussianSplats & msg, std::siz
 
   writeSplatDataTexture();
 
-  if (gpu_view_preparation_ && !gpu_view_preparation_->uploadStaticData(
+  if (gpu_view_preparation_ && gpu_view_preparation_->uploadStaticData(
       records_.data(), records_.size(),
       sh_dc_, msg.sh_dc.size(), sh_rest_, msg.sh_rest.size()))
   {
+    // GPU preparation now has everything it reads, and nothing else reads the
+    // records or the message. Together they are another copy and a half of the
+    // scene - about 2 GB for six million splats at degree 3 - which a device
+    // with unified memory pays for out of the same budget as the GPU's copy.
+    // Should GPU preparation fail later, fallBackToCpuPreparation() asks for
+    // the message again.
+    std::vector<SplatRecord>().swap(records_);
+    sh_dc_ = nullptr;
+    sh_rest_ = nullptr;
+    message_.reset();
+  } else if (gpu_view_preparation_) {
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "GPU preparation",
       QString::fromStdString(gpu_view_preparation_->error() + "; using CPU fallback"));
@@ -1422,7 +1451,9 @@ void radixSortByHighWord(
 
 void GaussianSplattingDisplay::sortIndexBuffer()
 {
-  if (!instance_buffer_ || positions_.empty() || !sh_dc_ || !context_ ||
+  // GPU preparation holds its own copy of the splats; only the CPU path reads
+  // the records and the message's harmonics.
+  if (!instance_buffer_ || splat_count_ == 0 || (!gpu_projected_ && !sh_dc_) || !context_ ||
     !context_->getViewManager())
   {
     return;
@@ -1760,11 +1791,17 @@ void GaussianSplattingDisplay::fallBackToCpuPreparation()
 {
   // Held across clearMesh(), which drops the display's own reference.
   const GaussianSplats::ConstSharedPtr message = message_;
+  const bool had_splats = splat_count_ > 0;
   gpu_view_preparation_.reset();
   using_gpu_preparation_ = false;
   clearMesh();
   if (message) {
     processMessage(message);
+  } else if (had_splats) {
+    // The message was let go once the GPU had its own copy. Subscribing
+    // again, from update() rather than from inside a frame, has a Transient
+    // Local publisher deliver it once more.
+    resubscribe_pending_ = true;
   }
 }
 

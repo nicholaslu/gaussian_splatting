@@ -176,7 +176,7 @@ private:
   std::size_t splat_count_ = 0;
   std::size_t visible_splat_count_ = 0;
 
-  std::vector<Ogre::Vector3> positions_;
+  // Under GPU preparation the records exist only until they are uploaded.
   std::vector<SplatRecord> records_;
   std::vector<DrawInstance> draw_instances_;
 
@@ -190,8 +190,12 @@ private:
   // copied out of: at degree 3 the coefficients are 180 bytes a splat, and
   // copying them measured 6 ms against a memory bandwidth that leaves nothing
   // for threads to win. sh_coefficients_ is K-1, the count beyond the constant
-  // term, so it is 0, 3, 8 or 15.
+  // term, so it is 0, 3, 8 or 15. Once GPU preparation holds its own copy the
+  // message is let go, and the pointers are null.
   GaussianSplats::ConstSharedPtr message_;
+  // Set when GPU preparation failed after the message was let go: the next
+  // update() subscribes again, so that a Transient Local topic delivers it anew.
+  bool resubscribe_pending_ = false;
   const float * sh_dc_ = nullptr;
   const float * sh_rest_ = nullptr;
   std::size_t sh_coefficients_ = 0;
