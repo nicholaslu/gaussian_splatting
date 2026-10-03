@@ -214,6 +214,11 @@ install(DIRECTORY ogre_media
   DESTINATION share/${PROJECT_NAME}
 )
 
+# RViz looks the display's icon up by class name under icons/classes.
+install(DIRECTORY icons
+  DESTINATION share/${PROJECT_NAME}
+)
+
 # The notice travels with the shader it covers.
 install(FILES plugins_description.xml THIRD_PARTY_NOTICES.md
   DESTINATION share/${PROJECT_NAME}
