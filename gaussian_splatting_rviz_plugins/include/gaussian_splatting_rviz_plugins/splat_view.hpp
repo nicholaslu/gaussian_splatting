@@ -57,7 +57,7 @@ constexpr int kFrustumPlaneFar = 1;
 // plain values. Matrices are row-major, so a transform is the same row dot
 // products Ogre performs; frustum planes are (normal, d). Mirrored by
 // ViewParameters in gsplat_prepare.metal.
-struct alignas(16) ViewParameters
+struct alignas (16) ViewParameters
 {
   float world_rows[16];
   float view_rows[16];
@@ -253,7 +253,8 @@ inline bool prepareSplat(
   }
   evaluateColour(sh_dc, sh_rest, p.sh_coefficients, view, colour);
 
-  key = depthKey(dotProduct(
+  key = depthKey(
+    dotProduct(
       x, y, z, p.local_sort_direction[0], p.local_sort_direction[1], p.local_sort_direction[2]));
   return true;
 }
@@ -264,7 +265,7 @@ inline bool prepareSplat(
 // rasterised, and fov. GPU preparation computes it once per splat in
 // gather_instances instead, and the vertex program only places the corners.
 // Mirrored by ProjectionParameters in gsplat_prepare.metal.
-struct alignas(16) ProjectionParameters
+struct alignas (16) ProjectionParameters
 {
   float worldview_rows[16];
   float worldviewproj_rows[16];

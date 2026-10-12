@@ -220,7 +220,8 @@ inline void splatColour(
   const SplatRecord & record = scene.records[i];
   float direction[3] = {record.position[0] - view.local_camera[0],
     record.position[1] - view.local_camera[1], record.position[2] - view.local_camera[2]};
-  const float length = std::sqrt(dotProduct(
+  const float length = std::sqrt(
+    dotProduct(
       direction[0], direction[1], direction[2], direction[0], direction[1], direction[2]));
   if (length > 0.0f) {
     const float inverse = 1.0f / length;
@@ -287,9 +288,11 @@ inline double quadDifference(
   const auto w = form(want);
   const double trace = std::max(g[0] + g[2], w[0] + w[2]);
   double worst = 0.0;
-  worst = std::max(worst, scaledError(
+  worst = std::max(
+    worst, scaledError(
       got.centre[0] * half_width, want.centre[0] * half_width, 1e-2, 1e-5));
-  worst = std::max(worst, scaledError(
+  worst = std::max(
+    worst, scaledError(
       got.centre[1] * half_height, want.centre[1] * half_height, 1e-2, 1e-5));
   worst = std::max(worst, scaledError(got.centre[2], want.centre[2], 1e-5, 1e-5));
   for (int i = 0; i < 3; ++i) {

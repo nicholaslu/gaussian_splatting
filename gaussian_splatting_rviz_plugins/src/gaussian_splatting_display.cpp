@@ -759,8 +759,9 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
       QString("splats rasterised at %1x%2, %3%4%5, redrawn %6 times in the last second")
       .arg(rtt_width_).arg(rtt_height_).arg(rtt_half_ ? "half float" : "8-bit")
       .arg(rtt_samples_ > 1 ? QString(" with %1x MSAA").arg(rtt_samples_) : QString())
-      .arg(upscaled_texture_ ? QString(", upscaled by MetalFX to %1x%2")
-      .arg(upscaled_texture_->getWidth()).arg(upscaled_texture_->getHeight()) : QString())
+      .arg(
+        upscaled_texture_ ? QString(", upscaled by MetalFX to %1x%2")
+        .arg(upscaled_texture_->getWidth()).arg(upscaled_texture_->getHeight()) : QString())
       .arg(recent_offscreen_draws_.size()));
     if (depth_scheme_resolver_) {
       const auto stats = depth_scheme_resolver_->stats();
@@ -799,8 +800,9 @@ void GaussianSplattingDisplay::update(float wall_dt, float ros_dt)
         const GpuViewPreparation::StageTimes times = gpu_view_preparation_->lastStageTimes();
         setStatus(
           rviz_common::properties::StatusProperty::Ok, "GPU preparation",
-          QString("GPU cull+compact %1, shade+project %2, sort %3, gather %4 ms "
-          "(GSPLAT_PROFILE_GPU: stages run synchronously)")
+          QString(
+            "GPU cull+compact %1, shade+project %2, sort %3, gather %4 ms "
+            "(GSPLAT_PROFILE_GPU: stages run synchronously)")
           .arg(times.cull_ms, 0, 'f', 2)
           .arg(times.shade_ms, 0, 'f', 2)
           .arg(times.sort_ms, 0, 'f', 2)
@@ -961,8 +963,9 @@ bool GaussianSplattingDisplay::validate(const GaussianSplats & msg, std::size_t 
   if (rows > kMaxTextureDimension) {
     setStatus(
       rviz_common::properties::StatusProperty::Error, "Message",
-      QString("%1 splats need a %2 x %3 data texture, past the %4 this "
-      "render system allows.")
+      QString(
+        "%1 splats need a %2 x %3 data texture, past the %4 this "
+        "render system allows.")
       .arg(count).arg(splatDataWidth(count)).arg(rows).arg(kMaxTextureDimension));
     return false;
   }
@@ -972,8 +975,9 @@ bool GaussianSplattingDisplay::validate(const GaussianSplats & msg, std::size_t 
   if (!usesMetalRenderSystem() && count * kTexelsPerSplat > kMaxGlslExactTexels) {
     setStatus(
       rviz_common::properties::StatusProperty::Warn, "Message",
-      QString("%1 splats: past %2, the OpenGL shader's float texel index is no "
-      "longer exact and some splats will read a neighbour's record.")
+      QString(
+        "%1 splats: past %2, the OpenGL shader's float texel index is no "
+        "longer exact and some splats will read a neighbour's record.")
       .arg(count).arg(kMaxGlslExactTexels / kTexelsPerSplat));
     return true;
   }
@@ -1015,8 +1019,9 @@ void GaussianSplattingDisplay::registerOgreResources()
   if (!base) {
     setStatus(
       rviz_common::properties::StatusProperty::Error, "Material",
-      QString("Material '%1' was not found in %2. This usually means the shader "
-      "failed to compile; see Ogre.log in the directory rviz2 was started from.")
+      QString(
+        "Material '%1' was not found in %2. This usually means the shader "
+        "failed to compile; see Ogre.log in the directory rviz2 was started from.")
       .arg(kMaterialName).arg(usesMetalRenderSystem() ? "Metal" : "GLSL"));
     resources_registered_ = true;
     return;
@@ -1667,23 +1672,23 @@ void GaussianSplattingDisplay::sortIndexBuffer()
     cull_start - sort_start).count();
   parallelFor(
     splat_count_, workers, [&](std::size_t begin, std::size_t end, std::size_t worker) {
-    std::vector<std::uint64_t> & partition = cull_partitions_[worker];
-    partition.clear();
-    partition.reserve(end - begin);
+      std::vector<std::uint64_t> & partition = cull_partitions_[worker];
+      partition.clear();
+      partition.reserve(end - begin);
 
-    for (std::uint32_t i = begin; i < end; ++i) {
-      // Only the survivors get a colour: at a typical camera this is a third of
-      // the scene, and the evaluation is the most expensive thing in the loop.
-      std::uint32_t key = 0;
-      if (!prepareSplat(
+      for (std::uint32_t i = begin; i < end; ++i) {
+        // Only the survivors get a colour: at a typical camera this is a third of
+        // the scene, and the evaluation is the most expensive thing in the loop.
+        std::uint32_t key = 0;
+        if (!prepareSplat(
           parameters, records_[i], &sh_dc_[i * 3],
           rest_stride > 0 ? &sh_rest_[i * rest_stride] : nullptr, &colours_[i * 3], key))
-      {
-        continue;
+        {
+          continue;
+        }
+        partition.push_back((static_cast<std::uint64_t>(key) << 32) | i);
       }
-      partition.push_back((static_cast<std::uint64_t>(key) << 32) | i);
-    }
-  });
+    });
   const auto cull_end = std::chrono::steady_clock::now();
   last_cull_sh_ms_ = std::chrono::duration<double, std::milli>(
     cull_end - cull_start).count();

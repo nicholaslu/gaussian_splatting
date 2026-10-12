@@ -36,8 +36,8 @@ constexpr std::size_t kMarkRadix = 8u;
 // instead, which dispatches to the current context just as GLEW does.
 struct ComputeFunctions
 {
-  void (*dispatch)(GLuint, GLuint, GLuint) = nullptr;
-  void (*dispatch_indirect)(GLintptr) = nullptr;
+  void (* dispatch)(GLuint, GLuint, GLuint) = nullptr;
+  void (* dispatch_indirect)(GLintptr) = nullptr;
 };
 
 const ComputeFunctions & computeFunctions()
@@ -68,10 +68,10 @@ const ComputeFunctions & computeFunctions()
 // for the same reason as the dispatch entry points above.
 struct TimerFunctions
 {
-  void (*gen_queries)(GLsizei, GLuint *) = nullptr;
-  void (*delete_queries)(GLsizei, const GLuint *) = nullptr;
-  void (*query_counter)(GLuint, GLenum) = nullptr;
-  void (*get_query_result)(GLuint, GLenum, GLuint64 *) = nullptr;
+  void (* gen_queries)(GLsizei, GLuint *) = nullptr;
+  void (* delete_queries)(GLsizei, const GLuint *) = nullptr;
+  void (* query_counter)(GLuint, GLenum) = nullptr;
+  void (* get_query_result)(GLuint, GLenum, GLuint64 *) = nullptr;
 
   bool resolved() const
   {
@@ -264,7 +264,8 @@ OpenGlViewPreparationCore::OpenGlViewPreparationCore(
     "GSPLAT_STAGE_RADIX_SCATTER", "GSPLAT_STAGE_SHADE_SLOTS", "GSPLAT_STAGE_FINISH_ORDER",
     "GSPLAT_STAGE_PUBLISH", "GSPLAT_STAGE_REPROJECT_GATHER", "GSPLAT_STAGE_CLEAR_TAIL",
     "GSPLAT_STAGE_RECOLOUR_ORDER"};
-  static_assert(sizeof(stages) / sizeof(stages[0]) == std::tuple_size<decltype(programs_)>::value,
+  static_assert(
+    sizeof(stages) / sizeof(stages[0]) == std::tuple_size<decltype(programs_)>::value,
     "a program per stage");
   for (std::size_t i = 0; i < programs_.size(); ++i) {
     programs_[i] = compile(stages[i]);
@@ -284,9 +285,10 @@ OpenGlViewPreparationCore::~OpenGlViewPreparationCore()
 
 bool OpenGlViewPreparationCore::ready() const
 {
-  return std::all_of(programs_.begin(), programs_.end(), [](GLuint program) {
-             return program != 0u;
-           });
+  return std::all_of(
+    programs_.begin(), programs_.end(), [](GLuint program) {
+      return program != 0u;
+    });
 }
 
 const std::string & OpenGlViewPreparationCore::error() const
@@ -411,8 +413,7 @@ void OpenGlViewPreparationCore::clear()
     &drawn_, &colours_, &slot_draws_, &instance_state_, &clear_dispatch_,
     &draw_arguments_, &view_parameters_, &frame_view_parameters_, &projection_parameters_};
   for (Order & order : orders_) {
-    for (GLuint * buffer : {&order.state, &order.tile_dispatch, &order.gather_dispatch})
-    {
+    for (GLuint * buffer : {&order.state, &order.tile_dispatch, &order.gather_dispatch}) {
       buffers.push_back(buffer);
     }
   }

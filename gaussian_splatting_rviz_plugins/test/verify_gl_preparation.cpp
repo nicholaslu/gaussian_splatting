@@ -326,18 +326,21 @@ int verifyIncremental(
   // once both halves have been refreshed at the same camera, all of them are
   // its colours, on the old order and on the new.
   for (std::uint32_t parts : {1u, 2u}) {
-    failures += !verify("  recolour: starting order", context, scene, from, projection,
+    failures += !verify(
+      "  recolour: starting order", context, scene, from, projection,
       nullptr, false, parts);
     for (int frame = 1; frame <= 4; ++frame) {
       if (frame < int(parts)) {
         prepare(context, to, projection, nullptr, true, parts);
         continue;
       }
-      failures += !verify(parts == 1 ? "  recolour every frame, old order" :
+      failures += !verify(
+        parts == 1 ? "  recolour every frame, old order" :
         "  recolour half a frame, old order", context, scene, from, projection, &to, true,
         parts, &to);
     }
-    failures += !verify(parts == 1 ? "  recolour every frame, new order" :
+    failures += !verify(
+      parts == 1 ? "  recolour every frame, new order" :
       "  recolour half a frame, new order", context, scene, to, projection, &to, true, parts);
   }
   return failures;
@@ -395,7 +398,8 @@ void timeStages(
     median(cull), median(shade), median(sort), median(gather));
   const char * refresh[3] = {"no colour refresh", "every colour", "half the colours"};
   for (std::uint32_t parts : {0u, 2u, 1u}) {
-    std::printf("  GPU per incremental frame, %s: median %.2f, largest %.2f ms\n",
+    std::printf(
+      "  GPU per incremental frame, %s: median %.2f, largest %.2f ms\n",
       refresh[parts], median(frames[parts]),
       *std::max_element(frames[parts].begin(), frames[parts].end()));
   }
@@ -405,7 +409,8 @@ void timeStages(
   std::printf(
     "    sort, four passes: histogram %.2f | scan %.2f | scatter %.2f ms\n",
     median(histogram), median(radix_scan), median(radix_scatter));
-  std::printf("  preparation scratch buffers %.0f MiB\n\n",
+  std::printf(
+    "  preparation scratch buffers %.0f MiB\n\n",
     double(context.core->scratchBytes()) / (1024.0 * 1024.0));
 }
 
@@ -481,7 +486,8 @@ int main(int argc, char ** argv)
     if (n == 0) {
       // The same buffers again under a narrower view: whatever the wider view
       // left beyond the new visible count must be emptied, and not drawn.
-      failures += !verify("  same buffers, narrower view", context, scene,
+      failures += !verify(
+        "  same buffers, narrower view", context, scene,
         makeView(scene, c.flags, c.far_clip, c.dx, c.dy, c.dz, 1.0f), projection);
 
       // Nothing visible at all.
@@ -537,7 +543,8 @@ int main(int argc, char ** argv)
     std::printf("splat at the camera FAIL: %s\n", core.error().c_str());
     ++failures;
   } else {
-    failures += !verify("splat exactly at the camera", context, scene,
+    failures += !verify(
+      "splat exactly at the camera", context, scene,
       makeView(scene, 0, 100, 0.1f, 0.2f, 1.0f), makeProjection(0.0f));
   }
 
