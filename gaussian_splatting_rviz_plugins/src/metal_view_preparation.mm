@@ -165,7 +165,7 @@ public:
     core_->setColourRefresh(colour_parts);
     return profiling_ ?
            encodeProfiled(parameters, projection, instances, draw, incremental, colour_parts) :
-           encodeInFrame(parameters, projection, instances, draw, incremental, colour_parts);
+           encodeInFrame(parameters, projection, instances, draw, incremental);
   }
 
   std::int64_t lastVisibleCount() const override
@@ -207,9 +207,11 @@ public:
   }
 
 private:
+  // The core already has the colour refresh setting from encode(); only the
+  // profiled path, which encodes each stage itself, needs it passed down.
   bool encodeInFrame(
     const ViewParameters & parameters, const ProjectionParameters & projection,
-    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental, std::uint32_t colour_parts)
+    id<MTLBuffer> instances, id<MTLBuffer> draw, bool incremental)
   {
     id<MTLComputeCommandEncoder> encoder = device_->getComputeEncoder();
     id<MTLCommandBuffer> command_buffer = device_->mCurrentCommandBuffer;
