@@ -24,7 +24,7 @@
 #include <cstdlib>
 #include <vector>
 
-#include "metal_view_preparation_core.h"
+#include "metal_view_preparation_core.hpp"
 
 namespace
 {

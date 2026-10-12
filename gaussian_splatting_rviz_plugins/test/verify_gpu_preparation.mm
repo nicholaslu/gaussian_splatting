@@ -35,7 +35,7 @@
 #include <vector>
 
 #include "gaussian_splatting_rviz_plugins/splat_view.hpp"
-#include "metal_view_preparation_core.h"
+#include "metal_view_preparation_core.hpp"
 #include "preparation_test_scenes.hpp"
 
 namespace

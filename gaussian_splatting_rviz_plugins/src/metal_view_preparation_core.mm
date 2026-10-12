@@ -4,7 +4,7 @@
 
 #import <Foundation/Foundation.h>
 
-#include "metal_view_preparation_core.h"
+#include "metal_view_preparation_core.hpp"
 
 #include <algorithm>
 #include <cstring>

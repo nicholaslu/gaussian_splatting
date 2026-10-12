@@ -610,7 +610,7 @@ static ProjectedInstance projectSplat(
 // that costs a fraction of what it does on an RTX 4090 (see finish_order), and
 // keeping records in the order instead took four times the memory, which an
 // iPad does not have for a large scene. The OpenGL path keeps them. Mirrors
-// OrderedSplat in metal_view_preparation_core.h.
+// OrderedSplat in metal_view_preparation_core.hpp.
 struct OrderedSplat
 {
   packed_float3 colour;

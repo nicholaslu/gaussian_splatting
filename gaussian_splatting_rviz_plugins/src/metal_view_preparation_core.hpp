@@ -9,7 +9,7 @@
 #include "gaussian_splatting_rviz_plugins/splat_view.hpp"
 
 #if !__has_feature(objc_arc)
-#error "metal_view_preparation_core.h relies on ARC; compile with -fobjc-arc"
+#error "metal_view_preparation_core.hpp relies on ARC; compile with -fobjc-arc"
 #endif
 
 namespace gaussian_splatting_rviz_plugins
